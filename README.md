@@ -2,9 +2,9 @@
 
 # 🎧 Antra
 
-**Your music. Offline. Lossless.**
+**Get tracks in true Lossless (FLAC) from multiple hi-res streaming sources — no premium account required.**
 
-Paste a supported streaming link — Antra builds your music library automatically with the highest quality audio available.
+<a href="https://ko-fi.com/antraverse"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" /></a>
 
 ![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![Version](https://img.shields.io/badge/Version-1.0.0-00ffcc?style=for-the-badge)
@@ -39,9 +39,7 @@ Paste a supported streaming link — Antra builds your music library automatical
 
 ## Audio Quality Priority
 
-Antra works through a waterfall of supported platforms, always trying the highest quality lossless formats first, before falling back to lossy formats. 
-
-Audio is sourced from licensed streaming services. No piracy infrastructure is involved.
+Antra works through a waterfall of supported platforms, always trying the highest quality lossless formats first, before falling back to lossy formats.
 
 ---
 
@@ -176,11 +174,7 @@ Yes. The folder structure (`Artist/Album/Track.flac`) and embedded metadata are 
 
 ## Support Development
 
-If Antra saves you time, consider supporting ongoing development:
-
-<a href="https://ko-fi.com/antraverse">
-  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" />
-</a>
+If Antra saves you time, consider supporting ongoing development via the link at the top of the page.
 
 ---
 
