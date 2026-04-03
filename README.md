@@ -49,6 +49,18 @@ Audio is sourced from licensed streaming services. No piracy infrastructure is i
 
 ---
 
+## Soulseek/slskd Integration
+
+Antra features deeply integrated, auto-managed Soulseek P2P routing powered by `slskd`, allowing it to source rare, high-resolution, and out-of-print FLAC releases completely effortlessly.
+
+- **Zero-Setup Daemon**: Antra automatically downloads, configures, and manages a native `slskd` instance in the background. No external setup required.
+- **API-Driven**: Communicates directly with the `slskd` API for seamless background searches and queuing—no separate UI needed.
+- **Painless Onboarding**: Simply provide your network credentials on the first run, and Antra permanently integrates P2P as a lossless fallback source.
+
+*(Note: You need a free network account to use this feature.)*
+
+---
+
 ## Requirements
 
 - **Windows 10 or later** (64-bit)
@@ -101,6 +113,10 @@ python -m antra <url> --format lossless
 Copy `.env.example` to `.env` and fill in what you need:
 
 ```env
+# Soulseek/slskd Integration (optional — auto-configured on first run)
+SOULSEEK_USERNAME=
+SOULSEEK_PASSWORD=
+
 # Output directory (default: ~/Music)
 ANTRA_OUTPUT_DIR=
 ```
