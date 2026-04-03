@@ -1,12 +1,6 @@
 <div align="center">
 
-<pre>
-    ___            __
-   /   |  ____  / /__________ _
-  / /| | / __ \/ __/ ___/ __ `/
- / ___ |/ / / / /_/ /  / /_/ /
-/_/  |_/_/ /_/\__/_/   \__,_/
-</pre>
+# 🎧 Antra
 
 **Your music. Offline. Lossless.**
 
@@ -19,7 +13,9 @@ Paste a supported streaming link — Antra builds your music library automatical
 
 ### [⬇ Download Latest Release](https://github.com/anandprtp/antra/releases)
 
-![Antra App Screenshot](assets/screenshots/app-preview.png)
+<img src="assets/screenshots/Screenshot%202026-04-04%20034601.png" width="800" />
+<img src="assets/screenshots/Screenshot%202026-04-04%20034621.png" width="800" />
+<img src="assets/screenshots/Screenshot%202026-04-04%20034709.png" width="800" />
 
 </div>
 
@@ -182,11 +178,9 @@ Yes. The folder structure (`Artist/Album/Track.flac`) and embedded metadata are 
 
 If Antra saves you time, consider supporting ongoing development:
 
-<a href="#">
-  <img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee" />
+<a href="https://ko-fi.com/antraverse">
+  <img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" />
 </a>
-
-*(link coming soon)*
 
 ---
 
