@@ -1,0 +1,72 @@
+:root {
+  --bg-color: #0d1c1c;
+  --fg-color: #a0d8d8;
+  --accent-color: #00ffcc;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  --font-mono: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  box-sizing: border-box;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--accent-color);
+  border-radius: 4px;
+}
+
+input, button {
+  font-family: var(--font-mono);
+}
+
+button {
+  background-color: rgba(0, 255, 204, 0.1);
+  color: var(--accent-color);
+  border: 1px solid var(--accent-color);
+  border-radius: 4px;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+button:hover {
+  background-color: var(--accent-color);
+  color: #000;
+}
+
+input[type="text"] {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: white;
+  padding: 8px;
+  border-radius: 4px;
+  width: 100%;
+}
+input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}

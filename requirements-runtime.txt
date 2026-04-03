@@ -1,0 +1,15 @@
+# ── Core runtime ─────────────────────────────────────────────────────────────
+spotipy>=2.23.0
+yt-dlp>=2024.1.1
+mutagen>=1.47.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pycryptodomex>=3.23.0
+Pillow>=10.0.0
+imageio-ffmpeg>=0.6.0
+
+# ── Soulseek / slskd integration ────────────────────────────────────────────
+slskd-api>=0.1.5
+
+# ── Optional lyrics provider wrapper ────────────────────────────────────────
+lyricsgenius>=3.0.1
