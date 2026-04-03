@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+dist/
+build/
+
+# Environment / secrets
+.env
+*.env.local
+.antra_auth.json
+.antra_qobuz_creds.json
+*.log
+
+# Desktop app build artifacts
+antra-wails/build/bin/
+antra-wails/runtime/backend/
+antra-wails/frontend/dist/
+antra-wails/frontend/node_modules/
+antra-wails/frontend/package.json.md5
+antra-wails/*.exe
+
+# Music library (user data - not part of the repo)
+Music/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
