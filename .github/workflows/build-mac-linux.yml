@@ -12,7 +12,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            name: Linux
+          - os: macos-latest
+            name: macOS
 
     steps:
       - name: Checkout Code
