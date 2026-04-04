@@ -2,7 +2,7 @@
 
 # 🎧 Antra
 
-**Get tracks in true Lossless (FLAC) from multiple hi-res streaming sources — no premium account required.**
+**Get Spotify and Apple Music tracks in true Lossless (FLAC) from multiple hi-res streaming sources — no premium account required.**
 
 <a href="https://ko-fi.com/antraverse"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" /></a>
 
