@@ -4,7 +4,6 @@ import (
 	"context"
 	"os/exec"
 	"sync"
-	"syscall"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -47,7 +46,7 @@ func (a *App) shutdown(ctx context.Context) {
 	// Fallback: kill by process name to catch any orphaned children
 	for _, name := range []string{"AntraBackend.exe", "slskd.exe"} {
 		killer := exec.Command("taskkill", "/IM", name, "/F")
-		killer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+		hideProcess(killer)
 		_ = killer.Run()
 	}
 }

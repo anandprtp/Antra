@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -197,7 +196,7 @@ func (a *App) StartDownload(playlists []string) error {
 	}
 
 	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideProcess(cmd)
 	cmd.Dir = workDir
 	cmd.Env = env
 
@@ -332,20 +331,17 @@ func (a *App) clearActiveDownload(cmd *exec.Cmd) {
 func shouldHideLogMessage(msg string) bool {
 	noisePrefixes := []string{
 		"[OK] HiFi adapter",
-		"[OK] Amazon Music adapter",
+		"[OK] Amazon adapter",
 		"[OK] Apple Music adapter",
 		"[OK] JioSaavn adapter",
-		"[OK] YouTube adapter",
 		"[OK] Qobuz adapter",
 		"[OK] Deezer adapter",
 		"[OK] Tidal adapter",
 		"[OK] YAMS adapter",
 		"[OK] Soulseek adapter",
-		"[OK] DAB adapter",
 		"[OK] Source preference",
 		"[Gate]",
 		"[HiFi]",
-		"[DAB]",
 		"[Resolver]",
 		"[DL]",
 		"[OK] Done:",
@@ -374,7 +370,7 @@ func killCommandTree(cmd *exec.Cmd) error {
 
 	if runtime.GOOS == "windows" {
 		killer := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", cmd.Process.Pid), "/T", "/F")
-		killer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+		hideProcess(killer)
 		output, err := killer.CombinedOutput()
 		if err != nil {
 			text := strings.ToLower(string(output))
@@ -408,7 +404,7 @@ func (a *App) runPythonCommand(args []string) (string, error) {
 	cmd := exec.Command(pythonExe, finalArgs...)
 	cmd.Dir = workDir
 	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideProcess(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -126,7 +125,7 @@ func runFFProbe(filePath string) (map[string]interface{}, error) {
 		"-select_streams", "a:0",
 		filePath,
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideProcess(cmd)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -154,7 +153,7 @@ func generateSpectrogram(filePath string) (string, error) {
 		"-frames:v", "1",
 		tmpFile,
 	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	hideProcess(cmd)
 
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("ffmpeg: %w — %s", err, strings.TrimSpace(string(out)))
