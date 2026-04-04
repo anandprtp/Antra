@@ -1,0 +1,239 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload artifacts to (e.g. v1.0.0)'
+        required: false
+
+jobs:
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: antra-wails/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements-desktop.txt
+
+      - name: Install UPX
+        run: |
+          choco install upx -y
+          upx --version
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build Python Backend
+        working-directory: antra-wails
+        run: |
+          New-Item -ItemType Directory -Force -Path runtime/backend | Out-Null
+          pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Build Wails App
+        working-directory: antra-wails
+        run: wails build -clean
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Antra-Windows
+          path: antra-wails/build/bin/Antra.exe
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: antra-wails/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements-desktop.txt
+
+      - name: Install Linux GUI Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.0-dev \
+            build-essential \
+            pkg-config \
+            upx \
+            libfuse2 \
+            file
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build Python Backend
+        working-directory: antra-wails
+        run: |
+          mkdir -p runtime/backend
+          pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Build Wails App
+        working-directory: antra-wails
+        run: wails build -clean
+
+      - name: Package as AppImage
+        run: |
+          # Download appimagetool
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /tmp/appimagetool
+          chmod +x /tmp/appimagetool
+
+          # Find the built binary
+          BIN=$(find antra-wails/build/bin -maxdepth 1 -type f -executable | head -1)
+
+          # Create AppDir structure
+          mkdir -p AppDir/usr/bin
+          cp "$BIN" AppDir/usr/bin/Antra
+
+          # Desktop entry
+          cat > AppDir/Antra.desktop <<'EOF'
+          [Desktop Entry]
+          Name=Antra
+          Exec=Antra
+          Icon=Antra
+          Type=Application
+          Categories=AudioVideo;Audio;
+          EOF
+
+          # Icon (use the one bundled in the repo if it exists, otherwise create a placeholder)
+          if [ -f antra-wails/build/appicon.png ]; then
+            cp antra-wails/build/appicon.png AppDir/Antra.png
+          elif [ -f antra-wails/frontend/src/assets/images/logo-universal.png ]; then
+            cp antra-wails/frontend/src/assets/images/logo-universal.png AppDir/Antra.png
+          else
+            # 1x1 transparent PNG as placeholder
+            printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > AppDir/Antra.png
+          fi
+
+          # AppRun symlink
+          ln -s usr/bin/Antra AppDir/AppRun
+
+          # Build the AppImage
+          ARCH=x86_64 /tmp/appimagetool AppDir Antra-Linux.AppImage
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Antra-Linux
+          path: Antra-Linux.AppImage
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: antra-wails/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Python Dependencies
+        run: pip install -r requirements-desktop.txt
+
+      - name: Install macOS Dependencies
+        run: brew install create-dmg upx || true
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Build Python Backend
+        working-directory: antra-wails
+        run: |
+          mkdir -p runtime/backend
+          pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Build Wails App
+        working-directory: antra-wails
+        run: wails build -clean
+
+      - name: Package as DMG
+        run: |
+          APP=$(find antra-wails/build/bin -maxdepth 1 -name "*.app" | head -1)
+          create-dmg \
+            --volname "Antra" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "$(basename $APP)" 175 190 \
+            --hide-extension "$(basename $APP)" \
+            --app-drop-link 425 190 \
+            "Antra-macOS.dmg" \
+            "$APP"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Antra-macOS
+          path: Antra-macOS.dmg
+
+  release:
+    name: Upload to Release
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.tag != ''
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event.inputs.tag }}" != "" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            dist/Antra-Windows/Antra.exe
+            dist/Antra-Linux/Antra-Linux.AppImage
+            dist/Antra-macOS/Antra-macOS.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
