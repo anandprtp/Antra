@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os/exec"
+	"runtime"
 	"sync"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -43,10 +44,12 @@ func (a *App) shutdown(ctx context.Context) {
 		_ = killCommandTree(cmd)
 	}
 
-	// Fallback: kill by process name to catch any orphaned children
-	for _, name := range []string{"AntraBackend.exe", "slskd.exe"} {
-		killer := exec.Command("taskkill", "/IM", name, "/F")
-		hideProcess(killer)
-		_ = killer.Run()
+	// Windows-only fallback: kill by process name to catch any orphaned children
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"AntraBackend.exe", "slskd.exe"} {
+			killer := exec.Command("taskkill", "/IM", name, "/F")
+			hideProcess(killer)
+			_ = killer.Run()
+		}
 	}
 }

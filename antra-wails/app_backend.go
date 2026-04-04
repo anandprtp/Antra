@@ -36,8 +36,17 @@ type HistoryItem struct {
 }
 
 func getAppDataDir() string {
-	localAppData := os.Getenv("LOCALAPPDATA")
-	return filepath.Join(localAppData, "Antra")
+	switch runtime.GOOS {
+	case "windows":
+		localAppData := os.Getenv("LOCALAPPDATA")
+		return filepath.Join(localAppData, "Antra")
+	case "darwin":
+		home := os.Getenv("HOME")
+		return filepath.Join(home, "Library", "Application Support", "Antra")
+	default:
+		home := os.Getenv("HOME")
+		return filepath.Join(home, ".local", "share", "Antra")
+	}
 }
 
 func getConfigPath() string {

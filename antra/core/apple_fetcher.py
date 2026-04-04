@@ -119,9 +119,11 @@ class AppleFetcher:
             logger.info(f"[Apple] Detected album URL — album ID {entity_id}")
             return self._fetch_album(entity_id, storefront)
 
-        # playlist
+        # playlist — extract human-readable name from URL slug as fallback
+        slug_match = re.search(r"/playlist/([^/]+)/", url)
+        url_slug_name = slug_match.group(1).replace("-", " ").title() if slug_match else "Apple Music Playlist"
         logger.info(f"[Apple] Detected playlist URL — {entity_id}")
-        return self._fetch_playlist(entity_id, storefront)
+        return self._fetch_playlist(entity_id, storefront, url_slug_name=url_slug_name)
 
     # ── Song ──────────────────────────────────────────────────────────────────
 
@@ -204,7 +206,7 @@ class AppleFetcher:
 
     # ── Playlist ──────────────────────────────────────────────────────────────
 
-    def _fetch_playlist(self, playlist_id: str, storefront: str = "us") -> list[TrackMetadata]:
+    def _fetch_playlist(self, playlist_id: str, storefront: str = "us", url_slug_name: str = "Apple Music Playlist") -> list[TrackMetadata]:
         """
         Fetch tracks from an Apple Music playlist via the Catalog API.
 
@@ -223,12 +225,37 @@ class AppleFetcher:
         # RSS fallback (Apple curated playlists only, ~20 tracks)
         tracks = self._playlist_via_rss(playlist_id, storefront)
         if tracks:
+            for i, track in enumerate(tracks):
+                if not track.playlist_name:
+                    track.playlist_name = url_slug_name
+                    track.playlist_position = track.playlist_position or (i + 1)
             return tracks
 
         raise RuntimeError(
             f"[Apple] Could not fetch playlist {playlist_id}.\n"
             "For user-created or private Apple Music playlists, set APPLE_DEVELOPER_TOKEN in your .env."
         )
+
+    def _fetch_playlist_name(self, playlist_id: str, storefront: str, token: str) -> str:
+        """Fetch the playlist name from the Catalog API."""
+        try:
+            resp = self._session.get(
+                f"{_AM_CATALOG.format(storefront=storefront)}/playlists/{playlist_id}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Origin": "https://music.apple.com",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.ok:
+                data = resp.json().get("data", [])
+                if data:
+                    name = data[0].get("attributes", {}).get("name", "")
+                    if name:
+                        return name
+        except Exception as e:
+            logger.debug(f"[Apple] Could not fetch playlist name: {e}")
+        return "Apple Music Playlist"
 
     def _playlist_via_catalog_api(
         self,
@@ -237,6 +264,8 @@ class AppleFetcher:
         token: str,
     ) -> list[TrackMetadata]:
         """Paginate through the Apple Music Catalog API to fetch all playlist tracks."""
+        playlist_name = self._fetch_playlist_name(playlist_id, storefront, token)
+
         base_url = f"{_AM_CATALOG.format(storefront=storefront)}/playlists/{playlist_id}/tracks"
         headers = {
             "Authorization": f"Bearer {token}",
@@ -277,6 +306,7 @@ class AppleFetcher:
                 attrs = item.get("attributes", {})
                 meta = self._catalog_item_to_metadata(attrs)
                 if meta:
+                    meta.playlist_name = playlist_name
                     meta.playlist_position = len(tracks) + 1
                     tracks.append(meta)
 
@@ -287,7 +317,7 @@ class AppleFetcher:
             if url:
                 time.sleep(0.2)  # polite pacing
 
-        logger.info(f"[Apple] Fetched {len(tracks)} tracks from playlist via Catalog API")
+        logger.info(f"[Apple] Fetched {len(tracks)} tracks from playlist '{playlist_name}' via Catalog API")
         return tracks
 
     def _playlist_via_rss(self, playlist_id: str, storefront: str) -> list[TrackMetadata]:

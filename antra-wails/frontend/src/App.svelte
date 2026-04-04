@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { GetConfig, SaveConfig, PickDirectory, StartDownload, CancelDownload, GetHistory, AddHistory, ClearHistory } from '../wailsjs/go/main/App.js';
   import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile } from '../wailsjs/go/main/App.js';
-  import { BrowserOpenURL, EventsOn } from '../wailsjs/runtime/runtime.js';
+  import { EventsOn } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
 
   let config: main.Config = {
@@ -619,7 +619,7 @@
 /_/  |_/_/ |_/  /_/   /_/ |_/ /_/  |_|
       </pre>
       <p>Your music. Offline. Lossless.</p>
-      <p style="font-size: 12px; opacity: 0.5; margin-top: -8px;">Paste a Spotify, Apple Music, or YouTube playlist and Antra builds your music library automatically.</p>
+      <p style="font-size: 12px; opacity: 0.5; margin-top: -8px;">Paste a Spotify or Apple Music playlist and Antra builds your music library automatically.</p>
       <p style="font-size: 11px; opacity: 0.35; margin-top: -4px; letter-spacing: 0.04em;">OPTIMIZED FOR NAVIDROME &amp; JELLYFIN</p>
     </div>
 
@@ -676,7 +676,7 @@
         <input
           type="text"
           bind:value={inputUrl}
-          placeholder="Paste a Spotify, Apple Music, or YouTube playlist URL to build your library..."
+          placeholder="Paste a Spotify or Apple Music playlist URL to build your library..."
           disabled={isDownloading}
           on:keydown={(e) => e.key === 'Enter' && startDownload()}
         />

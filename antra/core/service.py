@@ -20,13 +20,12 @@ from antra.core.models import (
 )
 from antra.core.resolver import SourceResolver
 from antra.core.spotify import SpotifyClient
-from antra.sources.youtube import YouTubeAdapter
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PREFERENCE_CHOICES = ("auto", "hifi", "soulseek", "dab", "jiosaavn", "youtube")
+SOURCE_PREFERENCE_CHOICES = ("auto", "hifi", "amazon", "soulseek", "jiosaavn")
 OUTPUT_FORMAT_CHOICES = ("source", "flac", "m4a", "aac", "mp3")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
 SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
@@ -61,9 +60,9 @@ def describe_source_preference(value: Optional[str]) -> str:
     normalized = normalize_source_preference(value)
     labels = {
         "auto": "auto",
-        "priority-2": "hifi / dab -> soulseek -> jiosaavn / youtube",
-        "priority-3": "jiosaavn / youtube",
-        "priority-4": "jiosaavn / youtube",
+        "priority-2": "hifi / dab -> soulseek -> jiosaavn",
+        "priority-3": "jiosaavn",
+        "priority-4": "jiosaavn",
     }
     return labels.get(normalized, normalized)
 
@@ -122,17 +121,17 @@ class AntraService:
         if not normalized or normalized == "auto":
             return adapters
         if normalized == "soulseek":
-            preferred_order = ["soulseek", "hifi", "jiosaavn", "youtube"]
+            preferred_order = ["soulseek", "hifi", "jiosaavn"]
             by_name = {adapter.name: adapter for adapter in adapters}
             return [by_name[name] for name in preferred_order if name in by_name]
         if normalized == "priority-2":
-            allowed = {"hifi", "dab", "soulseek", "jiosaavn", "youtube"}
+            allowed = {"hifi", "amazon", "soulseek", "jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         if normalized == "priority-3":
-            allowed = {"jiosaavn", "youtube"}
+            allowed = {"jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         if normalized == "priority-4":
-            allowed = {"jiosaavn", "youtube"}
+            allowed = {"jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         return [adapter for adapter in adapters if adapter.name == normalized]
 
@@ -146,7 +145,21 @@ class AntraService:
         """Build and return all configured source adapters."""
         adapters: list = []
 
-        # HiFi (free FLAC via community Tidal proxy — highest priority, no account needed)
+        # Amazon Music (free FLAC via community proxy — highest priority, no account needed)
+        if cfg.amazon_enabled and cfg.amazon_mirrors:
+            try:
+                from antra.sources.amazon import AmazonAdapter
+                amazon = AmazonAdapter(
+                    mirrors=cfg.amazon_mirrors,
+                    api_key=cfg.odesli_api_key or None,
+                )
+                if amazon.is_available():
+                    adapters.append(amazon)
+                    logger.info("[OK] Amazon adapter enabled (free FLAC via community proxy)")
+            except Exception as e:
+                logger.warning(f"Amazon adapter failed to initialize: {e}")
+
+        # HiFi (free FLAC via community Tidal proxy — no account needed)
         try:
             from antra.sources.hifi import HifiAdapter
             hifi = HifiAdapter()
@@ -202,17 +215,6 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Soulseek adapter failed to initialize: {e}")
 
-        # DAB Music (free FLAC via dab.yeet.su — runs after Debrid)
-        if cfg.dab_enabled:
-            try:
-                from antra.sources.dab import DabAdapter
-                dab = DabAdapter()
-                if dab.is_available():
-                    adapters.append(dab)
-                    logger.info("[OK] DAB adapter enabled (free FLAC via dab.yeet.su)")
-            except Exception as e:
-                logger.warning(f"DAB adapter failed to initialize: {e}")
-
         # Qobuz (user credentials — lossless FLAC)
         if cfg.qobuz_email and cfg.qobuz_password and "@example.com" not in cfg.qobuz_email:
             try:
@@ -254,16 +256,6 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"JioSaavn adapter failed to initialize: {e}")
 
-        # YouTube — explicit-only by default; yt-dlp warning only shown when requested
-        source_preference = getattr(cfg, "source_preference", None)
-        youtube_explicit = normalize_source_preference(source_preference) == "youtube"
-        yt = YouTubeAdapter(explicit_only=not youtube_explicit)
-        if yt.is_available() or not youtube_explicit:
-            adapters.append(yt)
-            if youtube_explicit:
-                logger.info("[OK] YouTube adapter enabled (explicit mode)")
-        elif youtube_explicit:
-            logger.error("yt-dlp not installed. Run: pip install yt-dlp")
 
         source_preference = getattr(cfg, "source_preference", None)
         filtered = self._filter_adapters_by_source_preference(adapters, source_preference)
@@ -285,10 +277,6 @@ class AntraService:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
 
-        # Handle universal YouTube / YT Music intercepts
-        if "youtube.com" in playlist or "youtu.be" in playlist:
-            return self._fetch_youtube_tracks(playlist, cfg)
-
         # Handle Apple Music URLs
         if "music.apple.com" in playlist:
             return self._fetch_apple_tracks(playlist, cfg)
@@ -303,172 +291,6 @@ class AntraService:
         developer_token = getattr(cfg, "apple_developer_token", "") or None
         fetcher = AppleFetcher(developer_token=developer_token)
         return fetcher.fetch(url)
-
-    def _fetch_youtube_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
-        import yt_dlp
-        import re
-
-        # Detect auto-generated YouTube Mix (Radio) playlists
-        is_mix_playlist = "list=RD" in url or "start_radio=1" in url
-
-        if is_mix_playlist:
-            print("\n! This is a YouTube auto-generated Mix (Radio).")
-            print("Tracks are dynamic and may change.")
-            print("Only a limited number of songs can be extracted.")
-            print("\nFor best results:")
-            print("-> Save this Mix as a playlist in YouTube Music")
-            print("-> Then use the playlist link")
-
-            try:
-                ans = input("\nContinue anyway? [Y/N]: ").strip().lower()
-                if ans != 'y':
-                    logger.info("User aborted dynamic mix extraction.")
-                    return []
-            except (EOFError, Exception):
-                logger.warning("Non-interactive environment detected. Proceeding automatically with capped mix extraction.")
-                pass
-
-        # We only want flat metadata, avoid resolving actual video streams
-        ydl_opts = {
-            'extract_flat': True,
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': True
-        }
-
-        if is_mix_playlist:
-            ydl_opts['playlistend'] = 50
-            logger.info("Capped YouTube Mix playlist extraction to 50 tracks.")
-
-        logger.info(f"Extracting YouTube metadata for: {url}")
-
-        spotify = self._make_spotify_client(cfg)
-
-        def _enrich_metadata(title: str, channel: str, duration: Optional[float], thumb: Optional[str],
-                             fallback_album: str, track_num: int, stream_id: Optional[str]) -> TrackMetadata:
-            search_query = ""
-
-            # 1. Broadly purge all bracketed blocks
-            clean_title = re.sub(r'[\(\[].*?[\)\]]', '', title).strip()
-            # 2. Drop recurring un-bracketed YouTube terminology
-            clean_title = re.sub(r'(?i)\b(hd|hq|4k|audio|official|video|lyric|lyrics|full song|title song|new song|edited)\b', '', clean_title).strip()
-            # 3. Strip trailing tags separated by pipes or slashes
-            clean_title = re.sub(r'\s*[|/].*$', '', clean_title).strip()
-            # 4. Collapse hanging spaces
-            clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-
-            if ' - ' in clean_title:
-                parts = clean_title.split(' - ', 1)
-                if len(parts[0].strip()) > 0 and len(parts[1].strip()) > 0:
-                    search_query = f"{parts[0].strip()} {parts[1].strip()}"
-                else:
-                    search_query = f"{clean_title} {channel}"
-            else:
-                search_query = f"{clean_title} {channel}"
-
-            # Pass 1 Search: Strict or appended with Uploader
-            meta = spotify.search_track(search_query)
-
-            # Pass 2 Fallback: If 0 hits, the uploader might be random. Try pure stripped title.
-            if not meta and search_query != clean_title and clean_title:
-                meta = spotify.search_track(clean_title)
-
-            if meta:
-                meta.playlist_name = fallback_album
-                meta.playlist_position = track_num
-                meta.stream_id = stream_id
-                if not meta.artwork_url and thumb:
-                    meta.artwork_url = thumb
-                if duration:
-                    meta.duration_ms = int(duration * 1000)
-                return meta
-
-            track_meta = TrackMetadata(
-                title=clean_title or title,
-                artists=[channel],
-                album=fallback_album,
-                duration_ms=int(duration * 1000) if duration else None,
-                track_number=track_num,
-                disc_number=1,
-                artwork_url=thumb
-            )
-            # Attach stream_id dynamically so components can use it if they check
-            track_meta.stream_id = stream_id
-            return track_meta
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-            if not info:
-                raise ValueError("Could not extract YouTube metadata")
-
-            tracks = []
-
-            # YouTube Playlists return an 'entries' mapping
-            if 'entries' in info:
-                playlist_title = info.get('title', 'YouTube Playlist')
-                for i, entry in enumerate(info['entries']):
-                    if not entry:
-                        continue
-
-                    actual_track = entry.get('track')
-                    actual_artist = entry.get('artist')
-                    title = entry.get('title', 'Unknown Title')
-                    channel = entry.get('uploader') or entry.get('channel') or 'Unknown Artist'
-                    duration = entry.get('duration')
-                    stream_id = entry.get('id')
-
-                    # Some flat extractions don't provide raw thumbnails properly, check common keys
-                    thumb = None
-                    thumbnails = entry.get("thumbnails", [])
-                    if thumbnails and isinstance(thumbnails, list):
-                        thumb = thumbnails[-1].get("url")
-                    if not thumb:
-                        thumb = entry.get("thumbnail") or entry.get("url")
-
-                    if actual_track and actual_artist:
-                        search_query = f"{actual_artist} {actual_track}"
-                        meta = spotify.search_track(search_query)
-                        if meta:
-                            meta.playlist_name = playlist_title
-                            meta.playlist_position = i + 1
-                            meta.stream_id = stream_id
-                            if not meta.artwork_url and thumb:
-                                meta.artwork_url = thumb
-                            if duration:
-                                meta.duration_ms = int(duration * 1000)
-                            tracks.append(meta)
-                            continue
-
-                    track_meta = _enrich_metadata(title, channel, duration, thumb, playlist_title, i + 1, stream_id)
-                    tracks.append(track_meta)
-
-                return tracks
-
-            # Single YouTube Music/Standard Video Track fallback
-            title = info.get('title', 'Unknown Title')
-            channel = info.get('uploader') or info.get('channel') or 'Unknown Artist'
-            duration = info.get('duration')
-            thumb = info.get('thumbnail')
-            stream_id = info.get('id')
-
-            actual_track = info.get('track')
-            actual_artist = info.get('artist')
-
-            if actual_track and actual_artist:
-                search_query = f"{actual_artist} {actual_track}"
-                meta = spotify.search_track(search_query)
-                if meta:
-                    meta.playlist_name = "YouTube Single"
-                    meta.playlist_position = 1
-                    meta.stream_id = stream_id
-                    if not meta.artwork_url and thumb:
-                        meta.artwork_url = thumb
-                    if duration:
-                        meta.duration_ms = int(duration * 1000)
-                    return [meta]
-
-            return [_enrich_metadata(title, channel, duration, thumb, "YouTube Single", 1, stream_id)]
 
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
         return self._spotify_client_factory(

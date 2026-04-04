@@ -44,7 +44,6 @@ SOURCE_PROMPT_RANKS = {
     "amazon": 3,
     "soulseek": 4,
     "jiosaavn": 5,
-    "youtube": 5,
 }
 
 OUTPUT_FORMAT_PROMPT_RANKS = {
@@ -602,7 +601,7 @@ def main(argv=None):
         print("  Copy .env.example to .env and fill in your real Developer App credentials.")
         sys.exit(1)
 
-    # Expand 'liked-songs' shorthand
+    # Expand 'liked-songs' shorthand into the Playwright sentinel URL
     _LIKED_SENTINELS = {"liked-songs", "liked_songs", "liked", "me:liked"}
     expanded_playlists = [
         "https://open.spotify.com/collection/tracks"

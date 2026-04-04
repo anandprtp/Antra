@@ -43,7 +43,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev upx
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            pkg-config \
+            upx
+
+      - name: Install macOS Dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install upx || true
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
@@ -54,21 +64,29 @@ jobs:
           mkdir -p runtime/backend
           pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
 
-      - name: Build Wails App
+      - name: Build Wails App (Linux)
+        if: runner.os == 'Linux'
+        working-directory: antra-wails
+        run: wails build -clean -tags webkit2gtk_4_1
+
+      - name: Build Wails App (macOS)
+        if: runner.os == 'macOS'
         working-directory: antra-wails
         run: wails build -clean
 
       - name: Package Linux Binary
         if: runner.os == 'Linux'
         run: |
-          mv antra-wails/build/bin/antra antra-wails/build/bin/Antra-Linux || mv antra-wails/build/bin/Antra antra-wails/build/bin/Antra-Linux || true
-          chmod +x antra-wails/build/bin/Antra-Linux || true
+          BIN=$(find antra-wails/build/bin -maxdepth 1 -type f ! -name "*.app" | head -1)
+          mv "$BIN" antra-wails/build/bin/Antra-Linux
+          chmod +x antra-wails/build/bin/Antra-Linux
 
       - name: Package macOS App
         if: runner.os == 'macOS'
         run: |
           cd antra-wails/build/bin
-          tar -czvf Antra-MacOS.tar.gz antra.app || tar -czvf Antra-MacOS.tar.gz Antra.app || true
+          APP=$(find . -maxdepth 1 -name "*.app" | head -1)
+          tar -czvf Antra-MacOS.tar.gz "$APP"
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1

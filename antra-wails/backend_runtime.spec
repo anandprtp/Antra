@@ -21,7 +21,6 @@ ENTRY = ROOT / "antra" / "json_cli.py"
 hiddenimports = (
     collect_submodules("antra")
     + collect_submodules("spotipy")
-    + collect_submodules("yt_dlp")
     + collect_submodules("mutagen")
     + collect_submodules("requests")
     + collect_submodules("urllib3")
