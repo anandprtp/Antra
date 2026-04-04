@@ -48,9 +48,10 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
       - name: Build Python Backend
+        working-directory: antra-wails
         run: |
-          mkdir -p antra-wails/runtime/backend
-          pyinstaller antra-wails/backend_runtime.spec --distpath antra-wails/runtime/backend --noconfirm
+          mkdir -p runtime/backend
+          pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
 
       - name: Build Wails App
         working-directory: antra-wails
@@ -70,7 +71,7 @@ jobs:
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
             antra-wails/build/bin/Antra-Linux
