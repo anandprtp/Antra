@@ -132,6 +132,12 @@ Output: `antra-wails/build/bin/Antra.exe`
 
 ---
 
+## 🚀 Upcoming Features (Supporter Exclusive)
+
+Currently in development for Antra supporters: a seamless Spotify integration that syncs your **Saved Playlists**. With just an auth token (no intrusive logins required), Antra will automatically allow you to setup a recurring schedule to sync your Spotify playlists every 24 hours.
+
+---
+
 ## FAQ
 
 <details>
@@ -147,9 +153,9 @@ No. Antra works without any premium account.
 </details>
 
 <details>
-<summary>Where does the audio come from?</summary>
+<summary>What are the music sources?</summary>
 
-Audio is sourced from licensed streaming services via their APIs. Antra finds the best quality version available from multiple sources and downloads it.
+Community run Hi-Fi and Amazon endpoints which get you the highest possible FLAC available on the internet, for free.
 </details>
 
 <details>
@@ -169,6 +175,14 @@ By default, Antra keeps the source format (FLAC, ALAC, M4A, or MP3). You can for
 
 Yes. The folder structure (`Artist/Album/Track.flac`) and embedded metadata are fully compatible with Navidrome, Jellyfin, and Plex.
 </details>
+
+---
+
+## 🙌 Acknowledgements
+
+A massive shoutout to the **Community run Hifi-APIs** that made these lossless downloads possible! 
+
+While those APIs originally laid the foundation, Antra builds heavily on top of them to make the engine significantly faster and solves critical reliability problems. Previously, you might occasionally get truncated music or something other than the exact song requested. With Antra's strict filtering engine, you are guaranteed to get exactly the right song, fully intact, and in the highest quality.
 
 ---
 
