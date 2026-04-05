@@ -134,26 +134,13 @@ jobs:
           fi
 
           # Desktop entry
-          cat > AppDir/Antra.desktop << 'DESKTOP'
-[Desktop Entry]
-Name=Antra
-Exec=Antra
-Icon=Antra
-Type=Application
-Categories=AudioVideo;Audio;
-DESKTOP
+          printf '[Desktop Entry]\nName=Antra\nExec=Antra\nIcon=Antra\nType=Application\nCategories=AudioVideo;Audio;\n' > AppDir/Antra.desktop
 
           # Icon
           cp antra-wails/build/appicon.png AppDir/Antra.png
 
           # AppRun — sets up library paths and launches the binary
-          cat > AppDir/AppRun << 'APPRUN'
-#!/bin/bash
-HERE="$(dirname "$(readlink -f "${0}")")"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
-export WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkit2gtk-4.1"
-exec "${HERE}/usr/bin/Antra" "$@"
-APPRUN
+          printf '#!/bin/bash\nHERE="$(dirname "$(readlink -f "${0}")")"\nexport LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"\nexport WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkit2gtk-4.1"\nexec "${HERE}/usr/bin/Antra" "$@"\n' > AppDir/AppRun
           chmod +x AppDir/AppRun
 
           # Build the AppImage
