@@ -549,7 +549,11 @@
   async function startDownload() {
     if (!inputUrl) return;
 
-    let urls = inputUrl.split(',').map(s => s.trim()).filter(Boolean);
+    // Accept one URL per line, or comma-separated, or both
+    let urls = inputUrl
+      .split(/[\n,]+/)
+      .map(s => s.trim())
+      .filter(s => s.startsWith('http'));
     if (urls.length === 0) return;
 
     isDownloading = true;
@@ -672,19 +676,20 @@
           <button on:click={() => showSettings = true} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">⚙️ Settings</button>
         </div>
       </div>
-      <div class="input-bar" style="margin-top: 16px; display: flex; gap: 8px;">
-        <input
-          type="text"
+      <div class="input-bar" style="margin-top: 16px; display: flex; gap: 8px; align-items: flex-start;">
+        <textarea
           bind:value={inputUrl}
-          placeholder="Paste a Spotify or Apple Music playlist URL to build your library..."
+          placeholder="Paste one or more Spotify / Apple Music URLs (one per line)..."
           disabled={isDownloading}
-          on:keydown={(e) => e.key === 'Enter' && startDownload()}
-        />
+          rows="3"
+          on:keydown={(e) => e.key === 'Enter' && e.ctrlKey && startDownload()}
+          style="resize: vertical; min-height: 44px; max-height: 160px; font-family: inherit; font-size: 13px;"
+        ></textarea>
         {#if isDownloading}
-          <button on:click={cancelDownload} style="background: var(--error-color); color: white; border-color: var(--error-color);">Stop</button>
+          <button on:click={cancelDownload} style="background: var(--error-color); color: white; border-color: var(--error-color); align-self: stretch;">Stop</button>
         {:else}
-          <button on:click={startDownload} disabled={!inputUrl}>
-            Add to Library
+          <button on:click={startDownload} disabled={!inputUrl} style="align-self: stretch;">
+            Add to<br>Library
           </button>
         {/if}
     </div>

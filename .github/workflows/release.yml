@@ -62,7 +62,7 @@ jobs:
 
   build-linux:
     name: Build Linux
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -87,12 +87,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
+            libwebkit2gtk-4.1-dev \
             build-essential \
             pkg-config \
             upx \
             libfuse2 \
-            file
+            file \
+            patchelf
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
@@ -105,7 +106,7 @@ jobs:
 
       - name: Build Wails App
         working-directory: antra-wails
-        run: wails build -clean
+        run: wails build -clean -tags webkit2gtk_4_1
 
       - name: Package as AppImage
         run: |
@@ -117,31 +118,43 @@ jobs:
           BIN=$(find antra-wails/build/bin -maxdepth 1 -type f -executable | head -1)
 
           # Create AppDir structure
-          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/bin AppDir/usr/lib
+
           cp "$BIN" AppDir/usr/bin/Antra
 
-          # Desktop entry
-          cat > AppDir/Antra.desktop <<'EOF'
-          [Desktop Entry]
-          Name=Antra
-          Exec=Antra
-          Icon=Antra
-          Type=Application
-          Categories=AudioVideo;Audio;
-          EOF
-
-          # Icon (use the one bundled in the repo if it exists, otherwise create a placeholder)
-          if [ -f antra-wails/build/appicon.png ]; then
-            cp antra-wails/build/appicon.png AppDir/Antra.png
-          elif [ -f antra-wails/frontend/src/assets/images/logo-universal.png ]; then
-            cp antra-wails/frontend/src/assets/images/logo-universal.png AppDir/Antra.png
-          else
-            # 1x1 transparent PNG as placeholder
-            printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > AppDir/Antra.png
+          # Bundle webkit2gtk-4.1 and gstreamer libs so the AppImage is portable
+          WEBKIT_LIBS=$(dpkg -L libwebkit2gtk-4.1-0 2>/dev/null | grep '\.so' || true)
+          for lib in $WEBKIT_LIBS; do
+            [ -f "$lib" ] && cp -n "$lib" AppDir/usr/lib/ 2>/dev/null || true
+          done
+          # Copy webkit2 auxiliary process and resources
+          if [ -d /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 ]; then
+            mkdir -p AppDir/usr/lib/webkit2gtk-4.1
+            cp -r /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/* AppDir/usr/lib/webkit2gtk-4.1/ 2>/dev/null || true
           fi
 
-          # AppRun symlink
-          ln -s usr/bin/Antra AppDir/AppRun
+          # Desktop entry
+          cat > AppDir/Antra.desktop << 'DESKTOP'
+[Desktop Entry]
+Name=Antra
+Exec=Antra
+Icon=Antra
+Type=Application
+Categories=AudioVideo;Audio;
+DESKTOP
+
+          # Icon
+          cp antra-wails/build/appicon.png AppDir/Antra.png
+
+          # AppRun — sets up library paths and launches the binary
+          cat > AppDir/AppRun << 'APPRUN'
+#!/bin/bash
+HERE="$(dirname "$(readlink -f "${0}")")"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+export WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkit2gtk-4.1"
+exec "${HERE}/usr/bin/Antra" "$@"
+APPRUN
+          chmod +x AppDir/AppRun
 
           # Build the AppImage
           ARCH=x86_64 /tmp/appimagetool AppDir Antra-Linux.AppImage
