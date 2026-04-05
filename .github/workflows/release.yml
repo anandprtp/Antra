@@ -145,7 +145,7 @@ jobs:
           printf '[Desktop Entry]\nName=Antra\nExec=Antra\nIcon=Antra\nType=Application\nCategories=AudioVideo;Audio;\n' > AppDir/Antra.desktop
 
           # Icon
-          cp antra-wails/build/appicon.png AppDir/Antra.png
+          cp antra-wails/frontend/src/assets/images/logo-universal.png AppDir/Antra.png
 
           # AppRun — sets up library paths and launches the binary
           printf '#!/bin/bash\nHERE="$(dirname "$(readlink -f "${0}")")"\nexport LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"\nexport WEBKIT_EXEC_PATH="${HERE}/usr/lib/webkit2gtk-4.1"\nexec "${HERE}/usr/bin/Antra" "$@"\n' > AppDir/AppRun
