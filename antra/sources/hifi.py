@@ -672,9 +672,11 @@ class HifiAdapter(BaseSourceAdapter):
         """
         try:
             import subprocess
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
             result = subprocess.run(
                 [
-                    "ffmpeg", "-y",
+                    ffmpeg, "-y",
                     "-i", input_path,
                     "-c", "copy",
                     "-f", "flac",
@@ -694,6 +696,8 @@ class HifiAdapter(BaseSourceAdapter):
     def _try_ffmpeg_concat(segment_files: list[str], output_path: str) -> bool:
         """Use ffmpeg to concat segments into a clean output file."""
         try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
             # Write a concat list file
             tmp_list = tempfile.NamedTemporaryFile(
                 mode="w", suffix=".txt", delete=False
@@ -704,7 +708,7 @@ class HifiAdapter(BaseSourceAdapter):
 
             result = subprocess.run(
                 [
-                    "ffmpeg", "-y",
+                    ffmpeg, "-y",
                     "-f", "concat",
                     "-safe", "0",
                     "-i", tmp_list.name,

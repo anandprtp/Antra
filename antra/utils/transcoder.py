@@ -36,7 +36,8 @@ class AudioTranscoder:
             return False
         if target_format == "lossless":
             ext = os.path.splitext(file_path)[1].lower()
-            return ext not in {".flac", ".m4a"}
+            # .m4a can be ALAC (lossless) but we still convert to .flac for uniformity
+            return ext not in {".flac"}
 
         ext = os.path.splitext(file_path)[1].lower()
         target_ext = OUTPUT_FORMAT_EXTENSION[target_format]
@@ -46,9 +47,9 @@ class AudioTranscoder:
         if target_format == "source":
             return file_path
         if target_format == "lossless":
-            if not self.needs_conversion(file_path, target_format):
-                return file_path
             target_format = "flac"
+            if not self.needs_conversion(file_path, "lossless"):
+                return file_path
         if not self.needs_conversion(file_path, target_format):
             return file_path
         from antra.utils.runtime import get_ffmpeg_exe

@@ -11,7 +11,7 @@
     soulseek_username: '',
     soulseek_password: '',
     first_run_complete: false,
-    output_format: 'auto'
+    output_format: 'lossless'
   };
 
   let isLoading = true;
@@ -58,7 +58,7 @@
         setupMode = true;
       }
       if (!config.output_format) {
-        config.output_format = 'auto';
+        config.output_format = 'lossless';
       }
     } catch (e) {
       console.error('Failed to load config', e);
