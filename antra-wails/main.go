@@ -12,9 +12,6 @@ import (
 //go:embed all:frontend/dist
 var assets embed.FS
 
-//go:embed build/appicon.png
-var appIcon []byte
-
 func main() {
 	// Create an instance of the app structure
 	app := NewApp()
@@ -37,7 +34,6 @@ func main() {
 		OnStartup:    app.startup,
 		OnDomReady:   app.domReady,
 		OnShutdown:   app.shutdown,
-		Icon:         appIcon,
 		Windows: &windows.Options{
 			WebviewIsTransparent: false,
 			WindowIsTranslucent:  false,
