@@ -17,6 +17,8 @@ jobs:
   build-windows:
     name: Build Windows
     runs-on: windows-latest
+    env:
+      WAILS_VERSION: v2.12.0
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +44,7 @@ jobs:
           upx --version
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -62,7 +64,9 @@ jobs:
 
   build-linux:
     name: Build Linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      WAILS_VERSION: v2.12.0
     steps:
       - uses: actions/checkout@v4
 
@@ -96,7 +100,7 @@ jobs:
             patchelf
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -106,7 +110,7 @@ jobs:
 
       - name: Build Wails App
         working-directory: antra-wails
-        run: wails build -clean -tags webkit2gtk_4_1
+        run: wails build -clean -tags webkit2_41
 
       - name: Package as AppImage
         run: |
@@ -122,15 +126,19 @@ jobs:
 
           cp "$BIN" AppDir/usr/bin/Antra
 
-          # Bundle webkit2gtk-4.1 and gstreamer libs so the AppImage is portable
-          WEBKIT_LIBS=$(dpkg -L libwebkit2gtk-4.1-0 2>/dev/null | grep '\.so' || true)
+          # Bundle webkit2gtk-4.1 libs so the AppImage matches Ubuntu 24.04
+          WEBKIT_LIBS=$(dpkg -L libwebkit2gtk-4.1-dev 2>/dev/null | grep '\.so' || true)
           for lib in $WEBKIT_LIBS; do
             [ -f "$lib" ] && cp -n "$lib" AppDir/usr/lib/ 2>/dev/null || true
           done
-          # Copy webkit2 auxiliary process and resources
+          # Copy the actual shared libs
+          for lib in /usr/lib/x86_64-linux-gnu/libwebkit2gtk-4.1* /usr/lib/x86_64-linux-gnu/libjavascriptcoregtk-4.1*; do
+            [ -f "$lib" ] && cp -n "$lib" AppDir/usr/lib/ 2>/dev/null || true
+          done
+          # Copy webkit2 auxiliary processes and resources
           if [ -d /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1 ]; then
             mkdir -p AppDir/usr/lib/webkit2gtk-4.1
-            cp -r /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/* AppDir/usr/lib/webkit2gtk-4.1/ 2>/dev/null || true
+            cp -r /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/. AppDir/usr/lib/webkit2gtk-4.1/ 2>/dev/null || true
           fi
 
           # Desktop entry
@@ -155,6 +163,8 @@ jobs:
   build-macos:
     name: Build macOS
     runs-on: macos-latest
+    env:
+      WAILS_VERSION: v2.12.0
     steps:
       - uses: actions/checkout@v4
 
@@ -178,7 +188,7 @@ jobs:
         run: brew install create-dmg upx || true
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Build Python Backend
         working-directory: antra-wails
