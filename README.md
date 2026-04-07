@@ -7,6 +7,8 @@
 <a href="https://ko-fi.com/antraverse"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" /></a>
 
 ![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-12%2B-000000?style=for-the-badge&logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-Ubuntu%2024.04-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ![Version](https://img.shields.io/badge/Version-1.0.0-00ffcc?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Free](https://img.shields.io/badge/Free-Forever-ff69b4?style=for-the-badge)
