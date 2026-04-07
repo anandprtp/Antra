@@ -45,13 +45,19 @@ Antra works through a waterfall of supported platforms, always trying the highes
 
 ## Soulseek/slskd Integration
 
-Antra features deeply integrated, auto-managed Soulseek P2P routing powered by `slskd`, allowing it to source rare, high-resolution, and out-of-print FLAC releases completely effortlessly.
+Antra features optional Soulseek integration powered by [`slskd`](https://github.com/slskd/slskd), a third-party client for the Soulseek network.
 
 - **Zero-Setup Daemon**: Antra automatically downloads, configures, and manages a native `slskd` instance in the background. No external setup required.
 - **API-Driven**: Communicates directly with the `slskd` API for seamless background searches and queuing—no separate UI needed.
 - **Painless Onboarding**: Simply provide your network credentials on the first run, and Antra permanently integrates P2P as a lossless fallback source.
 
 *(Note: You need a free network account to use this feature.)*
+
+Important notes:
+
+- `slskd` is a separate third-party project and is not affiliated with or endorsed by Antra.
+- Users are responsible for complying with Soulseek network rules, the `slskd` license, and applicable law in their jurisdiction.
+- This integration is optional and can be left disabled if you do not want to use Soulseek-based sourcing.
 
 ---
 
