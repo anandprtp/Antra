@@ -4,8 +4,6 @@
 
 **Get Spotify and Apple Music tracks in true Lossless (FLAC) from multiple hi-res streaming sources — no premium account required.**
 
-<a href="https://ko-fi.com/antraverse"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="ko-fi" /></a>
-
 ![Windows](https://img.shields.io/badge/Windows-10%2B-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-12%2B-000000?style=for-the-badge&logo=apple&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-Ubuntu%2024.04-FCC624?style=for-the-badge&logo=linux&logoColor=black)
