@@ -63,6 +63,16 @@ Antra features deeply integrated, auto-managed Soulseek P2P routing powered by `
 
 ---
 
+## Analyzer Notice
+
+The spectrogram analyzer currently requires `ffmpeg` to be installed and available in your system `PATH`.
+
+If `ffmpeg` is missing, analyzer features will not work on your machine yet.
+
+A future Antra release will include a smoother built-in setup for this.
+
+---
+
 ## Installation
 
 1. Download `Antra.exe` from [Releases](https://github.com/anandprtp/antra/releases)
@@ -168,6 +178,12 @@ This is a false positive. The executable is compressed with UPX and bundled with
 <summary>What audio formats does Antra output?</summary>
 
 By default, Antra keeps the source format (FLAC, ALAC, M4A, or MP3). You can force lossless-only, M4A, or MP3 in Settings or via `--format`.
+</details>
+
+<details>
+<summary>Why is the analyzer not working on my machine?</summary>
+
+The analyzer currently depends on a system-installed `ffmpeg`. If `ffmpeg` is not installed or not available in your `PATH`, analyzer features will not work yet.
 </details>
 
 <details>
