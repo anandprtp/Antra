@@ -47,6 +47,8 @@ Antra works through a waterfall of supported platforms, always trying the highes
 
 Antra features optional Soulseek integration powered by [`slskd`](https://github.com/slskd/slskd), a third-party client for the Soulseek network.
 
+Antra does not bundle `slskd` in its desktop release. If Soulseek integration is enabled, Antra downloads and manages a compatible `slskd` release on the user's machine.
+
 - **Zero-Setup Daemon**: Antra automatically downloads, configures, and manages a native `slskd` instance in the background. No external setup required.
 - **API-Driven**: Communicates directly with the `slskd` API for seamless background searches and queuing—no separate UI needed.
 - **Painless Onboarding**: Simply provide your network credentials on the first run, and Antra permanently integrates P2P as a lossless fallback source.
