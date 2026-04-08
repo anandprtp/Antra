@@ -244,6 +244,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          body_path: .github/release-notes.md
           files: |
             dist/Antra-Windows/Antra.exe
             dist/Antra-Linux/Antra-Linux.AppImage
