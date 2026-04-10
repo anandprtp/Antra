@@ -9,6 +9,7 @@ from antra.core.config import Config, load_config
 from antra.core.control import DownloadController
 from antra.core.engine import DownloadEngine, EngineConfig
 from antra.core.events import EngineEvent
+from antra.core.spotify import SpotifyResourceError
 from antra.core.models import (
     BulkDownloadProgress,
     BulkDownloadReport,
@@ -31,6 +32,27 @@ SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
 SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
 LEGACY_SOURCE_PREFERENCE_ALIASES = {}
 LEGACY_OUTPUT_FORMAT_ALIASES = {"flac-16": "flac", "flac-24": "flac"}
+
+
+_AUTH_ERROR_KEYWORDS = (
+    "not authenticated",
+    "no credentials",
+    "unauthorized",
+    "auth",
+    "token",
+    "login",
+    "credentials",
+    "client_id",
+    "client_secret",
+    "401",
+    "403",
+)
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a Spotify auth/credential failure."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _AUTH_ERROR_KEYWORDS)
 
 
 def _split_config_urls(value: str) -> list[str]:
@@ -281,16 +303,75 @@ class AntraService:
         if "music.apple.com" in playlist:
             return self._fetch_apple_tracks(playlist, cfg)
 
-        spotify = self._make_spotify_client(cfg)
-        tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
+        # Handle SoundCloud URLs
+        if "soundcloud.com" in playlist:
+            return self._fetch_soundcloud_tracks(playlist, cfg)
 
-        return tracks
+        # Handle Amazon Music URLs
+        if "music.amazon.com" in playlist:
+            return self._fetch_amazon_music_tracks(playlist, cfg)
+
+        # Try Spotify first; fall back to SpotFetch if credentials are missing
+        # or if the anonymous public-page scraper fails (Spotify changed their
+        # web app and no longer embeds __NEXT_DATA__ JSON).
+        try:
+            spotify = self._make_spotify_client(cfg)
+            tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
+            return tracks
+        except SpotifyResourceError as e:
+            logger.info(
+                f"[SpotFetch] Spotify metadata unavailable ({e}) — falling back to SpotFetch proxy"
+            )
+            return self._fetch_spotfetch_tracks(playlist, cfg)
+        except Exception as e:
+            if _is_auth_error(e):
+                logger.info(
+                    "[SpotFetch] Spotify auth not configured — falling back to SpotFetch proxy"
+                )
+                return self._fetch_spotfetch_tracks(playlist, cfg)
+            raise
 
     def _fetch_apple_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
-        from antra.core.apple_fetcher import AppleFetcher
+        try:
+            from antra.core.apple_fetcher import AppleFetcher
+        except ImportError:
+            raise RuntimeError(
+                "Apple Music playlist fetching is not available in this distribution."
+            )
         developer_token = getattr(cfg, "apple_developer_token", "") or None
         fetcher = AppleFetcher(developer_token=developer_token)
         return fetcher.fetch(url)
+
+    def _fetch_soundcloud_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+        try:
+            from antra.core.soundcloud_fetcher import SoundCloudFetcher
+        except ImportError:
+            raise RuntimeError(
+                "SoundCloud playlist fetching is not available in this distribution."
+            )
+        client_id = getattr(cfg, "soundcloud_client_id", "") or None
+        return SoundCloudFetcher(client_id=client_id).fetch(url)
+
+    def _fetch_spotfetch_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+        try:
+            from antra.core.spotfetch_fetcher import SpotFetchFetcher
+        except ImportError:
+            raise RuntimeError(
+                "Spotify playlist fetching via proxy is not available in this distribution."
+            )
+        return SpotFetchFetcher().fetch(url)
+
+    def _fetch_amazon_music_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+        try:
+            from antra.core.amazon_music_fetcher import AmazonMusicFetcher
+        except ImportError:
+            raise RuntimeError(
+                "Amazon Music playlist fetching is not available in this distribution."
+            )
+        return AmazonMusicFetcher(
+            mirrors=cfg.amazon_mirrors,
+            cookies_path=cfg.amazon_cookies_path,
+        ).fetch(url)
 
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
         return self._spotify_client_factory(

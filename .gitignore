@@ -36,3 +36,16 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Gray-area source adapters (local only, not for public distribution)
+antra/sources/amazon.py
+antra/sources/apple.py
+antra/sources/hifi.py
+antra/sources/deezer.py
+antra/sources/qobuz.py
+antra/sources/tidal.py
+antra/core/spotify_fetcher.py
+antra/core/apple_fetcher.py
+antra/core/amazon_music_fetcher.py
+antra/core/soundcloud_fetcher.py
+antra/core/spotfetch_fetcher.py
