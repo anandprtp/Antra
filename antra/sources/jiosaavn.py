@@ -66,6 +66,7 @@ def _decrypt_url(enc_url: str) -> Optional[str]:
 class JioSaavnAdapter(BaseSourceAdapter):
     name = "jiosaavn"
     priority = 4  # After Amazon (1), HiFi (2), Soulseek (3)
+    always_lossy = True  # AAC 320kbps only — never returns lossless
 
     _API_BASE = "https://www.jiosaavn.com/api.php"
     # Fallback endpoint used by some open-source clients

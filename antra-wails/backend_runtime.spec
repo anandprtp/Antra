@@ -27,6 +27,7 @@ hiddenimports = (
     + collect_submodules("slskd_api")
     + collect_submodules("lyricsgenius")
     + collect_submodules("platformdirs")
+    + collect_submodules("Cryptodome")  # pycryptodomex — used for Python CENC fallback in Amazon adapter
     + [
         # dotenv
         "dotenv", "dotenv.main", "dotenv.compat", "dotenv.variables",
@@ -39,6 +40,13 @@ hiddenimports = (
         "zipfile", "tarfile",
         # spotipy internals
         "spotipy.oauth2", "spotipy.cache_handler",
+        # imageio_ffmpeg — bundled ffmpeg used by Python sources
+        "imageio_ffmpeg",
+        # New fetchers added: SoundCloud, Amazon Music, SpotFetch
+        "antra.core.soundcloud_fetcher",
+        "antra.core.amazon_music_fetcher",
+        "antra.core.spotfetch_fetcher",
+        "antra.core.apple_fetcher",
     ]
 )
 
@@ -51,6 +59,10 @@ for package in ("imageio_ffmpeg", "certifi", "lyricsgenius", "spotipy"):
         pass
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
+# NOTE: collect_data_files("imageio_ffmpeg") already collects the ffmpeg binary
+# into datas (as imageio_ffmpeg/binaries/ffmpeg-*.exe). Do NOT also add it to
+# binaries= — that would cause PyInstaller to UPX-compress it, which conflicts
+# with the datas copy and can cause the binary to silently fail on some machines.
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(ROOT)],

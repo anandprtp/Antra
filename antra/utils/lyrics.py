@@ -38,9 +38,38 @@ class LyricsFetcher:
         except Exception as e:
             logger.debug(f"[Lyrics] LRCLIB failed: {e}")
 
-        # 2. Add future Genius/Musixmatch fallbacks here if keys provided
-        # For now, we return (None, None) if LRCLIB fails to maintain stability
+        # 2. Try Paxsenix (synced LRC from Spotify ID — no key needed)
+        if track.spotify_id:
+            try:
+                lrc = self._fetch_paxsenix(track)
+                if lrc:
+                    plain, synced = lrc
+                    if plain or synced:
+                        return plain, synced
+            except Exception as e:
+                logger.debug(f"[Lyrics] Paxsenix failed: {e}")
+
         return None, None
+
+    def _fetch_paxsenix(self, track: "TrackMetadata") -> Optional[Tuple[str, str]]:
+        """Fetch synced LRC lyrics from Paxsenix using Spotify track ID."""
+        resp = self.session.get(
+            "https://lyrics.paxsenix.org/spotify/lyrics",
+            params={"id": track.spotify_id},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        # Response is a JSON string containing the raw LRC text
+        try:
+            lrc_text = resp.json()  # returns a plain string
+        except Exception:
+            lrc_text = resp.text.strip().strip('"')
+        if not lrc_text or not isinstance(lrc_text, str):
+            return None
+        # Paxsenix only provides synced LRC; strip timestamps for plain fallback
+        plain = re.sub(r'^\[\d+:\d+\.\d+\]', '', lrc_text, flags=re.MULTILINE).strip()
+        return plain or None, lrc_text
 
     def _fetch_lrclib(self, track: "TrackMetadata") -> Optional[Tuple[str, str]]:
         """Fetch from lrclib.net API."""

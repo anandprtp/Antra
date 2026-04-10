@@ -78,6 +78,9 @@ class Config:
     musixmatch_api_key: str = ""
     genius_api_key: str = ""
 
+    # SoundCloud (optional — no credentials needed; provide client_id to skip auto-detection)
+    soundcloud_client_id: str = ""
+
     # Apple Music (optional — no credentials needed, lossless ALAC via community proxy)
     apple_enabled: bool = True
     apple_mirrors: list[str] = field(default_factory=lambda: [
@@ -109,11 +112,11 @@ class Config:
 
     # Download behaviour
     max_retries: int = 3
-    retry_delay: float = 5.0
+    retry_delay: float = 2.0
     fetch_lyrics: bool = True
     enrich_album_data: bool = True
     source_preference: str = "auto"
-    output_format: str = "source"
+    output_format: str = "flac"
 
     # Soulseek / slskd (optional)
     soulseek_base_url: str = ""
@@ -149,6 +152,7 @@ def load_config() -> Config:
         jiosaavn_enabled=os.getenv("JIOSAAVN_ENABLED", "true").lower() == "true",
         jiosaavn_quality=os.getenv("JIOSAAVN_QUALITY", "320"),
         odesli_api_key=os.getenv("ODESLI_API_KEY", ""),
+        soundcloud_client_id=os.getenv("SOUNDCLOUD_CLIENT_ID", ""),
         musixmatch_api_key=os.getenv("MUSIXMATCH_API_KEY", ""),
         genius_api_key=os.getenv("GENIUS_API_KEY", ""),
         output_dir=os.getenv("OUTPUT_DIR", "./Music"),
@@ -162,11 +166,11 @@ def load_config() -> Config:
         amazon_cookies_path=os.getenv("AMAZON_COOKIES_PATH", ""),
         amazon_insecure_mirrors=os.getenv("AMAZON_INSECURE_MIRRORS", "true").lower() == "true",
         max_retries=int(os.getenv("MAX_RETRIES", "3")),
-        retry_delay=float(os.getenv("RETRY_DELAY", "5.0")),
+        retry_delay=float(os.getenv("RETRY_DELAY", "2.0")),
         fetch_lyrics=os.getenv("FETCH_LYRICS", "true").lower() == "true",
         enrich_album_data=os.getenv("ENRICH_ALBUM_DATA", "true").lower() == "true",
         source_preference=os.getenv("SOURCE_PREFERENCE", "auto"),
-        output_format=os.getenv("OUTPUT_FORMAT", "source"),
+        output_format=os.getenv("OUTPUT_FORMAT", "flac"),
         soulseek_base_url=os.getenv("SLSKD_BASE_URL", ""),
         soulseek_api_key=os.getenv("SLSKD_API_KEY", ""),
         soulseek_username=os.getenv("SOULSEEK_USERNAME", ""),

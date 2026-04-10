@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { GetConfig, SaveConfig, PickDirectory, StartDownload, CancelDownload, GetHistory, AddHistory, ClearHistory } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile } from '../wailsjs/go/main/App.js';
-  import { EventsOn } from '../wailsjs/runtime/runtime.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography } from '../wailsjs/go/main/App.js';
+  import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
 
   let config: main.Config = {
@@ -281,6 +281,13 @@
     error?: string;
   }
 
+  // Discography modal
+  let showDiscography = false
+  let discographyLoading = false
+  let discographyArtist: any = null
+  let discographySelected: Set<string> = new Set()
+  let discographyReqId = 0  // incremented on each new request; stale responses are ignored
+
   let showAnalyzer = false;
   let analyzerTracks: TrackAnalysis[] = [];
   let analyzerCurrentIndex = 0;
@@ -556,21 +563,60 @@
       .filter(s => s.startsWith('http'));
     if (urls.length === 0) return;
 
-    isDownloading = true;
-    logs = [];
-    Object.keys(activeTracks).forEach(clearTrackInterval);
-    activeTracks = {};
-    shouldAutoScroll = true;
-    addLog('info', `━━━ Building your music library ━━━`);
-    addLog('info', `Searching best available source (lossless prioritized)...`);
+    const isArtistUrl = (u: string) =>
+      u.includes('spotify.com/artist/') ||
+      (u.includes('music.apple.com') && u.includes('/artist/')) ||
+      (u.includes('music.amazon.com') && u.includes('/artists/'));
+    const artistUrls = urls.filter(isArtistUrl);
+    const otherUrls = urls.filter(u => !isArtistUrl(u));
 
-    try {
-      await StartDownload(urls);
-    } catch (err) {
-      addLog('error', `Library engine error: ${err}`);
-      isDownloading = false;
+    if (otherUrls.length > 0) {
+      isDownloading = true;
+      logs = [];
+      Object.keys(activeTracks).forEach(clearTrackInterval);
+      activeTracks = {};
+      shouldAutoScroll = true;
+      addLog('info', `━━━ Building your music library ━━━`);
+      addLog('info', `Searching best available source (lossless prioritized)...`);
+      inputUrl = '';
+      try {
+        await StartDownload(otherUrls);
+      } catch (err) {
+        addLog('error', `Library engine error: ${err}`);
+        isDownloading = false;
+      }
     }
-    inputUrl = '';
+
+    for (const artistUrl of artistUrls) {
+      const reqId = ++discographyReqId;
+      discographyLoading = true;
+      showDiscography = true;
+      discographyArtist = null;
+      discographySelected = new Set();
+      inputUrl = '';
+      try {
+        const raw = await GetArtistDiscography(artistUrl);
+        // If user closed the modal while loading, reqId won't match — ignore result
+        if (reqId !== discographyReqId) break;
+        const parsed = JSON.parse(raw);
+        if (parsed?.error) {
+          addLog('error', `Discography error: ${parsed.error}`);
+          showDiscography = false;
+        } else {
+          discographyArtist = parsed;
+          if (discographyArtist?.albums) {
+            discographySelected = new Set(discographyArtist.albums.map(a => a.url));
+          }
+        }
+      } catch (e) {
+        if (reqId === discographyReqId) {
+          addLog('error', `Failed to fetch discography: ${e}`);
+          showDiscography = false;
+        }
+      } finally {
+        if (reqId === discographyReqId) discographyLoading = false;
+      }
+    }
   }
 
   async function cancelDownload() {
@@ -670,20 +716,32 @@
             <p style="margin:0; font-size: 11px; color: #555; letter-spacing: 0.05em;">MUSIC LIBRARY ENGINE</p>
           </div>
         </div>
-        <div style="display: flex; gap: 8px;">
+        <div style="display: flex; gap: 8px; align-items: center;">
           <button on:click={openHistory} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🕒 Library History</button>
           <button on:click={() => { showAnalyzer = true; }} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🔬 Analyzer</button>
           <button on:click={() => showSettings = true} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">⚙️ Settings</button>
+          <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
+          <button title="Support on Ko-fi" on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/>
+            </svg>
+          </button>
+          <button title="Join our Reddit community" on:click={() => BrowserOpenURL('https://www.reddit.com/r/antraverse/')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="12" cy="12" r="12" fill="#FF4500"/>
+              <path d="M20 12c0-1.1-.9-2-2-2-.5 0-1 .2-1.4.5C15.3 9.6 13.8 9 12 9l.7-3.3 2.3.5c0 .6.5 1 1 1s1-.4 1-1-.4-1-1-1c-.4 0-.8.3-.9.7l-2.6-.5c-.1 0-.2.1-.3.2L11.4 9c-1.8.1-3.3.7-4.5 1.6C6.5 10.2 6 10 5.5 10c-1.1 0-2 .9-2 2 0 .8.5 1.5 1.1 1.8-.1.3-.1.6-.1.9 0 2.8 3.1 5.1 7 5.1s7-2.3 7-5.1c0-.3 0-.6-.1-.9.5-.3 1-.9 1-1.8zm-11 1c0-.6.4-1 1-1s1 .4 1 1-.4 1-1 1-1-.4-1-1zm5.8 2.8c-.7.7-1.9 1-2.8 1s-2.1-.3-2.8-1c-.2-.2-.2-.4 0-.6.2-.2.4-.2.6 0 .5.5 1.4.8 2.2.8s1.7-.3 2.2-.8c.2-.2.4-.2.6 0 .2.2.2.4 0 .6zm-.3-1.8c-.6 0-1-.4-1-1s.4-1 1-1 1 .4 1 1-.4 1-1 1z" fill="white"/>
+            </svg>
+          </button>
         </div>
       </div>
       <div class="input-bar" style="margin-top: 16px; display: flex; gap: 8px; align-items: flex-start;">
         <textarea
           bind:value={inputUrl}
-          placeholder="Paste one or more Spotify / Apple Music URLs (one per line)..."
+          placeholder="Paste one or more Spotify / Apple Music / SoundCloud / Amazon Music URLs (one per line or comma-separated)..."
           disabled={isDownloading}
-          rows="3"
+          rows="4"
           on:keydown={(e) => e.key === 'Enter' && e.ctrlKey && startDownload()}
-          style="resize: vertical; min-height: 44px; max-height: 160px; font-family: inherit; font-size: 13px;"
+          style="flex: 1; min-width: 0; resize: vertical; min-height: 64px; max-height: 200px; font-family: inherit; font-size: 13px;"
         ></textarea>
         {#if isDownloading}
           <button on:click={cancelDownload} style="background: var(--error-color); color: white; border-color: var(--error-color); align-self: stretch;">Stop</button>
@@ -831,6 +889,91 @@
     </div>
 
     <button on:click={saveSettings} style="margin-top: 24px; width: 100%;">Save Settings</button>
+  </div>
+</div>
+{/if}
+
+<!-- ── Artist Discography Modal ───────────────────────────────────────────── -->
+{#if showDiscography}
+<div class="modal-overlay" on:click={() => { discographyReqId++; showDiscography = false; }}>
+  <div class="modal-content" on:click|stopPropagation style="max-width: 640px; width: 100%; max-height: 80vh; display: flex; flex-direction: column;">
+
+    <!-- Header -->
+    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(0,255,204,0.2); padding-bottom:16px; margin-bottom:16px; flex-shrink:0;">
+      <div style="display:flex; align-items:center; gap:12px;">
+        {#if discographyArtist?.artwork_url}
+          <img src={discographyArtist.artwork_url} alt="" style="width:48px; height:48px; border-radius:50%; object-fit:cover;"/>
+        {/if}
+        <div>
+          <h3 style="margin:0; color:var(--accent-color);">{discographyArtist?.artist_name ?? 'Loading...'}</h3>
+          <p style="margin:0; font-size:11px; color:#555;">Select releases to download</p>
+        </div>
+      </div>
+      <button on:click={() => { discographyReqId++; showDiscography = false; }} style="padding:4px 8px; font-size:12px;">✕</button>
+    </div>
+
+    {#if discographyLoading}
+      <p style="text-align:center; color:#777; padding:32px 0;">Fetching discography...</p>
+    {:else if discographyArtist}
+      <!-- Select all / deselect all -->
+      <div style="display:flex; gap:8px; margin-bottom:12px; flex-shrink:0;">
+        <button on:click={() => { discographySelected = new Set(discographyArtist.albums.map(a => a.url)); }} style="font-size:12px; padding:4px 10px;">Select All</button>
+        <button on:click={() => { discographySelected = new Set(); }} style="font-size:12px; padding:4px 10px;">Deselect All</button>
+        <span style="margin-left:auto; font-size:12px; color:#777; align-self:center;">{discographySelected.size} selected</span>
+      </div>
+
+      <!-- Album list grouped by type -->
+      <div style="overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:4px; padding-right:4px;">
+        {#each [['album','Albums'], ['single','Singles'], ['compilation','EPs & Compilations']] as [type, label]}
+          {#if discographyArtist.albums.filter(a => a.type === type).length > 0}
+            <div style="font-size:11px; color:#555; letter-spacing:0.08em; margin-top:12px; margin-bottom:4px;">{label.toUpperCase()}</div>
+            {#each discographyArtist.albums.filter(a => a.type === type) as album (album.id)}
+              <label style="display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:6px; cursor:pointer;"
+                     on:mouseenter={(e) => e.currentTarget.style.background='rgba(255,255,255,0.04)'}
+                     on:mouseleave={(e) => e.currentTarget.style.background='transparent'}>
+                <input type="checkbox"
+                  checked={discographySelected.has(album.url)}
+                  on:change={() => {
+                    if (discographySelected.has(album.url)) discographySelected.delete(album.url);
+                    else discographySelected.add(album.url);
+                    discographySelected = discographySelected;
+                  }}
+                  style="accent-color:var(--accent-color); width:14px; height:14px; flex-shrink:0;"
+                />
+                {#if album.artwork_url}
+                  <img src={album.artwork_url} alt="" style="width:36px; height:36px; border-radius:4px; object-fit:cover; flex-shrink:0;"/>
+                {/if}
+                <div style="flex:1; min-width:0;">
+                  <div style="font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{album.name}</div>
+                  <div style="font-size:11px; color:#666;">{album.year ?? '—'} · {album.track_count} track{album.track_count !== 1 ? 's' : ''}</div>
+                </div>
+              </label>
+            {/each}
+          {/if}
+        {/each}
+      </div>
+
+      <!-- Download button -->
+      <button
+        disabled={discographySelected.size === 0}
+        on:click={async () => {
+          const albumUrls = [...discographySelected];
+          showDiscography = false;
+          isDownloading = true;
+          logs = [];
+          Object.keys(activeTracks).forEach(clearTrackInterval);
+          activeTracks = {};
+          shouldAutoScroll = true;
+          addLog('info', `━━━ Building your music library ━━━`);
+          addLog('info', `Downloading ${albumUrls.length} release${albumUrls.length !== 1 ? 's' : ''} (lossless prioritized)...`);
+          try { await StartDownload(albumUrls); }
+          catch (err) { addLog('error', `Library engine error: ${err}`); isDownloading = false; }
+        }}
+        style="margin-top:16px; width:100%; flex-shrink:0;">
+        Download {discographySelected.size} Release{discographySelected.size !== 1 ? 's' : ''}
+      </button>
+    {/if}
+
   </div>
 </div>
 {/if}

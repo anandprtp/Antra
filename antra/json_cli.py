@@ -11,6 +11,133 @@ from antra.core.service import AntraService, RuntimeOptions
 from antra.core.events import EngineEvent
 from antra.utils.runtime import ensure_runtime_environment
 
+
+# ── Mutagen probe fallback ────────────────────────────────────────────────────
+# Used when ffprobe is not available (no system ffprobe and imageio_ffmpeg
+# doesn't bundle ffprobe). Returns the same JSON shape as ffprobe so the
+# frontend works identically on all machines.
+
+def _extract_mutagen_tags(tags) -> dict:
+    """Normalise tag objects from any mutagen format into a flat dict."""
+    result = {}
+    if tags is None:
+        return result
+
+    # VorbisComment (FLAC, OGG, Opus) and APEv2 both expose dict-style .get()
+    if hasattr(tags, "get"):
+        for field, candidates in [
+            ("title",  ["title", "TITLE"]),
+            ("artist", ["artist", "ARTIST"]),
+            ("album",  ["album",  "ALBUM"]),
+            ("tracknumber", ["tracknumber", "TRACKNUMBER"]),
+            ("date",   ["date", "DATE", "year", "YEAR"]),
+        ]:
+            for k in candidates:
+                v = tags.get(k)
+                if v:
+                    result[field] = v[0] if isinstance(v, list) else str(v)
+                    break
+
+    # ID3 (MP3) – tags.getall() returns list of frame objects
+    if hasattr(tags, "getall"):
+        for frame_id, field in [
+            ("TIT2", "title"), ("TPE1", "artist"), ("TALB", "album"),
+            ("TRCK", "tracknumber"), ("TDRC", "date"),
+        ]:
+            frames = tags.getall(frame_id)
+            if frames:
+                v = frames[0]
+                result[field] = str(v.text[0]) if hasattr(v, "text") and v.text else str(v)
+
+    # MP4/M4A – dict-like but with Apple four-char keys
+    if not result and hasattr(tags, "items"):
+        mp4_map = {
+            "\xa9nam": "title", "\xa9ART": "artist", "\xa9alb": "album",
+            "trkn": "tracknumber", "\xa9day": "date",
+        }
+        for k, field in mp4_map.items():
+            v = tags.get(k)
+            if v:
+                val = v[0]
+                result[field] = str(val[0]) if isinstance(val, tuple) else str(val)
+
+    return result
+
+
+def _probe_via_mutagen(file_path: str) -> dict:
+    """Pure-Python probe via mutagen — used when ffprobe is unavailable."""
+    try:
+        from mutagen import File as MutagenFile
+    except ImportError:
+        return {"error": "ffprobe not available and mutagen not installed"}
+
+    try:
+        audio = MutagenFile(file_path)
+    except Exception as exc:
+        return {"error": f"mutagen: {exc}"}
+
+    if audio is None:
+        return {"error": "mutagen: unrecognised audio format"}
+
+    info = audio.info
+    file_size = os.path.getsize(file_path)
+    duration  = float(getattr(info, "length", 0))
+    channels  = int(getattr(info, "channels", 0))
+    sample_rate = int(getattr(info, "sample_rate", 0))
+
+    # Codec from mutagen class name
+    type_name = type(audio).__name__
+    _codec_map = {
+        "FLAC": "flac", "MP3": "mp3", "OggVorbis": "vorbis",
+        "OggOpus": "opus", "OggFLAC": "flac", "OggSpeex": "speex",
+        "WAVE": "pcm_s16le", "AIFF": "pcm_s16be",
+        "MonkeysAudio": "ape", "WavPack": "wavpack",
+        "ASF": "wmav2", "MP4": "aac",
+    }
+    codec_name = _codec_map.get(type_name, type_name.lower())
+
+    # MP4 can be AAC or ALAC — check info.codec if present
+    if type_name == "MP4":
+        codec_attr = getattr(info, "codec", "") or ""
+        if codec_attr.lower().startswith("alac"):
+            codec_name = "alac"
+
+    # Bit depth (lossless formats expose bits_per_sample)
+    bits_per_sample = getattr(info, "bits_per_sample", None)
+
+    # Bit rate: mutagen.info.bitrate is always in bps (bits per second)
+    mutagen_bitrate = getattr(info, "bitrate", None)
+    if mutagen_bitrate and mutagen_bitrate > 0:
+        bit_rate_str = str(int(mutagen_bitrate))
+    elif duration > 0:
+        bit_rate_str = str(int(file_size * 8 / duration))
+    else:
+        bit_rate_str = "0"
+
+    tags = _extract_mutagen_tags(audio.tags)
+
+    stream: dict = {
+        "codec_name":     codec_name,
+        "codec_type":     "audio",
+        "sample_rate":    str(sample_rate),
+        "channels":       channels,
+        "channel_layout": "stereo" if channels == 2 else "mono" if channels == 1 else str(channels),
+    }
+    if bits_per_sample:
+        stream["bits_per_raw_sample"] = str(bits_per_sample)
+
+    return {
+        "streams": [stream],
+        "format": {
+            "filename": file_path,
+            "duration": str(duration),
+            "bit_rate": bit_rate_str,
+            "size":     str(file_size),
+            "tags":     tags,
+        },
+    }
+
+
 class JsonLogHandler(logging.Handler):
     def emit(self, record):
         try:
@@ -67,9 +194,104 @@ def main():
     parser = argparse.ArgumentParser(description="Antra JSON backend")
     parser.add_argument("playlists", nargs="*", help="Spotify URLs to download")
     parser.add_argument("--config", help="Path to config.json from Go launcher")
+    parser.add_argument("--get-ffmpeg-dir", action="store_true",
+                        help="Print the paths to bundled ffmpeg/ffprobe (two lines) and exit")
+    parser.add_argument("--probe", metavar="FILE",
+                        help="Run ffprobe on FILE and print JSON metadata, then exit")
+    parser.add_argument("--spectrogram", metavar="FILE",
+                        help="Generate spectrogram PNG for FILE and print base64 JSON, then exit")
+    parser.add_argument("--discography", metavar="ARTIST_URL",
+                        help="Fetch artist discography info as JSON and exit")
     args = parser.parse_args()
 
     ensure_runtime_environment()
+
+    if args.discography:
+        url = args.discography
+        try:
+            if "music.apple.com" in url and "/artist/" in url:
+                from antra.core.apple_fetcher import AppleFetcher
+                fetcher = AppleFetcher()
+                info = fetcher.fetch_artist_discography_info(url)
+            elif "music.amazon.com" in url and "/artists/" in url:
+                from antra.core.config import load_config
+                from antra.core.amazon_music_fetcher import AmazonMusicFetcher
+                cfg = load_config()
+                fetcher = AmazonMusicFetcher(mirrors=cfg.amazon_mirrors)
+                info = fetcher.fetch_artist_discography_info(url)
+            else:
+                from antra.core.config import load_config
+                from antra.core.spotify import SpotifyClient
+                cfg = load_config()
+                sp = SpotifyClient(
+                    cfg.spotify_client_id,
+                    cfg.spotify_client_secret,
+                    cfg.spotify_market,
+                    redirect_uri=cfg.spotify_redirect_uri,
+                    auth_storage_path=cfg.spotify_auth_path,
+                )
+                info = sp.fetch_artist_discography_info(url)
+            print(json.dumps({"type": "discography", "data": info}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.probe:
+        from antra.utils.runtime import get_ffprobe_exe
+        import subprocess
+        ffprobe = get_ffprobe_exe()
+        if ffprobe:
+            r = subprocess.run(
+                [ffprobe, "-v", "quiet", "-print_format", "json",
+                 "-show_format", "-show_streams", "-select_streams", "a:0", args.probe],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode == 0:
+                print(r.stdout.decode("utf-8", errors="replace"), flush=True)
+            else:
+                print(json.dumps({"error": r.stderr.decode("utf-8", errors="replace")}), flush=True)
+        else:
+            # ffprobe not available — fall back to mutagen (pure Python, always bundled)
+            result = _probe_via_mutagen(args.probe)
+            print(json.dumps(result), flush=True)
+        sys.exit(0)
+
+    if args.spectrogram:
+        from antra.utils.runtime import get_ffmpeg_exe
+        import subprocess, base64 as _b64, tempfile, os as _os
+        ffmpeg = get_ffmpeg_exe()
+        if not ffmpeg:
+            print(json.dumps({"error": "ffmpeg not found"}), flush=True)
+            sys.exit(1)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            r = subprocess.run(
+                [ffmpeg, "-y", "-i", args.spectrogram,
+                 "-lavfi", "showspectrumpic=s=1200x300:mode=combined:legend=0:color=viridis:scale=log:gain=4",
+                 "-frames:v", "1", tmp_path],
+                capture_output=True, timeout=120,
+            )
+            if r.returncode == 0 and _os.path.exists(tmp_path):
+                with open(tmp_path, "rb") as f:
+                    data = _b64.b64encode(f.read()).decode()
+                print(json.dumps({"data": data}), flush=True)
+            else:
+                print(json.dumps({"error": r.stderr.decode("utf-8", errors="replace")}), flush=True)
+        finally:
+            if _os.path.exists(tmp_path):
+                _os.unlink(tmp_path)
+        sys.exit(0)
+
+    if args.get_ffmpeg_dir:
+        from antra.utils.runtime import get_ffmpeg_exe, get_ffprobe_exe
+        ffmpeg = get_ffmpeg_exe()
+        ffprobe = get_ffprobe_exe()
+        # Output two lines: ffmpeg full path, ffprobe full path (empty if not found)
+        print(ffmpeg or "")
+        print(ffprobe or "")
+        sys.exit(0)
     setup_json_logging()
 
     # If config file is provided, load environments to os.environ so load_config picks them up

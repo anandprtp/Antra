@@ -57,24 +57,68 @@ func (a *App) ScanFolder(folderPath string) []string {
 }
 
 // AnalyzeAudio runs ffprobe for metadata and ffmpeg showspectrumpic for the
-// spectrogram. Returns a map with keys "probe" and "spectrogram".
+// spectrogram. Routes through the Python backend so the bundled ffmpeg inside
+// _MEIPASS is available even on machines with no system ffmpeg.
 func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 	result := make(map[string]interface{})
 
-	probe, err := runFFProbe(filePath)
+	backend, err := ensureBundledBackend()
 	if err != nil {
-		wailsRuntime.LogWarningf(a.ctx, "ffprobe failed for %s: %v", filePath, err)
-		result["probeError"] = err.Error()
-	} else {
-		result["probe"] = probe
+		// Dev mode: call ffprobe/ffmpeg directly using cached paths
+		a.mu.Lock()
+		ffmpegExe := a.ffmpegExe
+		ffprobeExe := a.ffprobeExe
+		a.mu.Unlock()
+
+		probe, err := runFFProbe(filePath, ffprobeExe)
+		if err != nil {
+			result["probeError"] = err.Error()
+		} else {
+			result["probe"] = probe
+		}
+		spec, err := generateSpectrogram(filePath, ffmpegExe)
+		if err != nil {
+			result["spectrogramError"] = err.Error()
+		} else {
+			result["spectrogram"] = spec
+		}
+		return result
 	}
 
-	spec, err := generateSpectrogram(filePath)
-	if err != nil {
-		wailsRuntime.LogWarningf(a.ctx, "spectrogram failed for %s: %v", filePath, err)
-		result["spectrogramError"] = err.Error()
+	// ── Probe ──────────────────────────────────────────────────────────────
+	probeCmd := exec.Command(backend, "--probe", filePath)
+	hideProcess(probeCmd)
+	if out, err := probeCmd.Output(); err == nil {
+		var probe map[string]interface{}
+		if jsonErr := json.Unmarshal(out, &probe); jsonErr == nil {
+			if errMsg, ok := probe["error"].(string); ok {
+				result["probeError"] = errMsg
+			} else {
+				result["probe"] = probe
+			}
+		} else {
+			result["probeError"] = "invalid probe JSON: " + jsonErr.Error()
+		}
 	} else {
-		result["spectrogram"] = spec
+		result["probeError"] = err.Error()
+	}
+
+	// ── Spectrogram ────────────────────────────────────────────────────────
+	specCmd := exec.Command(backend, "--spectrogram", filePath)
+	hideProcess(specCmd)
+	if out, err := specCmd.Output(); err == nil {
+		var specResult map[string]interface{}
+		if jsonErr := json.Unmarshal(out, &specResult); jsonErr == nil {
+			if errMsg, ok := specResult["error"].(string); ok {
+				result["spectrogramError"] = errMsg
+			} else if data, ok := specResult["data"].(string); ok {
+				result["spectrogram"] = "data:image/png;base64," + data
+			}
+		} else {
+			result["spectrogramError"] = "invalid spectrogram JSON: " + jsonErr.Error()
+		}
+	} else {
+		result["spectrogramError"] = err.Error()
 	}
 
 	return result
@@ -115,9 +159,17 @@ func (a *App) WriteFile(filePath string, base64Data string) error {
 
 // ─── ffprobe ─────────────────────────────────────────────────────────────────
 
-func runFFProbe(filePath string) (map[string]interface{}, error) {
+// resolveExe returns exePath if non-empty, otherwise falls back to name (looked up via PATH).
+func resolveExe(exePath, name string) string {
+	if exePath != "" {
+		return exePath
+	}
+	return name
+}
+
+func runFFProbe(filePath, ffprobeExe string) (map[string]interface{}, error) {
 	cmd := exec.Command(
-		"ffprobe",
+		resolveExe(ffprobeExe, "ffprobe"),
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
@@ -141,12 +193,12 @@ func runFFProbe(filePath string) (map[string]interface{}, error) {
 
 // ─── Spectrogram ─────────────────────────────────────────────────────────────
 
-func generateSpectrogram(filePath string) (string, error) {
+func generateSpectrogram(filePath, ffmpegExe string) (string, error) {
 	tmpFile := filePath + ".__spec__.png"
 	defer os.Remove(tmpFile)
 
 	cmd := exec.Command(
-		"ffmpeg",
+		resolveExe(ffmpegExe, "ffmpeg"),
 		"-y",
 		"-i", filePath,
 		"-lavfi", "showspectrumpic=s=1200x300:mode=combined:legend=0:color=viridis:scale=log:gain=4",

@@ -161,6 +161,10 @@ class SourceResolver:
                     )
                     # Fall through — let HiFi run at reduced speed
 
+            if self._is_lossless_only_mode() and getattr(adapter, "always_lossy", False):
+                logger.debug(f"[Resolver] Skipping {adapter.name} — lossy source in lossless-only mode")
+                continue
+
             if self.preserve_input_order:
                 logger.info(f"[Resolver] Trying {adapter.name} for: {track.title}")
             try:
@@ -189,6 +193,18 @@ class SourceResolver:
                 best_result = result
                 best_adapter = adapter
 
+            # Fast path: 24-bit lossless found — no need to query remaining adapters.
+            if (
+                self._is_quality_aware_mode()
+                and self._quality_tier(result) == 4
+                and self._meets_quality_aware_threshold(result, adapter)
+            ):
+                logger.info(
+                    f"[Resolver] 24-bit lossless match via {adapter.name}: '{result.title}' "
+                    f"({result.quality_label}) — skipping remaining adapters"
+                )
+                return result, adapter
+
             if self.preserve_input_order and self._accepts_result_immediately(result, adapter):
                 if result.isrc_match:
                     logger.info(
@@ -208,7 +224,19 @@ class SourceResolver:
                     f"{track.title} (score={result.similarity_score:.2f})"
                 )
 
+            # In quality-aware mode: stop as soon as we have a good lossless
+            # result — no point querying slower adapters (e.g. Soulseek) for
+            # something we already have at CD quality or better.
             if self._is_quality_aware_mode():
+                if (
+                    self._quality_tier(result) >= 2  # lossless (16-bit or better)
+                    and self._meets_quality_aware_threshold(result, adapter)
+                ):
+                    logger.info(
+                        f"[Resolver] Lossless match via {adapter.name}: '{result.title}' "
+                        f"({result.quality_label}) — skipping remaining adapters"
+                    )
+                    return result, adapter
                 continue
 
             # If this adapter's result clears the threshold, use it — don't

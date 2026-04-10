@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -423,6 +425,64 @@ func (a *App) runPythonCommand(args []string) (string, error) {
 }
 
 // Spotify Auth & Management
+
+// GetArtistDiscography fetches the full release list for an artist URL.
+// Returns a JSON string: {"artist_id","artist_name","artwork_url","albums":[...]}
+// On error returns: {"error":"..."}
+func (a *App) GetArtistDiscography(artistUrl string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	backend, err := ensureBundledBackend()
+	if err != nil {
+		// Dev fallback: run via python source
+		return a.getArtistDiscographyViaPython(ctx, artistUrl)
+	}
+
+	cmd := exec.CommandContext(ctx, backend, "--discography", artistUrl, "--config", getConfigPath())
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching discography (60s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return unwrapDiscographyJSON(out)
+}
+
+func (a *App) getArtistDiscographyViaPython(ctx context.Context, artistUrl string) string {
+	pythonExe, _, workDir, env, err := a.resolveBackendCommand([]string{})
+	if err != nil {
+		return `{"error":"could not resolve backend"}`
+	}
+	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--discography", artistUrl, "--config", getConfigPath())
+	cmd.Dir = workDir
+	cmd.Env = env
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching discography (60s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return unwrapDiscographyJSON(out)
+}
+
+// unwrapDiscographyJSON unpacks {"type":"discography","data":{...}} → just the data object.
+func unwrapDiscographyJSON(out []byte) string {
+	var wrapper map[string]interface{}
+	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
+		return string(out)
+	}
+	if wrapper["type"] == "error" {
+		msg, _ := wrapper["message"].(string)
+		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+	}
+	result, _ := json.Marshal(wrapper["data"])
+	return string(result)
+}
 
 func (a *App) GetSpotifyStatus() string {
 	output, err := a.runPythonCommand([]string{"spotify", "status", "--json"})

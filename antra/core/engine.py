@@ -287,11 +287,18 @@ class DownloadEngine:
                     last_error = str(e)
                     last_source = adapter.name
                     adapter.mark_failed_result(result, e)
+                    will_retry = attempt < self.cfg.max_retries and adapter.should_retry_download(result, e)
                     if adapter.name == "hifi" and "all quality levels failed" in str(e).lower():
                         logger.info("  [INFO]  HiFi mirrors could not provide a valid stream. Trying next source...")
+                    elif "rate limited" in str(e).lower() or "429" in str(e):
+                        logger.debug(f"  [RATE]  Attempt {attempt} rate-limited, retrying...")
+                    elif will_retry:
+                        # Transient failure — more attempts coming, keep it quiet
+                        logger.debug(f"  [RETRY] Attempt {attempt} failed, retrying... ({e})")
                     else:
+                        # Final failure for this adapter — surface it
                         logger.warning(f"  [WARN]  Attempt {attempt} failed: {e}")
-                    if attempt < self.cfg.max_retries and adapter.should_retry_download(result, e):
+                    if will_retry:
                         time.sleep(self.cfg.retry_delay)
                         continue
                     break

@@ -18,6 +18,10 @@ export function ClearHistory() {
   return window['go']['main']['App']['ClearHistory']();
 }
 
+export function GetArtistDiscography(arg1) {
+  return window['go']['main']['App']['GetArtistDiscography'](arg1);
+}
+
 export function GetConfig() {
   return window['go']['main']['App']['GetConfig']();
 }

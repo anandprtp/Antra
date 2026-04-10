@@ -1139,7 +1139,7 @@ class SpotifyClient:
             logger.info(f"Total tracks in public album fallback: {len(tracks)}")
             return tracks
         except Exception as e:
-            logger.warning(f"Public album fallback failed for {album_id}: {e}")
+            logger.debug(f"Public album fallback failed for {album_id}: {e}")
             return []
 
     def _fetch_track(self, url_or_id: str) -> list[TrackMetadata]:
@@ -1156,6 +1156,64 @@ class SpotifyClient:
             logger.warning(f"Spotify track API unavailable or credentials invalid for {track_id}: {e}")
             meta = self._fetch_public_track_page(track_id)
             return [meta] if meta else []
+
+    def fetch_artist_discography_info(self, url_or_id: str) -> dict:
+        """
+        Return artist metadata + full album/single/EP list (no track listings).
+        Used by the desktop UI discography picker — tracks are fetched later per
+        selected album via the normal download pipeline.
+        """
+        import time as _time
+        artist_id = _strip_id(url_or_id, "artist")
+        if not self.sp:
+            logger.info("[SpotFetch] No Spotify auth — fetching artist discography via SpotFetch proxy")
+            from antra.core.spotfetch_fetcher import SpotFetchFetcher
+            return SpotFetchFetcher().fetch_artist_discography_info(url_or_id)
+
+        artist_data = self.sp.artist(artist_id)
+        artist_name = artist_data.get("name", "Unknown Artist")
+        images = artist_data.get("images", [])
+        artwork_url = images[0]["url"] if images else None
+
+        albums: list[dict] = []
+        offset = 0
+        limit = 50
+        while True:
+            resp = self.sp.artist_albums(
+                artist_id,
+                album_type="album,single,compilation",
+                limit=limit,
+                offset=offset,
+                market=self._market or "US",
+            )
+            items = resp.get("items", [])
+            if not items:
+                break
+            for item in items:
+                release_date = item.get("release_date", "")
+                year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
+                imgs = item.get("images", [])
+                albums.append({
+                    "id": item["id"],
+                    "url": f"https://open.spotify.com/album/{item['id']}",
+                    "name": item["name"],
+                    "type": item.get("album_type", "album"),
+                    "year": year,
+                    "track_count": item.get("total_tracks", 0),
+                    "artwork_url": imgs[0]["url"] if imgs else None,
+                })
+            if not resp.get("next"):
+                break
+            offset += limit
+            _time.sleep(0.05)
+
+        logger.info(f"Discography fetched for {artist_name}: {len(albums)} releases")
+        return {
+            "artist_id": artist_id,
+            "artist_name": artist_name,
+            "artwork_url": artwork_url,
+            "albums": albums,
+        }
 
     def _fetch_artist_top(self, url_or_id: str) -> list[TrackMetadata]:
         artist_id = _strip_id(url_or_id, "artist")

@@ -10,6 +10,8 @@ export function CancelDownload():Promise<void>;
 
 export function ClearHistory():Promise<void>;
 
+export function GetArtistDiscography(arg1:string):Promise<string>;
+
 export function GetConfig():Promise<main.Config>;
 
 export function GetHistory():Promise<Array<main.HistoryItem>>;

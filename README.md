@@ -11,6 +11,9 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Free](https://img.shields.io/badge/Free-Forever-ff69b4?style=for-the-badge)
 
+[![Reddit](https://img.shields.io/badge/Community-Reddit-FF4500?style=for-the-badge&logo=reddit&logoColor=white)](https://www.reddit.com/r/antraverse/)
+[![Ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/antraverse)
+
 ### [⬇ Download Latest Release](https://github.com/anandprtp/antra/releases)
 
 <img src="assets/screenshots/Screenshot%202026-04-04%20034601.png" width="800" />
@@ -30,10 +33,12 @@
 | 🏷️ **Auto-Tagged** | Every track gets proper metadata — title, artist, album, artwork, lyrics |
 | 📁 **Auto-Organized** | Files are sorted into Artist → Album folder structure automatically |
 | 🖥️ **Navidrome Ready** | Output is fully compatible with Navidrome, Jellyfin, and Plex |
-| 🔬 **Quality Analyzer** | Spectrogram analyzer to verify the actual quality of any audio file |
+| 🔬 **Quality Analyzer** | Built-in spectrogram analyzer to verify the actual quality of any audio file |
 | 🔍 **Smart Matching** | ISRC-based matching ensures you always get the exact right track |
 | 🌐 **No Account Needed** | Works out of the box — no premium streaming service login required |
 | ⚡ **P2P Alternative** | Optional peer-to-peer integration for rare, hi-res, and out-of-print releases |
+| 🎤 **Artist Search** | Search for any artist and download their full discography or individual albums |
+| 🚀 **Fast Downloads** | Parallel download engine for significantly faster batch and playlist downloads |
 
 ---
 
@@ -61,32 +66,27 @@ Important notes:
 - Users are responsible for complying with Soulseek network rules, the `slskd` license, and applicable law in their jurisdiction.
 - This integration is optional and can be left disabled if you do not want to use Soulseek-based sourcing.
 
+> **Soulseek community etiquette:** The Soulseek network runs on sharing. If you're downloading from it, please share music back. Don't be a leecher — keep your share folder populated and leave slskd running when you can. The community depends on everyone contributing.
+
 ---
 
 ## Requirements
 
-- **Windows 10 or later** (64-bit)
-- **No installation required** — Antra ships as a single self-contained `.exe`
+- **Windows 10+**, **macOS 12+**, or **Linux** (Ubuntu 24.04+)
+- **No installation required** — Antra ships as a self-contained binary (`.exe` / `.dmg` / `.AppImage`)
 - Optional: [ffmpeg](https://ffmpeg.org/download.html) in PATH for format conversion
-
----
-
-## Analyzer Notice
-
-The spectrogram analyzer currently requires `ffmpeg` to be installed and available in your system `PATH`.
-
-If `ffmpeg` is missing, analyzer features will not work on your machine yet.
-
-A future Antra release will include a smoother built-in setup for this.
 
 ---
 
 ## Installation
 
-1. Download `Antra.exe` from [Releases](https://github.com/anandprtp/antra/releases)
+1. Download the build for your platform from [Releases](https://github.com/anandprtp/antra/releases):
+   - **Windows**: `Antra.exe`
+   - **macOS**: `Antra-macOS.dmg`
+   - **Linux**: `Antra-Linux.AppImage`
 2. Run it — no installation, no Python, no dependencies
 3. On first launch, select your Music Library folder
-4. Paste a playlist URL and click **Add to Library**
+4. Paste a playlist or artist URL and click **Add to Library**
 
 ---
 
@@ -150,10 +150,6 @@ Output: `antra-wails/build/bin/Antra.exe`
 
 ---
 
-## 🚀 Upcoming Features (Supporter Exclusive)
-
-Currently in development for Antra supporters: a seamless Spotify integration that syncs your **Saved Playlists**. With just an auth token (no intrusive logins required), Antra will automatically allow you to setup a recurring schedule to sync your Spotify playlists every 24 hours.
-
 ---
 
 ## FAQ
@@ -186,12 +182,6 @@ This is a false positive. The executable is compressed with UPX and bundled with
 <summary>What audio formats does Antra output?</summary>
 
 By default, Antra keeps the source format (FLAC, ALAC, M4A, or MP3). You can force lossless-only, M4A, or MP3 in Settings or via `--format`.
-</details>
-
-<details>
-<summary>Why is the analyzer not working on my machine?</summary>
-
-The analyzer currently depends on a system-installed `ffmpeg`. If `ffmpeg` is not installed or not available in your `PATH`, analyzer features will not work yet.
 </details>
 
 <details>

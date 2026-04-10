@@ -16,6 +16,7 @@ class BaseSourceAdapter(ABC):
 
     name: str = "base"
     priority: int = 99  # Lower = higher priority
+    always_lossy: bool = False  # True for adapters that can never return lossless audio
 
     @abstractmethod
     def is_available(self) -> bool:
