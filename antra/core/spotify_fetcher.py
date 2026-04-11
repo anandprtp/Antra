@@ -5,6 +5,10 @@ import time
 from typing import Optional
 from antra.core.models import TrackMetadata
 
+
+def _normalize_spotify_url(url_or_id: str) -> str:
+    return re.sub(r"(spotify\.com/)(?:intl-[^/]+/)", r"\1", url_or_id or "").strip()
+
 logger = logging.getLogger(__name__)
 
 class SpotifyFetcher:
@@ -299,20 +303,25 @@ class SpotifyFetcher:
     @staticmethod
     def _extract_playlist_id(url: str) -> str:
         """
-        Extract playlist ID from:
-        - https://open.spotify.com/playlist/37i9dQZF1DX...
-        - spotify:playlist:37i9dQZF1DX...
-        - raw ID: 37i9dQZF1DX...
+        Extract playlist or album ID from URLs and URIs.
+
+        Supports:
+          - https://open.spotify.com/playlist/37i9dQZF1DX...
+          - https://open.spotify.com/intl-es/playlist/37i9dQZF1DX...
+          - spotify:playlist:37i9dQZF1DX...
+          - https://open.spotify.com/album/0sNOF9WDwhWunNAHPD3Baj
+          - spotify:album:0sNOF9WDwhWunNAHPD3Baj
+          - raw ID: 37i9dQZF1DX...
         """
-        url = url.strip()
-        if "spotify.com/playlist/" in url:
-            return url.split("playlist/")[1].split("?")[0].strip()
-        elif "spotify.com/album/" in url:
-            return url.split("album/")[1].split("?")[0].strip()
-        elif "spotify:playlist:" in url:
-            return url.split("spotify:playlist:")[1].strip()
-        elif "spotify:album:" in url:
-            return url.split("spotify:album:")[1].strip()
-        elif "/" not in url and ":" not in url:
-            return url
+        normalized = _normalize_spotify_url(url)
+        if "spotify.com/playlist/" in normalized:
+            return normalized.split("playlist/")[1].split("?")[0].strip()
+        elif "spotify.com/album/" in normalized:
+            return normalized.split("album/")[1].split("?")[0].strip()
+        elif "spotify:playlist:" in normalized:
+            return normalized.split("spotify:playlist:")[1].strip()
+        elif "spotify:album:" in normalized:
+            return normalized.split("spotify:album:")[1].strip()
+        elif "/" not in normalized and ":" not in normalized:
+            return normalized
         raise ValueError(f"[Spotify] Cannot extract ID from: {url}")

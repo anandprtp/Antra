@@ -15,27 +15,34 @@ from antra.core.models import TrackMetadata, SpotifyLibrary, SpotifyPlaylistSumm
 logger = logging.getLogger(__name__)
 
 
+def _normalize_spotify_url(url_or_id: str) -> str:
+    """Normalize Spotify URLs by stripping optional locale path prefixes like /intl-es/."""
+    return re.sub(r"(spotify\.com/)(?:intl-[^/]+/)", r"\1", url_or_id or "").strip()
+
+
 class SpotifyResourceError(RuntimeError):
     """Raised when a Spotify resource cannot be fetched with the available token."""
 
 
 def _strip_id(url_or_id: str, type_hint: str) -> str:
     """Extract the bare Spotify ID from a URL of the given type."""
+    normalized = _normalize_spotify_url(url_or_id)
     key = f"spotify.com/{type_hint}/"
-    if key in url_or_id:
-        part = url_or_id.split(key)[1]
+    if key in normalized:
+        part = normalized.split(key)[1]
         return part.split("?")[0].strip()
     # Could also be a spotify:type:id URI
     prefix = f"spotify:{type_hint}:"
-    if url_or_id.startswith(prefix):
-        return url_or_id[len(prefix):].strip()
-    return url_or_id.strip()
+    if normalized.startswith(prefix):
+        return normalized[len(prefix):].strip()
+    return normalized.strip()
 
 
 def _detect_type(url_or_id: str) -> str:
     """Return 'playlist', 'album', 'track', or 'artist' based on the URL."""
+    normalized = _normalize_spotify_url(url_or_id)
     for t in ("playlist", "album", "track", "artist"):
-        if f"spotify.com/{t}/" in url_or_id or f"spotify:{t}:" in url_or_id:
+        if f"spotify.com/{t}/" in normalized or f"spotify:{t}:" in normalized:
             return t
     # Bare ID — assume playlist for backwards compatibility
     return "playlist"

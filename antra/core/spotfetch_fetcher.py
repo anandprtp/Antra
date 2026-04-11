@@ -23,7 +23,8 @@ from antra.core.models import TrackMetadata
 logger = logging.getLogger(__name__)
 
 _BASE = "https://sp.afkarxyz.qzz.io/api"
-_SPOTIFY_ID_RE = re.compile(r"spotify\.com/(track|album|playlist|artist)/([A-Za-z0-9]+)")
+_URL_LOCALE_RE = re.compile(r"(spotify\.com/)(?:intl-[^/]+/)")
+_SPOTIFY_ID_RE = re.compile(r"spotify\.com/(?:intl-[^/]+/)?(track|album|playlist|artist)/([A-Za-z0-9]+)")
 
 REQUEST_TIMEOUT = 15
 
@@ -73,9 +74,13 @@ class SpotFetchFetcher:
 
     # ── URL parsing ───────────────────────────────────────────────────────────
 
+    def _normalize_spotify_url(self, url: str) -> str:
+        return _URL_LOCALE_RE.sub(r"\1", url.strip())
+
     def _detect_type(self, url: str) -> tuple[str, str]:
         """Return (url_type, spotify_id). Raises ValueError on bad URLs."""
-        m = _SPOTIFY_ID_RE.search(url)
+        normalized = self._normalize_spotify_url(url)
+        m = _SPOTIFY_ID_RE.search(normalized)
         if not m:
             raise ValueError(
                 f"[SpotFetch] Not a recognised Spotify URL: {url}\n"
@@ -133,7 +138,8 @@ class SpotFetchFetcher:
         Return artist metadata + full album/single/EP list via SpotFetch proxy.
         No Spotify credentials required.
         """
-        m = re.search(r"spotify\.com/artist/([A-Za-z0-9]+)", url_or_id)
+        normalized = self._normalize_spotify_url(url_or_id)
+        m = re.search(r"spotify\.com/artist/([A-Za-z0-9]+)", normalized)
         artist_id = m.group(1) if m else url_or_id.strip()
 
         data = self._get(f"/artist/{artist_id}")
