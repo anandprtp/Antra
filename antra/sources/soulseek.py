@@ -81,6 +81,7 @@ class SoulseekAdapter(BaseSourceAdapter):
         self,
         base_url: str,
         api_key: Optional[str] = None,
+        seed_after_download: bool = False,
     ):
         """
         :param base_url: Full base URL to slskd, e.g. "http://localhost:5030".
@@ -104,6 +105,7 @@ class SoulseekAdapter(BaseSourceAdapter):
 
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key or ""
+        self._seed_after_download = seed_after_download
         self._downloads_dir: Optional[str] = None
         self._blocked_stream_ids: set[str] = set()
         self._search_cache: dict[tuple[str, str], list[SearchResult]] = {}
@@ -414,7 +416,10 @@ class SoulseekAdapter(BaseSourceAdapter):
 
         if os.path.abspath(download_path) != os.path.abspath(final_path):
             os.replace(download_path, final_path)
-            self._cleanup_empty_download_dirs(download_path)
+            if self._seed_after_download:
+                self._seed_hardlink(download_path, final_path)
+            else:
+                self._cleanup_empty_download_dirs(download_path)
 
         logger.info(f"[Soulseek] Downloaded: {final_path}")
         return final_path
@@ -604,6 +609,23 @@ class SoulseekAdapter(BaseSourceAdapter):
             if os.path.isfile(candidate):
                 return candidate
         return None
+
+    def _seed_hardlink(self, original_download_path: str, library_path: str) -> None:
+        """
+        Create a hardlink at the original slskd download path pointing to the
+        library file. Both paths share the same inode — zero extra disk space.
+        slskd will detect the file in its downloads directory and seed it.
+        Falls back to a regular copy if the filesystem doesn't support hardlinks
+        (e.g. cross-device, FAT32, or NAS with different filesystem).
+        """
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(original_download_path)), exist_ok=True)
+            os.link(library_path, original_download_path)
+            logger.debug(f"[Soulseek] Seed hardlink created: {original_download_path}")
+        except OSError as e:
+            # Cross-device link or filesystem doesn't support hardlinks — skip silently.
+            # We don't fall back to copy: seeding is best-effort, not worth doubling disk use.
+            logger.debug(f"[Soulseek] Could not create seed hardlink ({e}), skipping seed")
 
     def _cleanup_empty_download_dirs(self, original_download_path: str) -> None:
         downloads_dir = self._get_downloads_dir()

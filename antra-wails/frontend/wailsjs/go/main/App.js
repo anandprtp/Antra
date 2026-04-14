@@ -62,6 +62,10 @@ export function ScanFolder(arg1) {
   return window['go']['main']['App']['ScanFolder'](arg1);
 }
 
+export function SearchArtists(arg1, arg2) {
+  return window['go']['main']['App']['SearchArtists'](arg1, arg2);
+}
+
 export function SetSpotifyCookie(arg1) {
   return window['go']['main']['App']['SetSpotifyCookie'](arg1);
 }

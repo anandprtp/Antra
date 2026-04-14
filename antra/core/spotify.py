@@ -14,17 +14,41 @@ from antra.core.models import TrackMetadata, SpotifyLibrary, SpotifyPlaylistSumm
 
 logger = logging.getLogger(__name__)
 
+# ── Spotify web-player TOTP credentials ──────────────────────────────────────
+# Spotify's web player uses TOTP to obtain anonymous access tokens via
+# open.spotify.com/api/token — no login or OAuth required.
+# Secret and version extracted from the SpotiFLAC project (MIT licence).
+_SP_TOTP_SECRET = (
+    "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4D"
+    "QOJUGQYTAMRRGA2TCMJSHE3TCMBY"
+)
+_SP_TOTP_VERSION = 61
+
+# Persisted GraphQL query hashes for api-partner.spotify.com/pathfinder/v2/query
+_GQL_ALBUM_HASH   = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
+_GQL_TRACK_HASH   = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+
 
 class SpotifyResourceError(RuntimeError):
     """Raised when a Spotify resource cannot be fetched with the available token."""
 
 
+_LOCALE_RE = re.compile(r"(spotify\.com/)intl-[a-z]+/")
+
+
+def _normalize_spotify_url(url: str) -> str:
+    """Strip locale prefix (e.g. /intl-es/) from Spotify URLs."""
+    return _LOCALE_RE.sub(r"\1", url)
+
+
 def _strip_id(url_or_id: str, type_hint: str) -> str:
     """Extract the bare Spotify ID from a URL of the given type."""
+    url_or_id = _normalize_spotify_url(url_or_id)
     key = f"spotify.com/{type_hint}/"
     if key in url_or_id:
         part = url_or_id.split(key)[1]
-        return part.split("?")[0].strip()
+        # Take only the ID segment — ignore trailing path parts like /discography/all
+        return part.split("?")[0].split("/")[0].strip()
     # Could also be a spotify:type:id URI
     prefix = f"spotify:{type_hint}:"
     if url_or_id.startswith(prefix):
@@ -34,6 +58,7 @@ def _strip_id(url_or_id: str, type_hint: str) -> str:
 
 def _detect_type(url_or_id: str) -> str:
     """Return 'playlist', 'album', 'track', or 'artist' based on the URL."""
+    url_or_id = _normalize_spotify_url(url_or_id)
     for t in ("playlist", "album", "track", "artist"):
         if f"spotify.com/{t}/" in url_or_id or f"spotify:{t}:" in url_or_id:
             return t
@@ -590,14 +615,27 @@ class SpotifyClient:
                     title = v2_data.get("name") or "Unknown Track"
                     artists = [a.get("profile", {}).get("name") for a in v2_data.get("artists", {}).get("items", []) if a.get("profile", {}).get("name")]
                     if not artists: artists = ["Unknown Artist"]
-                    
-                    album = v2_data.get("albumOfTrack", {}).get("name") or "Unknown Album"
+
+                    album_of_track = v2_data.get("albumOfTrack", {})
+                    album = album_of_track.get("name") or "Unknown Album"
+                    # Extract album_id from its URI so batch_enrich_album_data can fill artwork/genres
+                    album_uri = album_of_track.get("uri", "")
+                    album_id = album_uri.split(":")[-1] if album_uri.startswith("spotify:album:") else None
+                    # Extract artwork from album coverArt images
+                    cover_sources = album_of_track.get("coverArt", {}).get("sources", [])
+                    artwork_url = cover_sources[0].get("url") if cover_sources else None
                     duration_ms = v2_data.get("trackDuration", {}).get("totalMilliseconds")
-                    
+                    release_date = album_of_track.get("date", {}).get("isoString", "") if isinstance(album_of_track.get("date"), dict) else ""
+                    release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
+
                     track_meta = TrackMetadata(
                         title=title,
                         artists=artists,
                         album=album,
+                        album_id=album_id,
+                        artwork_url=artwork_url,
+                        release_year=release_year,
+                        release_date=release_date or None,
                         playlist_name=playlist_title,
                         playlist_position=len(tracks) + 1,
                         duration_ms=int(duration_ms) if duration_ms else None,
@@ -703,43 +741,91 @@ class SpotifyClient:
 
         return ids
 
-    def _get_anonymous_access_token(self, playlist_id: str = "37i9dQZF1DXcBWIGoYBM5M") -> Optional[str]:
+    def _get_anonymous_access_token(self, _unused: str = "") -> Optional[str]:
         """
-        Extract the anonymous Bearer token Spotify embeds in its playlist embed pages.
-        This is the same token the web player uses for its internal API
-        calls and works without a Premium subscription or OAuth login.
+        Return an anonymous Bearer token for Spotify's internal partner API.
+        Tries TOTP generation first (reliable); falls back to embed-page HTML
+        scraping if pyotp is not installed.
         """
+        # ── Primary: TOTP-based token (no HTML scraping needed) ──────────────
+        token = self._get_totp_access_token()
+        if token:
+            return token
+
+        # ── Fallback: scrape the embed page for the token ─────────────────────
         try:
-            resp = self._get_with_retry_public(f"https://open.spotify.com/embed/playlist/{playlist_id}")
-            
-            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text)
+            resp = self._get_with_retry_public(
+                "https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M"
+            )
+            match = re.search(
+                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                resp.text,
+            )
             if match:
                 data = json.loads(match.group(1))
-                
-                def find_token(obj):
+
+                def _find_token(obj):
                     if isinstance(obj, dict):
                         for k, v in obj.items():
                             if k == "accessToken":
                                 return v
                             elif isinstance(v, (dict, list)):
-                                res = find_token(v)
+                                res = _find_token(v)
                                 if res:
                                     return res
                     elif isinstance(obj, list):
                         for item in obj:
-                            res = find_token(item)
+                            res = _find_token(item)
                             if res:
                                 return res
                     return None
-                    
-                token = find_token(data)
+
+                token = _find_token(data)
                 if token:
                     return token
-                    
         except Exception as e:
-            logger.debug(f"[Spotify] Failed to fetch anonymous token: {e}")
+            logger.debug(f"[Spotify] Embed-page token scrape failed: {e}")
 
-        logger.debug("[Spotify] Could not extract anonymous access token from page")
+        logger.debug("[Spotify] Could not obtain anonymous access token")
+        return None
+
+    def _get_totp_access_token(self) -> Optional[str]:
+        """
+        Generate a Spotify anonymous access token using the web player's TOTP
+        mechanism. Works without any Spotify credentials or scraping.
+        Requires: pip install pyotp
+        """
+        try:
+            import pyotp
+            totp = pyotp.TOTP(_SP_TOTP_SECRET)
+            code = totp.now()
+            resp = requests.get(
+                "https://open.spotify.com/api/token",
+                params={
+                    "reason": "init",
+                    "productType": "web-player",
+                    "totp": code,
+                    "totpVer": str(_SP_TOTP_VERSION),
+                    "totpServer": code,
+                },
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/145.0.0.0 Safari/537.36"
+                    )
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                token = resp.json().get("accessToken")
+                if token:
+                    logger.debug("[Spotify] TOTP anonymous token acquired")
+                    return token
+        except ImportError:
+            logger.debug("[Spotify] pyotp not installed — TOTP token unavailable")
+        except Exception as e:
+            logger.debug(f"[Spotify] TOTP token failed: {e}")
         return None
 
     def _fetch_track_ids_via_partner_api(self, playlist_id: str) -> list[str]:
@@ -977,6 +1063,7 @@ class SpotifyClient:
             artwork_url = images[0]["url"] if images else None
             total_tracks = album_data.get("total_tracks")
             album_genres = album_data.get("genres", [])
+            album_artist_names = [a["name"] for a in album_data.get("artists", []) if a.get("name")]
         except Exception as e:
             logger.warning(f"Spotify album API unavailable or credentials invalid for {album_id}: {e}")
             fallback_tracks = self._fetch_public_album_page(album_id)
@@ -1002,6 +1089,7 @@ class SpotifyClient:
                     title=t["name"],
                     artists=artists,
                     album=album_name,
+                    album_artists=album_artist_names,
                     release_year=release_year,
                     release_date=release_date,
                     track_number=t.get("track_number"),
@@ -1041,6 +1129,134 @@ class SpotifyClient:
 
         # Fallback to iTunes Search API (100% public, no auth, good metadata)
         return self._search_track_itunes(query)
+
+    def _get_anonymous_token(self) -> Optional[str]:
+        """
+        Fetch a short-lived anonymous Spotify token from the web player endpoint.
+        No credentials required — same mechanism browsers use to load open.spotify.com.
+        """
+        try:
+            resp = requests.get(
+                "https://open.spotify.com/get_access_token",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json",
+                },
+                params={"reason": "transport", "productType": "web_player"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json().get("accessToken")
+        except Exception as e:
+            logger.debug(f"[Spotify] Anonymous token fetch failed: {e}")
+            return None
+
+    def search_artists(self, query: str, limit: int = 8) -> list[dict]:
+        """Search for artists by name. Returns scored list for the artist search UI.
+
+        Each result: {artist_id, name, artwork_url, genres, followers, match_score, profile_url}
+        match_score is 0.0–1.0, sorted descending.
+        Falls back to iTunes artist search if Spotify credentials aren't available.
+        """
+        from antra.utils.matching import normalize, string_similarity
+
+        results: list[dict] = []
+
+        # Try Spotipy first
+        if self.sp:
+            try:
+                raw = self.sp.search(q=query, type="artist", limit=limit, market=self._market)
+                artists = raw.get("artists", {}).get("items", [])
+                for a in artists:
+                    name = a.get("name", "")
+                    images = a.get("images", [])
+                    artwork = images[0]["url"] if images else None
+                    artist_id = a.get("id", "")
+                    score = string_similarity(normalize(query), normalize(name))
+                    results.append({
+                        "artist_id": artist_id,
+                        "name": name,
+                        "artwork_url": artwork,
+                        "genres": a.get("genres", []),
+                        "followers": a.get("followers", {}).get("total"),
+                        "match_score": round(score, 3),
+                        "profile_url": f"https://open.spotify.com/artist/{artist_id}",
+                        "source": "spotify",
+                    })
+                results.sort(key=lambda x: x["match_score"], reverse=True)
+                return results
+            except Exception as e:
+                logger.debug(f"[Spotify] Artist search failed: {e}")
+
+        # No Spotipy credentials — get an anonymous token via the embed-page scraper.
+        # _get_anonymous_access_token() is already proven reliable (used for playlists).
+        token = self._get_anonymous_access_token()
+        if token:
+            try:
+                resp = requests.get(
+                    "https://api.spotify.com/v1/search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"q": query, "type": "artist", "limit": limit},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                artists = resp.json().get("artists", {}).get("items", [])
+                for a in artists:
+                    name = a.get("name", "")
+                    images = a.get("images", [])
+                    artwork = images[0]["url"] if images else None
+                    artist_id = a.get("id", "")
+                    score = string_similarity(normalize(query), normalize(name))
+                    results.append({
+                        "artist_id": artist_id,
+                        "name": name,
+                        "artwork_url": artwork,
+                        "genres": a.get("genres", []),
+                        "followers": a.get("followers", {}).get("total"),
+                        "match_score": round(score, 3),
+                        "profile_url": f"https://open.spotify.com/artist/{artist_id}",
+                        "source": "spotify",
+                    })
+                results.sort(key=lambda x: x["match_score"], reverse=True)
+                if results:
+                    return results
+            except Exception as e:
+                logger.debug(f"[Spotify] Anonymous artist search failed: {e}")
+
+        # Nothing worked — return empty (caller decides whether to surface an error)
+        return []
+
+    def _search_artists_itunes(self, query: str, limit: int = 8) -> list[dict]:
+        """Artist search via public iTunes Search API — no credentials required."""
+        from antra.utils.matching import normalize, string_similarity
+        try:
+            resp = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": query, "entity": "musicArtist", "limit": limit, "media": "music"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("results", [])
+            results = []
+            for a in items:
+                name = a.get("artistName", "")
+                artist_id = str(a.get("artistId", ""))
+                score = string_similarity(normalize(query), normalize(name))
+                results.append({
+                    "artist_id": artist_id,
+                    "name": name,
+                    "artwork_url": None,
+                    "genres": [a["primaryGenreName"]] if a.get("primaryGenreName") else [],
+                    "followers": None,
+                    "match_score": round(score, 3),
+                    "profile_url": f"https://music.apple.com/us/artist/{artist_id}",
+                    "source": "apple",
+                })
+            results.sort(key=lambda x: x["match_score"], reverse=True)
+            return results
+        except Exception as e:
+            logger.debug(f"[iTunes] Artist search fallback failed: {e}")
+            return []
 
     def _search_track_itunes(self, query: str) -> Optional[TrackMetadata]:
         url = "https://itunes.apple.com/search"
@@ -1142,6 +1358,164 @@ class SpotifyClient:
             logger.debug(f"Public album fallback failed for {album_id}: {e}")
             return []
 
+    def _fetch_album_via_partner_api(self, album_id: str) -> list[TrackMetadata]:
+        """
+        Fetch album tracks using Spotify's internal partner GraphQL API with an
+        anonymous TOTP token. More reliable than HTML scraping; returns full
+        track list including disc/track numbers and durations.
+        No Spotify credentials required.
+        """
+        token = self._get_anonymous_access_token()
+        if not token:
+            return []
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "App-Platform": "WebPlayer",
+            "Spotify-App-Version": "1.0.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/145.0.0.0 Safari/537.36"
+            ),
+        }
+
+        all_items: list = []
+        offset = 0
+        limit = 300
+        album_meta: dict = {}
+
+        while True:
+            payload = {
+                "variables": {
+                    "uri": f"spotify:album:{album_id}",
+                    "locale": "",
+                    "offset": offset,
+                    "limit": limit,
+                },
+                "operationName": "getAlbum",
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": _GQL_ALBUM_HASH,
+                    }
+                },
+            }
+            try:
+                resp = requests.post(
+                    "https://api-partner.spotify.com/pathfinder/v2/query",
+                    headers=headers,
+                    json=payload,
+                    timeout=20,
+                )
+                if not resp.ok:
+                    logger.debug(
+                        f"[Spotify] Partner album API {resp.status_code} for {album_id}: {resp.text[:200]}"
+                    )
+                    break
+                data = resp.json()
+            except Exception as e:
+                logger.debug(f"[Spotify] Partner album API error: {e}")
+                break
+
+            album_union = data.get("data", {}).get("albumUnion", {})
+            if not album_meta:
+                # Capture album-level fields on first page
+                artists_items = (
+                    album_union.get("artists", {}).get("items", [])
+                )
+                album_meta = {
+                    "name": album_union.get("name", ""),
+                    "artists": [
+                        a.get("profile", {}).get("name", "")
+                        for a in artists_items
+                        if isinstance(a, dict)
+                    ],
+                    "release_date": (
+                        album_union.get("date", {}).get("isoString", "")
+                        or album_union.get("date", {}).get("year", "")
+                    ),
+                    "artwork_url": self._pick_best_cover(
+                        album_union.get("coverArt", {}).get("sources", [])
+                    ),
+                    "total_tracks": album_union.get("tracksV2", {}).get("totalCount"),
+                }
+                # Strip time portion from ISO date
+                if album_meta["release_date"] and "T" in album_meta["release_date"]:
+                    album_meta["release_date"] = album_meta["release_date"].split("T")[0]
+
+            tracks_v2 = album_union.get("tracksV2", {})
+            items = tracks_v2.get("items", [])
+            if not items:
+                break
+            all_items.extend(items)
+            total = tracks_v2.get("totalCount", 0)
+            if len(all_items) >= total or len(items) < limit:
+                break
+            offset += limit
+
+        if not all_items:
+            return []
+
+        album_name = album_meta.get("name", "")
+        album_artists = album_meta.get("artists", [])
+        release_date = album_meta.get("release_date", "")
+        release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
+        artwork_url = album_meta.get("artwork_url")
+        total_tracks = album_meta.get("total_tracks") or len(all_items)
+
+        result: list[TrackMetadata] = []
+        for idx, item in enumerate(all_items, start=1):
+            track = item.get("track") if isinstance(item.get("track"), dict) else item
+            if not track or not track.get("name"):
+                continue
+            try:
+                track_uri = track.get("uri", "")
+                spotify_id = track_uri.split(":")[-1] if ":" in track_uri else track.get("id")
+                artist_items = track.get("artists", {}).get("items", [])
+                artists = [
+                    a.get("profile", {}).get("name", "")
+                    for a in artist_items
+                    if isinstance(a, dict)
+                ]
+                duration_ms = track.get("duration", {}).get("totalMilliseconds")
+                result.append(TrackMetadata(
+                    title=track.get("name", ""),
+                    artists=artists or album_artists,
+                    album=album_name,
+                    album_artists=album_artists,
+                    album_id=album_id,
+                    release_date=release_date or None,
+                    release_year=release_year,
+                    track_number=track.get("trackNumber") or idx,
+                    disc_number=track.get("discNumber") or 1,
+                    total_tracks=total_tracks,
+                    duration_ms=int(duration_ms) if duration_ms else None,
+                    artwork_url=artwork_url,
+                    spotify_id=spotify_id,
+                ))
+            except Exception as e:
+                logger.debug(f"[Spotify] Skipping partner API album track: {e}")
+
+        logger.info(f"[Spotify] Partner API: {len(result)} tracks for album {album_id}")
+        return result
+
+    @staticmethod
+    def _pick_best_cover(sources: list) -> Optional[str]:
+        """Return the largest cover art URL from a list of {url, width, height} dicts."""
+        if not sources:
+            return None
+        try:
+            best = max(
+                (s for s in sources if isinstance(s, dict) and s.get("url")),
+                key=lambda s: (s.get("width") or 0) * (s.get("height") or 0),
+                default=None,
+            )
+            return best["url"] if best else None
+        except Exception:
+            return sources[0].get("url") if sources else None
+
     def _fetch_track(self, url_or_id: str) -> list[TrackMetadata]:
         track_id = _strip_id(url_or_id, "track")
         if not self.sp:
@@ -1166,9 +1540,8 @@ class SpotifyClient:
         import time as _time
         artist_id = _strip_id(url_or_id, "artist")
         if not self.sp:
-            logger.info("[SpotFetch] No Spotify auth — fetching artist discography via SpotFetch proxy")
-            from antra.core.spotfetch_fetcher import SpotFetchFetcher
-            return SpotFetchFetcher().fetch_artist_discography_info(url_or_id)
+            logger.info("[Spotify] No Spotify auth — falling back to public iTunes Search API for artist discography")
+            return self._fetch_artist_discography_info_itunes(url_or_id)
 
         artist_data = self.sp.artist(artist_id)
         artist_name = artist_data.get("name", "Unknown Artist")
@@ -1214,6 +1587,77 @@ class SpotifyClient:
             "artwork_url": artwork_url,
             "albums": albums,
         }
+
+    def _fetch_artist_discography_info_itunes(self, url_or_id: str) -> dict:
+        """Fallback for fetching artist discography securely via iTunes Search API."""
+        import json
+        import requests
+        from antra.utils.matching import normalize, string_similarity
+
+        artist_id = _strip_id(url_or_id, "artist")
+        fallback_name = "Unknown Artist"
+        artwork_url = None
+
+        # 1. Grab true artist name from Spotify embed page
+        try:
+            embed_url = f"https://open.spotify.com/embed/artist/{artist_id}"
+            html = requests.get(embed_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10).text
+            match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+            if match:
+                data = json.loads(match.group(1))
+                entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+                fallback_name = entity.get("title") or entity.get("name") or fallback_name
+                # Extract avatar
+                visuals = entity.get("visuals", {})
+                avatar = visuals.get("avatarImage", {}).get("sources", [])
+                if avatar:
+                    artwork_url = avatar[0].get("url")
+        except Exception as e:
+            logger.debug(f"[Spotify] Could not fetch artist name from embed: {e}")
+
+        # 2. Search iTunes for the artist to get discography
+        try:
+            r = requests.get("https://itunes.apple.com/search", params={"term": fallback_name, "entity": "musicArtist", "limit": 10}, timeout=10)
+            r.raise_for_status()
+            results = r.json().get("results", [])
+            if not results:
+                raise RuntimeError(f"Could not find artist {fallback_name} on iTunes fallback search.")
+
+            best = max(results, key=lambda a: string_similarity(normalize(fallback_name), normalize(a.get("artistName", ""))))
+            itunes_id = best.get("artistId")
+            artist_name = best.get("artistName", fallback_name)
+
+            r2 = requests.get("https://itunes.apple.com/lookup", params={"id": itunes_id, "entity": "album", "limit": 200}, timeout=10)
+            r2.raise_for_status()
+            albums_data = r2.json().get("results", [])[1:]  # 0 is the artist entity itself
+
+            albums = []
+            for a in albums_data:
+                name = a.get("collectionName", "")
+                release_date = a.get("releaseDate", "")
+                year = int(release_date[:4]) if release_date[:4].isdigit() else None
+                a_url = a.get("collectionViewUrl", "")
+                a_url = a_url.split("?")[0] if "?" in a_url else a_url
+                img = a.get("artworkUrl100", "").replace("100x100bb", "600x600bb")
+
+                albums.append({
+                    "id": str(a.get("collectionId", "")),
+                    "url": a_url,
+                    "name": name,
+                    "type": "album",
+                    "year": year,
+                    "track_count": a.get("trackCount", 0),
+                    "artwork_url": img or None,
+                })
+
+            return {
+                "artist_id": artist_id,
+                "artist_name": artist_name,
+                "artwork_url": artwork_url,
+                "albums": albums,
+            }
+        except Exception as e:
+            raise RuntimeError(f"[Spotify] iTunes fallback failed: {e}")
 
     def _fetch_artist_top(self, url_or_id: str) -> list[TrackMetadata]:
         artist_id = _strip_id(url_or_id, "artist")
@@ -1308,6 +1752,78 @@ class SpotifyClient:
             logger.warning(f"Failed to enrich album data for {track.title}: {last_error}")
         return self.enrich_public_track_metadata(track)
 
+    def batch_enrich_album_data(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
+        """Enrich album data for a list of tracks using batched /albums API calls.
+
+        Uses the Spotify /albums endpoint (up to 20 IDs per call) instead of one
+        call per track, reducing API calls from N to ceil(unique_albums / 20).
+        Falls back to enrich_public_track_metadata for any albums that fail.
+        """
+        # Build album_id → list of track indices mapping
+        album_index: dict[str, list[int]] = {}
+        for i, track in enumerate(tracks):
+            if track.album_id:
+                album_index.setdefault(track.album_id, []).append(i)
+
+        unique_ids = list(album_index.keys())
+        if not unique_ids:
+            return tracks
+
+        # Fetch in batches of 20 (Spotify API limit)
+        album_data: dict[str, dict] = {}
+        clients = [self.sp] if self.sp else []
+        if self._oauth_sp and self._oauth_sp is not self.sp:
+            clients.append(self._oauth_sp)
+        if not clients:
+            return tracks
+
+        chunk_size = 20
+        for start in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[start:start + chunk_size]
+            for client in clients:
+                try:
+                    result = client.albums(chunk, market=self._market)
+                    for album in (result.get("albums") or []):
+                        if album and album.get("id"):
+                            album_data[album["id"]] = album
+                    break
+                except Exception as e:
+                    logger.warning(f"[Batch enrich] Failed to fetch album chunk: {e}")
+
+        # Apply enriched data back to tracks
+        for album_id, indices in album_index.items():
+            album = album_data.get(album_id)
+            if not album:
+                continue
+            genres = album.get("genres", [])
+            if not genres:
+                artist_ids = [a["id"] for a in album.get("artists", []) if a.get("id")]
+                if artist_ids:
+                    for client in clients:
+                        try:
+                            artist = client.artist(artist_ids[0])
+                            genres = artist.get("genres", [])
+                            break
+                        except Exception:
+                            pass
+            images = album.get("images", [])
+            artwork = images[0]["url"] if images else None
+            total_tracks = album.get("total_tracks")
+            for i in indices:
+                if genres:
+                    tracks[i].genres = genres
+                if artwork and not tracks[i].artwork_url:
+                    tracks[i].artwork_url = artwork
+                if total_tracks:
+                    tracks[i].total_tracks = total_tracks
+
+        # Fall back for any tracks whose album wasn't fetched
+        for i, track in enumerate(tracks):
+            if track.album_id and track.album_id not in album_data:
+                tracks[i] = self.enrich_public_track_metadata(track)
+
+        return tracks
+
     def enrich_public_track_metadata(self, track: TrackMetadata) -> TrackMetadata:
         """Best-effort artwork fallback using Spotify's public track page."""
         if not track.spotify_id:
@@ -1393,13 +1909,14 @@ class SpotifyClient:
 
     @staticmethod
     def _extract_meta_content(html: str, property_name: str) -> Optional[str]:
+        import html as _html_module
         match = re.search(
             rf'<meta\s+(?:property|name)="{re.escape(property_name)}"\s+content="([^"]+)"',
             html,
             re.IGNORECASE,
         )
         if match:
-            return match.group(1)
+            return _html_module.unescape(match.group(1))
         return None
 
     @classmethod
@@ -1449,11 +1966,13 @@ class SpotifyClient:
             release_year = int(release_date[:4]) if release_date else None
             images = album_data.get("images", [])
             artwork_url = images[0]["url"] if images else None
+            album_artists = [a["name"] for a in album_data.get("artists", []) if a.get("name")]
 
             return TrackMetadata(
                 title=track["name"],
                 artists=artists,
                 album=album_data.get("name", "Unknown Album"),
+                album_artists=album_artists,
                 release_year=release_year,
                 release_date=release_date,
                 track_number=track.get("track_number"),

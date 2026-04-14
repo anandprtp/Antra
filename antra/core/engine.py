@@ -2,9 +2,12 @@
 Download engine — orchestrates resolve → download → tag → organize.
 """
 import logging
+import os
 import shutil
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -14,12 +17,28 @@ from antra.core.control import DownloadController
 from antra.core.events import EngineEvent, EngineEventType
 from antra.core.models import AudioFormat, TrackMetadata, DownloadResult, DownloadStatus
 from antra.core.resolver import SourceResolver
+from antra.sources.base import RateLimitedError
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
 from antra.utils.tagger import FileTagger
 from antra.utils.transcoder import AudioTranscoder
 
 logger = logging.getLogger(__name__)
+
+# errno values that indicate the output filesystem is no longer accessible
+# (NAS disconnected, drive ejected, SMB session dropped after sleep, etc.)
+_MOUNT_LOST_ERRNOS = frozenset({
+    13,   # EACCES / EPERM  — permission denied (SMB session dropped)
+    57,   # ENOTCONN        — socket not connected (macOS SMB after sleep)
+    5,    # EIO             — I/O error (drive I/O failure)
+    30,   # EROFS           — read-only filesystem (mount degraded)
+    116,  # ESTALE          — stale NFS/SMB file handle
+})
+
+
+def _is_mount_lost_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like the output filesystem vanished."""
+    return isinstance(exc, OSError) and exc.errno in _MOUNT_LOST_ERRNOS
 
 
 @dataclass
@@ -29,6 +48,7 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     output_format: str = "source"
+    max_workers: int = 5
 
 
 class DownloadEngine:
@@ -49,14 +69,32 @@ class DownloadEngine:
         self.cfg = config or EngineConfig()
         self.event_callback = event_callback
         self.controller = controller
+        self._emit_lock = threading.Lock()
+        # Set when a mount-loss error is detected mid-batch so remaining workers
+        # can abort immediately instead of producing per-track error messages.
+        self._output_lost = threading.Event()
+        self._output_lost_message: str = ""
+
+    def _signal_output_lost(self, exc: OSError) -> None:
+        """Record the first mount-loss error so workers can abort fast."""
+        if not self._output_lost.is_set():
+            self._output_lost_message = (
+                f"Output directory became inaccessible mid-download "
+                f"(errno {exc.errno}: {exc.strerror}). "
+                "This usually means a NAS/network drive disconnected (e.g. Mac sleep). "
+                "Remaining tracks skipped — re-queue to resume."
+            )
+            logger.error(f"  [MOUNT LOST]  {self._output_lost_message}")
+            self._output_lost.set()
 
     def _emit(self, event_type: EngineEventType, **kwargs):
         if not self.event_callback:
             return
-        try:
-            self.event_callback(EngineEvent(type=event_type, **kwargs))
-        except Exception as e:
-            logger.debug(f"Event callback failed: {e}")
+        with self._emit_lock:
+            try:
+                self.event_callback(EngineEvent(type=event_type, **kwargs))
+            except Exception as e:
+                logger.debug(f"Event callback failed: {e}")
 
     @staticmethod
     def _hydrate_track_metadata(track: TrackMetadata, result) -> None:
@@ -76,6 +114,20 @@ class DownloadEngine:
             track.synced_lyrics = synced
         except Exception as e:
             logger.debug(f"  ℹ  Lyrics fetch failed: {e}")
+
+    @staticmethod
+    def _enrich_genres_if_needed(track: TrackMetadata) -> None:
+        """Populate track.genres from MusicBrainz when Spotify didn't provide any."""
+        if track.genres or not track.isrc:
+            return
+        try:
+            from antra.utils.musicbrainz import fetch_genres
+            genres = fetch_genres(track.isrc)
+            if genres:
+                track.genres = genres
+                logger.debug(f"  [MB]  Genres for '{track.title}': {', '.join(genres)}")
+        except Exception as e:
+            logger.debug(f"  [MB]  Genre fetch failed: {e}")
 
     @staticmethod
     def _audio_format_from_path(file_path: str) -> AudioFormat | None:
@@ -192,14 +244,32 @@ class DownloadEngine:
         self._fetch_lyrics_if_needed(track)
 
         excluded_adapters: set[str] = set()
+        # Adapters that were rate-limited get a second chance after all other
+        # sources are exhausted (rate limit may have cleared by then).
+        rate_limited_adapters: set[str] = set()
+        # Once an adapter has been given its second chance, permanently exclude it.
+        rate_limited_retried: set[str] = set()
         last_error: Optional[str] = None
         last_source: Optional[str] = None
+        used_lossy_fallback: bool = False  # flag for post-download warning
 
         while True:
-            # 3. Resolve
-            resolution = self.resolver.resolve(track, excluded_adapters=excluded_adapters)
+            # 3. Resolve — skip both permanently-excluded and currently rate-limited adapters.
+            all_excluded = excluded_adapters | rate_limited_adapters
+            resolution = self.resolver.resolve(track, excluded_adapters=all_excluded)
             if not resolution:
-                logger.warning(f"  [FAIL]  No source found: {track.title}")
+                # Before giving up: if any adapters were rate-limited and haven't
+                # had their one retry yet, unblock them and try again.
+                newly_retryable = rate_limited_adapters - rate_limited_retried
+                if newly_retryable:
+                    logger.info(
+                        f"  [RATE]  All other sources exhausted — retrying rate-limited: "
+                        f"{', '.join(newly_retryable)}"
+                    )
+                    rate_limited_retried |= newly_retryable
+                    rate_limited_adapters.clear()
+                    continue
+
                 self.organizer.mark_failed(track, last_error or "no_source")
                 self._emit(
                     EngineEventType.TRACK_FAILED,
@@ -218,20 +288,21 @@ class DownloadEngine:
                 )
 
             result, adapter = resolution
+            # Track if we ended up using a lossy source in lossless-prefer mode
+            # (so we can emit a post-download warning). The resolver already handles
+            # the "prefer lossless, fall back to lossy as last resort" logic.
             if self._requires_lossless_output() and not result.is_lossless:
-                last_error = (
-                    f"[{adapter.name}] Rejected lossy result in lossless mode for {track.title}"
-                )
-                last_source = adapter.name
-                excluded_adapters.add(adapter.name)
-                logger.warning(f"  [WARN]  {last_error}")
-                logger.info(f"  [NEXT]  {adapter.name} cannot satisfy lossless output, trying next source...")
-                continue
+                used_lossy_fallback = True
             self._hydrate_track_metadata(track, result)
             adapter.hydrate_track_metadata(track, result)
             self._fetch_lyrics_if_needed(track)
             # Layout must use post-hydration metadata (album/year from the resolver, etc.)
-            output_base = self.organizer.get_output_path(track)
+            try:
+                output_base = self.organizer.get_output_path(track)
+            except OSError as e:
+                if _is_mount_lost_error(e):
+                    self._signal_output_lost(e)
+                raise
             self._emit(
                 EngineEventType.TRACK_RESOLVED,
                 track=track,
@@ -246,7 +317,6 @@ class DownloadEngine:
             final_error: Optional[Exception] = None
 
             for attempt in range(1, self.cfg.max_retries + 1):
-                import time
                 self._last_attempt_start = time.time()
                 try:
                     source_text = adapter.name
@@ -267,10 +337,15 @@ class DownloadEngine:
                     source_quality = result.quality_label
                     if getattr(result, "sample_rate", None):
                         source_quality += f" / {result.sample_rate / 1000}kHz"
-                    
-                    logger.info(
-                        f"  \U0001f4e5 [Downloading] [{track_index}/{track_total}] {track.title} by {track.artist_string} ({source_quality})"
-                    )
+
+                    if attempt == 1:
+                        logger.info(
+                            f"  \U0001f4e5 [Downloading] [{track_index}/{track_total}] {track.title} by {track.artist_string} ({source_quality})"
+                        )
+                    else:
+                        logger.info(
+                            f"  \U0001f501 [Retry {attempt}] [{track_index}/{track_total}] {track.title} ({source_quality})"
+                        )
                     candidate_path = adapter.download(result, output_base)
                     if self._should_convert_output(candidate_path, self.cfg.output_format):
                         logger.info(f"  [FMT]  Converting to {self.cfg.output_format}: {track.title}")
@@ -282,16 +357,30 @@ class DownloadEngine:
                         )
                     file_path = candidate_path
                     break
+                except OSError as e:
+                    if _is_mount_lost_error(e):
+                        self._signal_output_lost(e)
+                    final_error = e
                 except Exception as e:
                     final_error = e
                     last_error = str(e)
                     last_source = adapter.name
                     adapter.mark_failed_result(result, e)
+
+                    # Rate-limited: skip to next source immediately — no sleep, no retry.
+                    if isinstance(e, RateLimitedError):
+                        logger.info(f"  [RATE]  {adapter.name} rate-limited — falling back to next source immediately")
+                        if adapter.name in rate_limited_retried:
+                            # Already gave this adapter its one retry — permanently exclude.
+                            excluded_adapters.add(adapter.name)
+                        else:
+                            # Defer for a possible second chance after other sources are tried.
+                            rate_limited_adapters.add(adapter.name)
+                        break
+
                     will_retry = attempt < self.cfg.max_retries and adapter.should_retry_download(result, e)
                     if adapter.name == "hifi" and "all quality levels failed" in str(e).lower():
                         logger.info("  [INFO]  HiFi mirrors could not provide a valid stream. Trying next source...")
-                    elif "rate limited" in str(e).lower() or "429" in str(e):
-                        logger.debug(f"  [RATE]  Attempt {attempt} rate-limited, retrying...")
                     elif will_retry:
                         # Transient failure — more attempts coming, keep it quiet
                         logger.debug(f"  [RETRY] Attempt {attempt} failed, retrying... ({e})")
@@ -304,14 +393,16 @@ class DownloadEngine:
                     break
 
             if file_path:
-                # 4. Tag
+                # 4. Enrich genres + tag
+                self._enrich_genres_if_needed(track)
                 logger.debug(
-                    "  [TAG]  %s | album=%r artwork=%s lyrics=%s synced=%s",
+                    "  [TAG]  %s | album=%r artwork=%s lyrics=%s synced=%s genres=%s",
                     file_path,
                     track.album,
                     bool(track.artwork_url),
                     bool(track.lyrics),
                     bool(track.synced_lyrics),
+                    track.genres or [],
                 )
                 tag_ok = self.tagger.tag(file_path, track)
                 if not tag_ok:
@@ -323,7 +414,6 @@ class DownloadEngine:
                 # 5. Mark done
                 self.organizer.mark_downloaded(track, file_path)
 
-                import os, time
                 size_mb = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0
                 attempt_time = getattr(self, "_last_attempt_start", time.time())
                 elapsed = time.time() - attempt_time
@@ -331,6 +421,12 @@ class DownloadEngine:
                 logger.info(
                     f"  \u2728 [Complete] [{track_index}/{track_total}] {track.title} by {track.artist_string}"
                 )
+                if used_lossy_fallback:
+                    logger.warning(
+                        f"  \u26a0\ufe0f  [{track.title}] No lossless source available — "
+                        f"downloaded as {result.quality_label} from {adapter.name}. "
+                        f"Not true lossless."
+                    )
                 self._emit(
                     EngineEventType.TRACK_COMPLETED,
                     track=track,
@@ -348,6 +444,11 @@ class DownloadEngine:
                     audio_format=self._audio_format_from_path(file_path) or result.audio_format,
                 )
 
+            # Rate-limited adapters already placed in rate_limited_adapters above — skip
+            # the regular exclude logic so they don't also land in excluded_adapters.
+            if isinstance(final_error, RateLimitedError):
+                continue
+
             should_exclude = True
             if final_error is not None:
                 should_exclude = adapter.should_exclude_adapter_after_failure(result, final_error)
@@ -359,9 +460,8 @@ class DownloadEngine:
                 logger.info(f"  [NEXT]  {adapter.name} candidate failed, trying another match from the same source...")
 
     def download_playlist(self, tracks: list[TrackMetadata]) -> list[DownloadResult]:
-        """Download all tracks in a playlist, returning all results."""
+        """Download all tracks in a playlist in parallel, returning results in original order."""
         total = len(tracks)
-        results: list[DownloadResult] = []
         playlist_name = tracks[0].playlist_name if tracks and tracks[0].playlist_name else None
         self._emit(
             EngineEventType.PLAYLIST_STARTED,
@@ -369,42 +469,101 @@ class DownloadEngine:
             message=f"Starting playlist download for {total} track(s).",
         )
 
-        for i, track in enumerate(tracks, 1):
+        # results[i] will hold the DownloadResult for tracks[i]
+        results: list[Optional[DownloadResult]] = [None] * total
+
+        def _worker(index: int, track: TrackMetadata) -> tuple[int, DownloadResult]:
+            # Abort immediately if the output filesystem was lost by a previous worker.
+            if self._output_lost.is_set():
+                return index, DownloadResult(
+                    track=track,
+                    status=DownloadStatus.FAILED,
+                    error=self._output_lost_message,
+                )
             if self.controller:
                 self.controller.wait_if_paused()
                 if self.controller.is_cancelled():
-                    if playlist_name and results:
-                        self.organizer.write_playlist_manifest(
-                            playlist_name,
-                            [result.file_path for result in results if result.file_path],
-                        )
-                    self._emit(
-                        EngineEventType.PLAYLIST_CANCELLED,
-                        track_index=i,
-                        track_total=total,
-                        message="Playlist download cancelled.",
+                    return index, DownloadResult(
+                        track=track,
+                        status=DownloadStatus.CANCELLED,
+                        error="Cancelled",
                     )
-                    return results
-
-            logger.info(f"[{i}/{total}] {track.artist_string} — {track.title}")
+            logger.info(f"[{index + 1}/{total}] {track.artist_string} — {track.title}")
             self._emit(
                 EngineEventType.TRACK_STARTED,
                 track=track,
-                track_index=i,
+                track_index=index + 1,
                 track_total=total,
             )
-            result = self.download_track(track, track_index=i, track_total=total)
-            results.append(result)
+            return index, self.download_track(track, track_index=index + 1, track_total=total)
+
+        workers = max(1, self.cfg.max_workers)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_worker, i, track): i for i, track in enumerate(tracks)}
+            for future in as_completed(futures):
+                if self.controller and self.controller.is_cancelled():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    idx, result = future.result()
+                    results[idx] = result
+                except OSError as e:
+                    idx = futures[future]
+                    if _is_mount_lost_error(e):
+                        self._signal_output_lost(e)
+                    results[idx] = DownloadResult(
+                        track=tracks[idx],
+                        status=DownloadStatus.FAILED,
+                        error=self._output_lost_message if self._output_lost.is_set() else str(e),
+                    )
+                except Exception as e:
+                    idx = futures[future]
+                    logger.warning(f"Worker for track {idx + 1} raised unexpectedly: {e}")
+                    results[idx] = DownloadResult(
+                        track=tracks[idx],
+                        status=DownloadStatus.FAILED,
+                        error=str(e),
+                    )
+
+        # Fill any slots that were cancelled or never completed
+        final: list[DownloadResult] = []
+        for i, r in enumerate(results):
+            if r is None:
+                r = DownloadResult(
+                    track=tracks[i],
+                    status=DownloadStatus.CANCELLED,
+                    error="Cancelled",
+                )
+            final.append(r)
+
+        if self.controller and self.controller.is_cancelled():
+            if playlist_name and final:
+                self.organizer.write_playlist_manifest(
+                    playlist_name,
+                    [r.file_path for r in final if r.file_path],
+                )
+            self._emit(
+                EngineEventType.PLAYLIST_CANCELLED,
+                track_total=total,
+                message="Playlist download cancelled.",
+            )
+            return final
 
         if playlist_name:
             self.organizer.write_playlist_manifest(
                 playlist_name,
-                [result.file_path for result in results if result.file_path],
+                [r.file_path for r in final if r.file_path],
             )
 
         self._emit(
             EngineEventType.PLAYLIST_COMPLETED,
             track_total=total,
-            message=f"Processed {len(results)} track(s).",
+            message=f"Processed {len(final)} track(s).",
         )
-        return results
+
+        # If mount loss was detected, raise so json_cli surfaces the error in
+        # the playlist_summary and subsequent URLs are also skipped cleanly.
+        if self._output_lost.is_set():
+            raise OSError(self._output_lost_message)
+
+        return final

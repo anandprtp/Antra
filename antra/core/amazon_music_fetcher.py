@@ -18,6 +18,7 @@ Strategy:
 """
 
 import html as html_module
+import json
 import logging
 import re
 from typing import Optional
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _AMAZON_MUSIC_BASE = "https://music.amazon.com"
 _URL_ASIN_RE = re.compile(
-    r"music\.amazon\.com/(tracks|albums|playlists)/([A-Z0-9]{10})"
+    r"(music\.amazon\.[a-z\.]+)/(tracks|albums|playlists|user-playlists)/([A-Za-z0-9_-]+)"
 )
 
 REQUEST_TIMEOUT = 20
@@ -52,7 +53,7 @@ _BASE_HEADERS = {
 
 def is_amazon_music_url(url: str) -> bool:
     """Return True if the URL looks like an Amazon Music URL."""
-    return "music.amazon.com" in url
+    return "music.amazon." in url
 
 
 class AmazonMusicFetcher:
@@ -80,38 +81,38 @@ class AmazonMusicFetcher:
         Raises RuntimeError if metadata cannot be retrieved.
         """
         url = url.strip()
-        url_type, asin = self._parse_url(url)
+        domain, url_type, asin = self._parse_url(url)
 
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
         marketplace_id = (qs.get("marketplaceId") or ["ATVPDKIKX0DER"])[0]
 
         if url_type == "tracks":
-            return self._fetch_track(asin, marketplace_id)
+            return self._fetch_track(domain, asin, marketplace_id)
         elif url_type == "albums":
-            return self._fetch_album(asin, marketplace_id)
-        elif url_type == "playlists":
-            return self._fetch_playlist(asin, marketplace_id)
+            return self._fetch_album(domain, asin, marketplace_id)
+        elif url_type in ("playlists", "user-playlists"):
+            return self._fetch_playlist(domain, url_type, asin, marketplace_id)
         else:
             raise ValueError(f"[AmazonMusic] Unsupported URL type: {url_type}")
 
     # ── URL parsing ───────────────────────────────────────────────────────────
 
-    def _parse_url(self, url: str) -> tuple[str, str]:
-        """Return (url_type, asin). Raises ValueError on bad URLs."""
+    def _parse_url(self, url: str) -> tuple[str, str, str]:
+        """Return (domain, url_type, asin). Raises ValueError on bad URLs."""
         m = _URL_ASIN_RE.search(url)
         if not m:
             raise ValueError(
                 f"[AmazonMusic] Not a recognised Amazon Music URL: {url}\n"
-                "Supported: music.amazon.com/tracks/..., /albums/..., /playlists/..."
+                "Supported: music.amazon.*/tracks/..., /albums/..., /playlists/..., /user-playlists/..."
             )
-        return m.group(1), m.group(2)
+        return m.group(1), m.group(2), m.group(3)
 
     # ── Fetchers ──────────────────────────────────────────────────────────────
 
-    def _fetch_track(self, asin: str, marketplace_id: str) -> list[TrackMetadata]:
+    def _fetch_track(self, domain: str, asin: str, marketplace_id: str) -> list[TrackMetadata]:
         """Fetch a single track's metadata from the track detail page."""
-        url = f"{_AMAZON_MUSIC_BASE}/tracks/{asin}"
+        url = f"https://{domain}/tracks/{asin}"
         html = self._get_page(url, marketplace_id)
         if not html:
             raise RuntimeError(f"[AmazonMusic] Could not fetch track page for ASIN {asin}.")
@@ -123,13 +124,19 @@ class AmazonMusicFetcher:
             )
         return tracks
 
-    def _fetch_album(self, asin: str, marketplace_id: str) -> list[TrackMetadata]:
+    def _fetch_album(self, domain: str, asin: str, marketplace_id: str) -> list[TrackMetadata]:
         """Fetch album track listing from the album detail page."""
-        url = f"{_AMAZON_MUSIC_BASE}/albums/{asin}"
+        url = f"https://{domain}/albums/{asin}"
         html = self._get_page(url, marketplace_id)
         if not html:
             raise RuntimeError(f"[AmazonMusic] Could not fetch album page for ASIN {asin}.")
 
+        # Try JSON-LD first (schema.org MusicAlbum — reliable, Amazon always embeds it)
+        tracks = self._parse_jsonld_album(html)
+        if tracks:
+            return tracks
+
+        # Fall back to web-component attribute parsing (older page format)
         tracks = self._parse_tracklist_page(html, url_type="album")
         if not tracks:
             raise RuntimeError(
@@ -137,9 +144,9 @@ class AmazonMusicFetcher:
             )
         return tracks
 
-    def _fetch_playlist(self, asin: str, marketplace_id: str) -> list[TrackMetadata]:
+    def _fetch_playlist(self, domain: str, url_type: str, asin: str, marketplace_id: str) -> list[TrackMetadata]:
         """Fetch playlist track listing from the playlist detail page."""
-        url = f"{_AMAZON_MUSIC_BASE}/playlists/{asin}?marketplaceId={marketplace_id}&musicTerritory=US"
+        url = f"https://{domain}/{url_type}/{asin}?marketplaceId={marketplace_id}"
         html = self._get_page(url, marketplace_id)
         if not html:
             raise RuntimeError(f"[AmazonMusic] Could not fetch playlist page for ASIN {asin}.")
@@ -223,20 +230,23 @@ class AmazonMusicFetcher:
             title = _get_dq('headline', attrs)
             artist = _get_dq('primary-text', attrs)
             album = _get_dq('secondary-text', attrs)
+            img = _get_dq('image-src', attrs)
             if not title:
                 continue
             return [TrackMetadata(
                 title=title,
                 artists=[artist] if artist else [],
                 album=album or "",
+                artwork_url=img or None,
             )]
 
         # Fallback: look for any music-detail-header with a headline (track title)
         for attrs in headers_raw:
             title = _get_dq('headline', attrs)
             artist = _get_dq('primary-text', attrs)
+            img = _get_dq('image-src', attrs)
             if title and artist:
-                return [TrackMetadata(title=title, artists=[artist], album="")]
+                return [TrackMetadata(title=title, artists=[artist], album="", artwork_url=img or None)]
 
         return []
 
@@ -260,7 +270,11 @@ class AmazonMusicFetcher:
         tracks: list[TrackMetadata] = []
 
         # --- Playlist: music-image-row ---
-        for attrs in re.findall(r'<music-image-row\b([^>]+)>', html, re.DOTALL):
+        name, playlist_img = self._extract_album_metadata(html)
+        is_playlist = url_type in ("playlist", "playlists", "user-playlists")
+        playlist_name = name if is_playlist and name else None
+
+        for idx, attrs in enumerate(re.findall(r'<music-image-row\b([^>]+)>', html, re.DOTALL), start=1):
             href = _get_dq('primary-href', attrs)
             if 'trackAsin=' not in href:
                 continue
@@ -269,19 +283,24 @@ class AmazonMusicFetcher:
                 continue
             artist = _get_dq('secondary-text-1', attrs)
             album = _get_dq('secondary-text-2', attrs)
+            img = _get_dq('image-src', attrs) or playlist_img
             dur_ms = _parse_duration(_get_dq('duration', attrs))
             tracks.append(TrackMetadata(
                 title=title,
                 artists=[artist] if artist else [],
                 album=album or "",
                 duration_ms=dur_ms,
+                artwork_url=img or None,
+                playlist_name=playlist_name,
+                playlist_position=idx if playlist_name else None,
             ))
 
         if tracks:
             return tracks
 
         # --- Album: music-horizontal-item ---
-        for attrs in re.findall(r'<music-horizontal-item\b([^>]+)>', html, re.DOTALL):
+        album, album_img = self._extract_album_metadata(html)
+        for idx, attrs in enumerate(re.findall(r'<music-horizontal-item\b([^>]+)>', html, re.DOTALL), start=1):
             href = _get_dq('primary-href', attrs)
             if 'trackAsin=' not in href:
                 continue
@@ -289,31 +308,112 @@ class AmazonMusicFetcher:
             if not title:
                 continue
             artist = _get_dq('secondary-text', attrs)
-            # Albums don't embed the album name in track rows — get it from the detail header
-            album = self._extract_album_name(html)
             dur_ms = _parse_duration(_get_dq('duration', attrs))
             tracks.append(TrackMetadata(
                 title=title,
                 artists=[artist] if artist else [],
                 album=album or "",
                 duration_ms=dur_ms,
+                track_number=idx if not is_playlist else None,
+                artwork_url=album_img or None,
+                playlist_name=playlist_name,
+                playlist_position=idx if is_playlist else None,
             ))
 
         return tracks
 
-    def _extract_album_name(self, html: str) -> str:
-        """Extract album name from the page's detail header."""
+    def _parse_jsonld_album(self, html: str) -> list[TrackMetadata]:
+        """
+        Parse schema.org JSON-LD embedded in the album page.
+        Amazon always includes a <script type="application/ld+json"> block with
+        the full MusicAlbum entity including track list and per-track ASINs.
+        """
+        # Find the JSON-LD script block
+        m = re.search(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not m:
+            # Fallback: find any script whose content starts with a MusicAlbum object
+            for script_content in re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+                sc = script_content.strip()
+                if '"MusicAlbum"' in sc and sc.startswith('{'):
+                    m = type('m', (), {'group': lambda self, n: sc})()
+                    break
+
+        if not m:
+            return []
+
+        try:
+            data = json.loads(m.group(1))
+        except Exception as e:
+            logger.debug(f"[AmazonMusic] JSON-LD parse failed: {e}")
+            return []
+
+        if data.get("@type") != "MusicAlbum":
+            return []
+
+        album_name = data.get("name", "")
+        album_artist = data.get("byArtist", {}).get("name", "")
+        release_date = (data.get("datePublished") or "")[:10]  # "2022-12-02"
+        release_year = int(release_date[:4]) if release_date[:4].isdigit() else None
+
+        _, artwork_url = self._extract_album_metadata(html)
+
+        raw_tracks = data.get("track", [])
+        if not raw_tracks:
+            return []
+
+        tracks: list[TrackMetadata] = []
+        for item in raw_tracks:
+            if item.get("@type") != "MusicRecording":
+                continue
+            title = item.get("name", "").strip()
+            if not title:
+                continue
+
+            # ASIN from track URL: https://music.amazon.com/tracks/{ASIN}
+            track_url = item.get("url", "")
+            asin_m = re.search(r"/tracks/([A-Z0-9]{10})", track_url)
+            amazon_asin = asin_m.group(1) if asin_m else None
+
+            # ISO 8601 duration e.g. "PT3M42S" → ms
+            duration_ms = _parse_iso_duration(item.get("duration", ""))
+            position = item.get("position")
+
+            tracks.append(TrackMetadata(
+                title=title,
+                artists=[album_artist] if album_artist else [],
+                album=album_name,
+                album_artists=[album_artist] if album_artist else [],
+                release_date=release_date or None,
+                release_year=release_year,
+                track_number=int(position) if position else None,
+                total_tracks=len(raw_tracks),
+                duration_ms=duration_ms,
+                amazon_asin=amazon_asin,
+                artwork_url=artwork_url or None,
+            ))
+
+        logger.info(f"[AmazonMusic] JSON-LD: parsed {len(tracks)} tracks for album {album_name!r}")
+        return tracks
+
+    def _extract_album_metadata(self, html: str) -> tuple[str, Optional[str]]:
+        """Extract album name and artwork URL from the page's detail header."""
         headers_raw = re.findall(r'<music-detail-header\b([^>]+)>', html, re.DOTALL)
         for attrs in headers_raw:
             label = _get_dq('label', attrs).upper()
-            if 'ALBUM' in label or 'EP' in label:
-                return _get_dq('primary-text', attrs)
-        # Fallback: first detail header's primary-text
+            if 'ALBUM' in label or 'EP' in label or 'PLAYLIST' in label:
+                name = _get_dq('headline', attrs) or _get_dq('primary-text', attrs)
+                return name, _get_dq('image-src', attrs) or None
+        # Fallback: first detail header
         if headers_raw:
-            name = _get_dq('primary-text', headers_raw[0])
+            name = _get_dq('headline', headers_raw[0]) or _get_dq('primary-text', headers_raw[0])
+            img = _get_dq('image-src', headers_raw[0])
             if name:
-                return name
-        return ""
+                return name, img or None
+        return "", None
 
     # ── Artist discography ────────────────────────────────────────────────────
 
@@ -322,12 +422,13 @@ class AmazonMusicFetcher:
         Return artist metadata + full album list for the discography picker UI.
         Fetches the artist page via the Googlebot SSR trick and parses album cards.
         """
-        m = re.search(r"music\.amazon\.com/artists/([A-Z0-9a-z0-9_-]+)", url)
+        m = re.search(r"(music\.amazon\.[a-z\.]+)/artists/([A-Z0-9a-z0-9_-]+)", url)
         if not m:
             raise ValueError(f"[AmazonMusic] Cannot parse artist ID from: {url}")
-        artist_id = m.group(1)
+        domain = m.group(1)
+        artist_id = m.group(2)
 
-        artist_url = f"{_AMAZON_MUSIC_BASE}/artists/{artist_id}"
+        artist_url = f"https://{domain}/artists/{artist_id}"
         html = self._get_page(artist_url, "ATVPDKIKX0DER")
         if not html:
             raise RuntimeError(f"[AmazonMusic] Could not fetch artist page for {artist_id}")
@@ -393,7 +494,7 @@ class AmazonMusicFetcher:
                 year = int(year_m.group(0))
 
             img = _get_dq('image-src', tag)
-            album_url = f"{_AMAZON_MUSIC_BASE}/albums/{album_asin}"
+            album_url = f"https://{domain}/albums/{album_asin}"
             albums.append({
                 "id": album_asin,
                 "url": album_url,
@@ -439,3 +540,22 @@ def _parse_duration(s: str) -> Optional[int]:
     except (ValueError, IndexError):
         pass
     return None
+
+
+def _parse_iso_duration(s: str) -> Optional[int]:
+    """
+    Parse an ISO 8601 duration string (e.g. "PT3M42S", "PT1H2M3S") into milliseconds.
+    Returns None for empty/invalid input.
+    """
+    if not s:
+        return None
+    m = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', s)
+    if not m:
+        return None
+    try:
+        hours = int(m.group(1) or 0)
+        minutes = int(m.group(2) or 0)
+        seconds = float(m.group(3) or 0)
+        return int((hours * 3600 + minutes * 60 + seconds) * 1000)
+    except (ValueError, TypeError):
+        return None

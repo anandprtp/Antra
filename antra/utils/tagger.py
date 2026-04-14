@@ -54,6 +54,11 @@ def _sniff_image_mime(data: bytes, response_mime: Optional[str]) -> str:
 
 
 class FileTagger:
+    def __init__(self):
+        # Cache artwork by URL so albums only hit the CDN once regardless of
+        # how many tracks share the same artwork_url.
+        self._artwork_cache: dict[str, Optional[tuple[bytes, str]]] = {}
+
     def tag(
         self,
         file_path: str,
@@ -73,23 +78,12 @@ class FileTagger:
                 self._write_lyrics_sidecars(file_path, track)
                 return False
             
-            # Internal lyric embedding (hardened)
             self.embed_lyrics(
                 file_path,
                 track.lyrics or "",
                 track.synced_lyrics or "",
                 track.duration_ms or 0
             )
-            
-            # Sidecar files
-            # Internal lyric embedding (hardened)
-            self.embed_lyrics(
-                file_path,
-                track.lyrics or "",
-                track.synced_lyrics or "",
-                track.duration_ms or 0
-            )
-
             self._write_lyrics_sidecars(file_path, track)
             logger.debug(f"Tagged: {file_path}")
             return True
@@ -104,7 +98,8 @@ class FileTagger:
 
         audio["title"] = track.title
         audio["artist"] = track.artists
-        audio["albumartist"] = [track.primary_artist]
+        album_artist_str = ", ".join(track.album_artists) if track.album_artists else track.primary_artist
+        audio["albumartist"] = [album_artist_str]
         audio["album"] = track.album
         if track.release_year:
             audio["date"] = str(track.release_year)
@@ -125,6 +120,7 @@ class FileTagger:
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
             artwork_data, mime = artwork
+            audio.clear_pictures()
             pic = Picture()
             pic.type = 3  # Cover (front)
             pic.mime = mime
@@ -144,7 +140,8 @@ class FileTagger:
 
         audio.add(TIT2(encoding=3, text=track.title))
         audio.add(TPE1(encoding=3, text=track.artist_string))
-        audio.add(TPE2(encoding=3, text=track.primary_artist))
+        album_artist_str = ", ".join(track.album_artists) if track.album_artists else track.primary_artist
+        audio.add(TPE2(encoding=3, text=album_artist_str))
         audio.add(TALB(encoding=3, text=track.album))
 
         if track.release_year:
@@ -167,6 +164,7 @@ class FileTagger:
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
             artwork_data, mime = artwork
+            audio.delall("APIC")
             audio.add(APIC(
                 encoding=3,
                 mime=mime,
@@ -175,7 +173,9 @@ class FileTagger:
                 data=artwork_data,
             ))
 
-        audio.save(path)
+        # Save as ID3v2.3 instead of mutagen's native v2.4 so Windows Explorer
+        # and standard mobile players can reliably read the Cover Art APIC frame.
+        audio.save(path, v1=2, v2_version=3)
 
     # ── MP4 / M4A ────────────────────────────────────────────────────────────
 
@@ -184,7 +184,8 @@ class FileTagger:
 
         audio["\xa9nam"] = [track.title]
         audio["\xa9ART"] = track.artists
-        audio["aART"] = [track.primary_artist]
+        album_artist_str = ", ".join(track.album_artists) if track.album_artists else track.primary_artist
+        audio["aART"] = [album_artist_str]
         audio["\xa9alb"] = [track.album]
 
         if track.release_year:
@@ -210,17 +211,28 @@ class FileTagger:
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _fetch_artwork(url: Optional[str]) -> Optional[tuple[bytes, str]]:
+    def _fetch_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str]]:
         if not url:
             return None
-        try:
-            resp = requests.get(url, timeout=15)
-            resp.raise_for_status()
-            return FileTagger._normalize_artwork(resp.content, resp.headers.get("Content-Type"))
-        except Exception as e:
-            logger.warning(f"Failed to download artwork from {url}: {e}")
-            return None
+        if url in self._artwork_cache:
+            return self._artwork_cache[url]
+
+        result = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                result = FileTagger._normalize_artwork(resp.content, resp.headers.get("Content-Type"))
+                break
+            except Exception as e:
+                if attempt < 2:
+                    import time
+                    time.sleep(1.5 ** attempt)
+                else:
+                    logger.warning(f"Failed to download artwork from {url}: {e}")
+
+        self._artwork_cache[url] = result
+        return result
 
     @staticmethod
     def _normalize_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str]:
@@ -316,7 +328,7 @@ class FileTagger:
                             desc="",
                             text=frames,
                         ))
-                audio.save(path)
+                audio.save(path, v1=2, v2_version=3)
 
             elif ext in (".m4a", ".mp4", ".aac"):
                 audio = MP4(path)

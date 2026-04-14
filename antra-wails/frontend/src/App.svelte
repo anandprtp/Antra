@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { GetConfig, SaveConfig, PickDirectory, StartDownload, CancelDownload, GetHistory, AddHistory, ClearHistory } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
 
@@ -10,9 +10,28 @@
     soulseek_enabled: false,
     soulseek_username: '',
     soulseek_password: '',
+    soulseek_seed_after_download: false,
+    sources_enabled: [],
     first_run_complete: false,
     output_format: 'lossless'
   };
+
+  // Derived: true if a source group is enabled (or sources_enabled is empty = all on)
+  $: sourcesAll = !config.sources_enabled || config.sources_enabled.length === 0;
+  $: hifiEnabled = sourcesAll || config.sources_enabled.includes('hifi');
+  $: soulseekSourceEnabled = sourcesAll || config.sources_enabled.includes('soulseek');
+
+  function toggleSourceGroup(group: string, checked: boolean) {
+    let current = config.sources_enabled ? [...config.sources_enabled] : [];
+    if (checked) {
+      if (!current.includes(group)) current.push(group);
+    } else {
+      current = current.filter(g => g !== group);
+    }
+    // If both are selected, normalize to empty (= all)
+    const both = current.includes('hifi') && current.includes('soulseek');
+    config.sources_enabled = both ? [] : current;
+  }
 
   let isLoading = true;
   let setupMode = false;
@@ -59,6 +78,12 @@
       }
       if (!config.output_format) {
         config.output_format = 'lossless';
+      }
+      if (!config.sources_enabled) {
+        config.sources_enabled = [];
+      }
+      if (typeof config.soulseek_seed_after_download !== 'boolean') {
+        config.soulseek_seed_after_download = false;
       }
     } catch (e) {
       console.error('Failed to load config', e);
@@ -183,6 +208,7 @@
 
       } else if (name === 'track_download_attempt') {
         const source = String(data.source || 'auto');
+        const attempt = data.attempt ?? 1;
         clearTrackInterval(trackName);
 
         if (source.startsWith('soulseek')) {
@@ -195,10 +221,11 @@
           return;
         }
 
+        const attemptSuffix = attempt > 1 ? ` • Retry ${attempt}` : '';
         updateActiveTrack(trackName, {
           mode: 'progress',
           progress: 8,
-          text: `Downloading${data.quality_label ? ` • ${data.quality_label}` : ''}`
+          text: `Downloading${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`
         });
 
         const intervalId = setInterval(() => {
@@ -280,6 +307,15 @@
     spectrogram?: string;
     error?: string;
   }
+
+  // Artist search mode
+  let searchMode = false;
+  let searchQuery = '';
+  let searchSource: 'spotify' | 'apple' = 'apple';
+  let showArtistSearch = false;
+  let artistSearchResults: any[] = [];
+  let artistSearchLoading = false;
+  let artistSearchReqId = 0;
 
   // Discography modal
   let showDiscography = false
@@ -451,7 +487,15 @@
     const br = +(fmt.bit_rate || 0);
 
     if (codec === 'flac' || codec === 'alac') {
-      if (bits >= 24 && sr >= 88200) return { label: 'Hi-Res Lossless', color: '#a78bfa' };
+      if (bits >= 24 && sr >= 88200) {
+        // Extra sanity: hi-res lossless should be at least 800kbps
+        if (br > 0 && br < 400000) return { label: 'Suspect (Low Bitrate)', color: '#f87171' };
+        return { label: 'Hi-Res Lossless', color: '#a78bfa' };
+      }
+      // Standard lossless (16-bit CD quality) should be at least ~400kbps;
+      // below ~250kbps is almost always a lossy-to-lossless transcode (fake FLAC).
+      if (br > 0 && br < 250000) return { label: 'Fake Lossless', color: '#f87171' };
+      if (br > 0 && br < 400000) return { label: 'Lossless (Low BR)', color: '#facc15' };
       return { label: 'Lossless', color: '#00ffcc' };
     }
     if (codec === 'mp3' || codec === 'aac' || codec === 'vorbis' || codec === 'opus') {
@@ -563,10 +607,12 @@
       .filter(s => s.startsWith('http'));
     if (urls.length === 0) return;
 
-    const isArtistUrl = (u: string) =>
-      u.includes('spotify.com/artist/') ||
-      (u.includes('music.apple.com') && u.includes('/artist/')) ||
-      (u.includes('music.amazon.com') && u.includes('/artists/'));
+    const isArtistUrl = (u: string) => {
+      const norm = u.replace(/spotify\.com\/intl-[a-z]+\//, 'spotify.com/');
+      return norm.includes('spotify.com/artist/') ||
+        (u.includes('music.apple.com') && u.includes('/artist/')) ||
+        (u.includes('music.amazon.com') && u.includes('/artists/'));
+    };
     const artistUrls = urls.filter(isArtistUrl);
     const otherUrls = urls.filter(u => !isArtistUrl(u));
 
@@ -616,6 +662,63 @@
       } finally {
         if (reqId === discographyReqId) discographyLoading = false;
       }
+    }
+  }
+
+  async function startArtistSearch() {
+    if (!searchQuery.trim()) return;
+    const reqId = ++artistSearchReqId;
+    artistSearchLoading = true;
+    showArtistSearch = true;
+    artistSearchResults = [];
+    try {
+      const raw = await SearchArtists(searchQuery.trim(), searchSource);
+      if (reqId !== artistSearchReqId) return;
+      const parsed = JSON.parse(raw);
+      if (parsed?.error) {
+        addLog('error', `Artist search error: ${parsed.error}`);
+        showArtistSearch = false;
+      } else {
+        artistSearchResults = Array.isArray(parsed) ? parsed : [];
+      }
+    } catch (e) {
+      if (reqId === artistSearchReqId) {
+        addLog('error', `Artist search failed: ${e}`);
+        showArtistSearch = false;
+      }
+    } finally {
+      if (reqId === artistSearchReqId) artistSearchLoading = false;
+    }
+  }
+
+  async function openArtistFromSearch(artist: any) {
+    showArtistSearch = false;
+    searchMode = false;
+    const reqId = ++discographyReqId;
+    discographyLoading = true;
+    showDiscography = true;
+    discographyArtist = null;
+    discographySelected = new Set();
+    try {
+      const raw = await GetArtistDiscography(artist.profile_url);
+      if (reqId !== discographyReqId) return;
+      const parsed = JSON.parse(raw);
+      if (parsed?.error) {
+        addLog('error', `Discography error: ${parsed.error}`);
+        showDiscography = false;
+      } else {
+        discographyArtist = parsed;
+        if (discographyArtist?.albums) {
+          discographySelected = new Set(discographyArtist.albums.map((a: any) => a.url));
+        }
+      }
+    } catch (e) {
+      if (reqId === discographyReqId) {
+        addLog('error', `Failed to fetch discography: ${e}`);
+        showDiscography = false;
+      }
+    } finally {
+      if (reqId === discographyReqId) discographyLoading = false;
     }
   }
 
@@ -669,7 +772,7 @@
 /_/  |_/_/ |_/  /_/   /_/ |_/ /_/  |_|
       </pre>
       <p>Your music. Offline. Lossless.</p>
-      <p style="font-size: 12px; opacity: 0.5; margin-top: -8px;">Paste a Spotify or Apple Music playlist and Antra builds your music library automatically.</p>
+      <p style="font-size: 12px; opacity: 0.5; margin-top: -8px;">Paste a Spotify, Apple Music, or Amazon Music playlist and Antra builds your music library automatically.</p>
       <p style="font-size: 11px; opacity: 0.35; margin-top: -4px; letter-spacing: 0.04em;">OPTIMIZED FOR NAVIDROME &amp; JELLYFIN</p>
     </div>
 
@@ -687,8 +790,8 @@
         <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
           <input type="checkbox" bind:checked={config.soulseek_enabled} style="margin-top: 2px;" />
           <div>
-            <span style="font-weight: 500;">Enable P2P Lossless Sourcing</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Antra will use the Soulseek network to find rare or hi-res versions not available on streaming.</p>
+            <span style="font-weight: 500;">Enable Soulseek (P2P) — optional</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Find rare or hi-res versions not on streaming services. Requires a free account.</p>
           </div>
         </label>
       </div>
@@ -734,23 +837,53 @@
           </button>
         </div>
       </div>
-      <div class="input-bar" style="margin-top: 16px; display: flex; gap: 8px; align-items: flex-start;">
-        <textarea
-          bind:value={inputUrl}
-          placeholder="Paste one or more Spotify / Apple Music / SoundCloud / Amazon Music URLs (one per line or comma-separated)..."
-          disabled={isDownloading}
-          rows="4"
-          on:keydown={(e) => e.key === 'Enter' && e.ctrlKey && startDownload()}
-          style="flex: 1; min-width: 0; resize: vertical; min-height: 64px; max-height: 200px; font-family: inherit; font-size: 13px;"
-        ></textarea>
-        {#if isDownloading}
-          <button on:click={cancelDownload} style="background: var(--error-color); color: white; border-color: var(--error-color); align-self: stretch;">Stop</button>
-        {:else}
-          <button on:click={startDownload} disabled={!inputUrl} style="align-self: stretch;">
-            Add to<br>Library
+      <!-- Mode toggle -->
+      <div style="margin-top: 16px; display: flex; gap: 6px; margin-bottom: 8px;">
+        <button
+          on:click={() => { searchMode = false; searchQuery = ''; }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {searchMode ? 0.45 : 1}; border-color: {searchMode ? 'rgba(255,255,255,0.1)' : 'var(--accent-color)'};">
+          🔗 URL
+        </button>
+        <button
+          on:click={() => { searchMode = true; inputUrl = ''; }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {searchMode ? 1 : 0.45}; border-color: {searchMode ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
+          🔍 Search Artist
+        </button>
+      </div>
+
+      {#if searchMode}
+        <!-- Artist search input -->
+        <div class="input-bar" style="display: flex; gap: 8px; align-items: center;">
+          <input
+            bind:value={searchQuery}
+            placeholder="Artist name..."
+            on:keydown={(e) => e.key === 'Enter' && startArtistSearch()}
+            style="flex: 1; min-width: 0; font-family: inherit; font-size: 13px; height: 38px;"
+          />
+          <button on:click={startArtistSearch} disabled={!searchQuery.trim() || artistSearchLoading} style="height: 38px; white-space: nowrap;">
+            {artistSearchLoading ? 'Searching...' : 'Search'}
           </button>
-        {/if}
-    </div>
+        </div>
+      {:else}
+        <!-- URL input -->
+        <div class="input-bar" style="display: flex; gap: 8px; align-items: flex-start;">
+          <textarea
+            bind:value={inputUrl}
+            placeholder="Paste one or more Spotify / Apple Music / SoundCloud / Amazon Music URLs (one per line or comma-separated)..."
+            disabled={isDownloading}
+            rows="4"
+            on:keydown={(e) => e.key === 'Enter' && e.ctrlKey && startDownload()}
+            style="flex: 1; min-width: 0; resize: vertical; min-height: 64px; max-height: 200px; font-family: inherit; font-size: 13px;"
+          ></textarea>
+          {#if isDownloading}
+            <button on:click={cancelDownload} style="background: var(--error-color); color: white; border-color: var(--error-color); align-self: stretch;">Stop</button>
+          {:else}
+            <button on:click={startDownload} disabled={!inputUrl} style="align-self: stretch;">
+              Add to<br>Library
+            </button>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <div class="terminal" bind:this={terminalContainer} on:scroll={updateAutoScrollState}>
@@ -797,9 +930,21 @@
         <p style="color: #777; font-size: 13px; text-align: center;">No history found.</p>
       {:else}
         {#each historyItems as item}
-          <div class="history-card">
-            <div style="font-weight: 500; font-size: 14px; margin-bottom: 4px; word-break: break-all;">{item.url}</div>
+          <div class="history-card" style={item.error ? 'border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.04);' : ''}>
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+              <div style="font-weight: 500; font-size: 14px; margin-bottom: 4px; word-break: break-all; flex: 1;">{item.url}</div>
+              <button
+                title="Re-queue this URL"
+                on:click={() => { inputUrl = (inputUrl ? inputUrl + '\n' : '') + item.url; showHistory = false; }}
+                style="flex-shrink: 0; padding: 2px 8px; font-size: 11px; border-color: rgba(0,255,204,0.3); color: var(--accent-color); background: rgba(0,255,204,0.05); margin-top: 1px;"
+              >↩ Re-queue</button>
+            </div>
             <div style="font-size: 11px; opacity: 0.6; margin-bottom: 8px;">{new Date(item.date).toLocaleString()}</div>
+            {#if item.error}
+              <div style="font-size: 11px; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 4px; padding: 4px 8px; margin-bottom: 8px; word-break: break-word;">
+                ✗ {item.error}
+              </div>
+            {/if}
             <div style="display: flex; gap: 12px; font-size: 12px;">
               <span style="color: #4ade80;">↓ {item.downloaded || 0}</span>
               <span style="color: var(--error-color);">× {item.failed || 0}</span>
@@ -826,12 +971,12 @@
 
 {#if showSettings}
 <div class="modal-overlay" on:click={() => showSettings = false}>
-  <div class="modal-content" on:click|stopPropagation>
-    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,204,0.2); padding-bottom: 16px; margin-bottom: 16px;">
+  <div class="modal-content" on:click|stopPropagation style="max-height: 88vh; display: flex; flex-direction: column;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,204,0.2); padding-bottom: 16px; margin-bottom: 16px; flex-shrink: 0;">
       <h3 style="margin:0; color:var(--accent-color);">⚙️ Settings</h3>
       <button on:click={() => showSettings = false} style="padding: 4px 8px; font-size: 12px;">Close</button>
     </div>
-    <div style="display: flex; flex-direction: column; gap: 16px;">
+    <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
       <div class="field">
         <label>Format Preference</label>
@@ -866,29 +1011,110 @@
       </div>
 
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <label style="font-size: 13px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px;">
-          P2P Lossless Sourcing (Soulseek)
-        </label>
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
-          <input type="checkbox" bind:checked={config.soulseek_enabled} style="margin-top: 2px;" />
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 12px;">Sources</p>
+
+        <!-- Hi-Fi / streaming sources toggle -->
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 10px;">
+          <input type="checkbox"
+            checked={hifiEnabled}
+            on:change={(e) => toggleSourceGroup('hifi', e.currentTarget.checked)}
+            style="margin-top: 2px;" />
           <div>
-            <span style="font-weight: 500;">Enable Soulseek</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Find rare or hi-res versions not available on streaming.</p>
+            <span style="font-weight: 500;">Hi-Fi (Amazon, Tidal proxy)</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Free lossless FLAC via community proxies. No account required.</p>
           </div>
         </label>
-        {#if config.soulseek_enabled}
-          <div style="margin-top: 12px;">
-            <label for="slskUsernameSettings" style="font-size: 13px;">Soulseek Username</label>
+
+        <!-- Soulseek toggle -->
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+          <input type="checkbox"
+            checked={soulseekSourceEnabled}
+            on:change={(e) => { toggleSourceGroup('soulseek', e.currentTarget.checked); config.soulseek_enabled = e.currentTarget.checked; }}
+            style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500;">Soulseek (P2P)</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Find rare or hi-res versions not on streaming. Requires account.</p>
+          </div>
+        </label>
+
+        {#if soulseekSourceEnabled}
+          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+            <label for="slskUsernameSettings" style="font-size: 12px; opacity: 0.7;">Soulseek Username</label>
             <input id="slskUsernameSettings" type="text" bind:value={config.soulseek_username} placeholder="Your Soulseek username" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-            <label for="slskPasswordSettings" style="font-size: 13px; margin-top: 12px; display: block;">Soulseek Password</label>
+            <label for="slskPasswordSettings" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Soulseek Password</label>
             <input id="slskPasswordSettings" type="password" bind:value={config.soulseek_password} placeholder="Your Soulseek password" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+            <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-top: 14px;">
+              <input type="checkbox" bind:checked={config.soulseek_seed_after_download} style="margin-top: 2px;" />
+              <div>
+                <span style="font-weight: 500; font-size: 13px;">Seed after download</span>
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Keep a hardlink in slskd's folder so files are seeded back to the Soulseek network. Zero extra disk space.</p>
+              </div>
+            </label>
           </div>
         {/if}
       </div>
 
     </div>
 
-    <button on:click={saveSettings} style="margin-top: 24px; width: 100%;">Save Settings</button>
+    <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
+      <button on:click={saveSettings} style="width: 100%;">Save Settings</button>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 10px 0 0;">Antra v1.1.2</p>
+    </div>
+  </div>
+</div>
+{/if}
+
+<!-- ── Artist Search Results Modal ───────────────────────────────────────── -->
+{#if showArtistSearch}
+<div class="modal-overlay" on:click={() => { artistSearchReqId++; showArtistSearch = false; }} on:keydown={(e) => e.key === 'Escape' && (showArtistSearch = false)} role="dialog" aria-modal="true" tabindex="-1">
+  <div class="modal-content" on:click|stopPropagation on:keydown|stopPropagation style="max-width: 560px; width: 100%; max-height: 75vh; display: flex; flex-direction: column;">
+
+    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(0,255,204,0.2); padding-bottom:14px; margin-bottom:14px; flex-shrink:0;">
+      <h3 style="margin:0; color:var(--accent-color); font-size:15px;">Artist Results — "{searchQuery}"</h3>
+      <button on:click={() => { artistSearchReqId++; showArtistSearch = false; }} style="padding:4px 8px; font-size:12px;">✕</button>
+    </div>
+
+    {#if artistSearchLoading}
+      <p style="text-align:center; color:#777; padding:32px 0;">Searching...</p>
+    {:else if artistSearchResults.length === 0}
+      <p style="text-align:center; color:#777; padding:32px 0;">No artists found.</p>
+    {:else}
+      <div style="overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:4px; padding-right:4px;">
+        {#each artistSearchResults as artist (artist.artist_id)}
+          <div
+            on:click={() => openArtistFromSearch(artist)}
+            on:keydown={(e) => e.key === 'Enter' && openArtistFromSearch(artist)}
+            role="button"
+            tabindex="0"
+            style="display:flex; align-items:center; gap:12px; padding:10px 10px; border-radius:8px; cursor:pointer; transition:background 0.12s;"
+            on:mouseenter={(e) => e.currentTarget.style.background='rgba(255,255,255,0.05)'}
+            on:mouseleave={(e) => e.currentTarget.style.background='transparent'}
+          >
+            {#if artist.artwork_url}
+              <img src={artist.artwork_url} alt="" style="width:44px; height:44px; border-radius:50%; object-fit:cover; flex-shrink:0;"/>
+            {:else}
+              <div style="width:44px; height:44px; border-radius:50%; background:rgba(255,255,255,0.07); flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:20px;">🎤</div>
+            {/if}
+            <div style="flex:1; min-width:0;">
+              <div style="font-size:14px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{artist.name}</div>
+              {#if artist.genres?.length}
+                <div style="font-size:11px; color:#777; margin-top:2px;">{artist.genres.slice(0, 2).join(' · ')}</div>
+              {/if}
+            </div>
+            <div style="flex-shrink:0; display:flex; flex-direction:column; align-items:flex-end; gap:4px;">
+              <span style="font-size:10px; padding:2px 7px; border-radius:99px; background:rgba(0,255,204,0.12); color:var(--accent-color);">
+                {Math.round(artist.match_score * 100)}% match
+              </span>
+              {#if artist.followers != null}
+                <span style="font-size:10px; color:#555;">{artist.followers.toLocaleString()} followers</span>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+
   </div>
 </div>
 {/if}

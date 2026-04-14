@@ -7,6 +7,14 @@ from typing import Optional
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 
 
+class RateLimitedError(Exception):
+    """
+    Raised by a source adapter when it receives a 429 / rate-limit response.
+    The engine treats this as a signal to skip this adapter immediately —
+    no retry delay, no further attempts — and fall through to the next source.
+    """
+
+
 class BaseSourceAdapter(ABC):
     """
     All source adapters implement this interface.

@@ -13,3 +13,9 @@ slskd-api>=0.1.5
 
 # ── Optional lyrics provider wrapper ────────────────────────────────────────
 lyricsgenius>=3.0.1
+
+# ── NetEase Cloud Music source (Chinese catalog) ─────────────────────────────
+pyncm>=2.0.0
+
+# ── Spotify TOTP token generation (no-auth web player token) ─────────────────
+pyotp>=2.9.0

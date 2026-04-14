@@ -32,6 +32,8 @@ export function SaveConfig(arg1:main.Config):Promise<void>;
 
 export function ScanFolder(arg1:string):Promise<Array<string>>;
 
+export function SearchArtists(arg1:string,arg2:string):Promise<string>;
+
 export function SetSpotifyCookie(arg1:string):Promise<string>;
 
 export function SetSpotifyToken(arg1:string):Promise<string>;

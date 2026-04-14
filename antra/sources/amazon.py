@@ -10,7 +10,7 @@ from typing import Optional
 import requests
 
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
-from antra.sources.base import BaseSourceAdapter
+from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.sources.odesli import OdesliEnricher
 
 logger = logging.getLogger(__name__)
@@ -94,12 +94,18 @@ class AmazonAdapter(BaseSourceAdapter):
 
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         """
-        Resolve Spotify track to Amazon Music ASIN via Odesli.
+        Resolve track to Amazon Music ASIN.
+        Uses the ASIN already on the track (when sourced from an Amazon Music URL)
+        or falls back to Odesli cross-platform lookup.
         """
-        logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
-        platform_ids = self._odesli.resolve(track)
-        amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
-        
+        amazon_id = getattr(track, "amazon_asin", None)
+        if amazon_id:
+            logger.debug(f"[Amazon] Using embedded ASIN for '{track.title}': {amazon_id}")
+        else:
+            logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
+            platform_ids = self._odesli.resolve(track)
+            amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
+
         if not amazon_id:
             logger.debug(f"[Amazon] No Amazon ID found for '{track.title}'")
             return None
@@ -156,12 +162,9 @@ class AmazonAdapter(BaseSourceAdapter):
                     return self._process_download(download_url, decryption_key, output_path)
 
                 if resp.status_code == 429:
-                    # Rate-limited — mirror is healthy, just needs a moment.
-                    # Don't count this as a mirror failure.
-                    logger.debug(f"[Amazon] Mirror {mirror} rate-limited (429), backing off...")
-                    last_error = "rate limited (429)"
-                    time.sleep(1.0)
-                    continue
+                    # Rate-limited — raise immediately so the engine skips to
+                    # the next source (HiFi / Soulseek) without any sleep.
+                    raise RateLimitedError(f"[Amazon] Rate limited (429) on {mirror}")
 
                 logger.debug(f"[Amazon] Mirror {mirror} returned {resp.status_code}")
                 last_error = f"API error {resp.status_code}"
@@ -174,6 +177,16 @@ class AmazonAdapter(BaseSourceAdapter):
             self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
 
         raise RuntimeError(f"[Amazon] All mirrors failed. Last error: {last_error}")
+
+    def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
+        # Never retry after a 429 — fall through to the next source immediately.
+        if isinstance(error, RateLimitedError):
+            return False
+        err = str(error)
+        # 404 means the ASIN doesn't exist on any mirror — retrying won't help.
+        if "404" in err:
+            return False
+        return True
 
     def _process_download(self, download_url: str, decryption_key: Optional[str], output_path: str) -> str:
         # Download encrypted file

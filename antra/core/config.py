@@ -81,6 +81,14 @@ class Config:
     # SoundCloud (optional — no credentials needed; provide client_id to skip auto-detection)
     soundcloud_client_id: str = ""
 
+    # SpotFetch (no credentials needed — Spotify metadata proxy for no-auth fallback)
+    spotfetch_mirrors: list[str] = field(default_factory=lambda: [
+        "https://sp.afkarxyz.qzz.io/api",
+        "https://sp.vov.li/api",
+        "https://sp.rnb.su/api",
+        "https://spotify.squid.wtf/api",
+    ])
+
     # Apple Music (optional — no credentials needed, lossless ALAC via community proxy)
     apple_enabled: bool = True
     apple_mirrors: list[str] = field(default_factory=lambda: [
@@ -124,6 +132,13 @@ class Config:
     soulseek_username: str = ""
     soulseek_password: str = ""
     soulseek_auto_bootstrap: bool = True
+    # After moving a completed download to the library, create a hardlink back
+    # in slskd's downloads dir so slskd can seed it to other Soulseek users.
+    soulseek_seed_after_download: bool = False
+
+    # Comma-separated list of enabled adapter groups: "hifi", "soulseek".
+    # Empty = all enabled. Controlled via the Sources toggle in Settings.
+    sources_enabled: str = ""
 
 
 def load_config() -> Config:
@@ -156,6 +171,10 @@ def load_config() -> Config:
         musixmatch_api_key=os.getenv("MUSIXMATCH_API_KEY", ""),
         genius_api_key=os.getenv("GENIUS_API_KEY", ""),
         output_dir=os.getenv("OUTPUT_DIR", "./Music"),
+        spotfetch_mirrors=os.getenv(
+            "SPOTFETCH_MIRRORS",
+            "https://sp.afkarxyz.qzz.io/api,https://sp.vov.li/api,https://sp.rnb.su/api,https://spotify.squid.wtf/api",
+        ).split(","),
         apple_enabled=os.getenv("APPLE_ENABLED", "true").lower() == "true",
         apple_mirrors=os.getenv("APPLE_MIRRORS", "https://apple.squid.wtf,https://appl.afkarxyz.qzz.io,https://apple.rnb.su,https://apple.vov.li").split(","),
         apple_developer_token=os.getenv("APPLE_DEVELOPER_TOKEN", ""),
@@ -176,5 +195,7 @@ def load_config() -> Config:
         soulseek_username=os.getenv("SOULSEEK_USERNAME", ""),
         soulseek_password=os.getenv("SOULSEEK_PASSWORD", ""),
         soulseek_auto_bootstrap=os.getenv("SLSKD_AUTO_BOOTSTRAP", "true").lower() == "true",
+        soulseek_seed_after_download=os.getenv("SOULSEEK_SEED_AFTER_DOWNLOAD", "false").lower() == "true",
+        sources_enabled=os.getenv("SOURCES_ENABLED", ""),
     )
     return cfg

@@ -20,6 +20,7 @@ class DownloadStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -40,7 +41,9 @@ class TrackMetadata:
     spotify_id: Optional[str] = None
     album_id: Optional[str] = None
     spotify_url: Optional[str] = None
+    amazon_asin: Optional[str] = None  # Track ASIN when sourced from Amazon Music URL
     genres: list[str] = field(default_factory=list)
+    album_artists: list[str] = field(default_factory=list)  # Album-level artists (e.g. ["PARTYNEXTDOOR", "Drake"] for joint albums)
     artwork_url: Optional[str] = None  # Highest res from Spotify
     lyrics: Optional[str] = None
     synced_lyrics: Optional[str] = None  # LRC format
@@ -86,7 +89,9 @@ class SearchResult:
             if self.bit_depth:
                 return f"{fmt} {self.bit_depth}-bit"
             return fmt
-        return f"{fmt} {self.quality_kbps}kbps"
+        if self.quality_kbps:
+            return f"{fmt} {self.quality_kbps}kbps"
+        return fmt
 
 
 @dataclass

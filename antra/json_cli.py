@@ -6,6 +6,22 @@ import sys
 import time
 from typing import Optional
 
+# On Windows, Python's subprocess module defaults to the system locale encoding
+# (usually cp1252) for text-mode pipes. yt-dlp spawns ffmpeg internally and
+# reads its stderr in text mode without specifying encoding, which causes
+# UnicodeDecodeError when ffmpeg outputs UTF-8 content (e.g. Unicode filenames
+# or progress bars). Patch subprocess.Popen to default to UTF-8 + replace on
+# Windows so all child process pipe I/O is handled gracefully.
+if sys.platform == 'win32':
+    import subprocess as _sp
+    _orig_popen_init = _sp.Popen.__init__
+    def _popen_utf8_default(self, *args, **kwargs):
+        if (kwargs.get('text') or kwargs.get('universal_newlines')) and 'encoding' not in kwargs:
+            kwargs['encoding'] = 'utf-8'
+            kwargs.setdefault('errors', 'replace')
+        _orig_popen_init(self, *args, **kwargs)
+    _sp.Popen.__init__ = _popen_utf8_default
+
 from antra.core.models import BulkDownloadProgress
 from antra.core.service import AntraService, RuntimeOptions
 from antra.core.events import EngineEvent
@@ -171,6 +187,8 @@ def emit_event(event: EngineEvent):
             "message": event.message,
             "source": event.source,
             "error": event.error,
+            "quality_label": event.quality_label,
+            "attempt": event.attempt,
         }
     }
     print(json.dumps(data), flush=True)
@@ -202,6 +220,10 @@ def main():
                         help="Generate spectrogram PNG for FILE and print base64 JSON, then exit")
     parser.add_argument("--discography", metavar="ARTIST_URL",
                         help="Fetch artist discography info as JSON and exit")
+    parser.add_argument("--search-artists", metavar="QUERY",
+                        help="Search for artists by name and return scored results as JSON, then exit")
+    parser.add_argument("--search-source", default="spotify", choices=["spotify", "apple"],
+                        help="Source to use for artist search (default: spotify)")
     args = parser.parse_args()
 
     ensure_runtime_environment()
@@ -232,6 +254,17 @@ def main():
                 )
                 info = sp.fetch_artist_discography_info(url)
             print(json.dumps({"type": "discography", "data": info}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.search_artists:
+        try:
+            from antra.core.config import load_config
+            cfg = load_config()
+            service = AntraService(config=cfg)
+            results = service.search_artists(args.search_artists, source=args.search_source)
+            print(json.dumps({"type": "artist_search", "data": results}), flush=True)
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
         sys.exit(0)
@@ -321,13 +354,26 @@ def main():
 
             if "output_format" in settings and settings["output_format"]:
                 os.environ["OUTPUT_FORMAT"] = settings["output_format"]
+
+            if "soulseek_seed_after_download" in settings:
+                os.environ["SOULSEEK_SEED_AFTER_DOWNLOAD"] = "true" if settings["soulseek_seed_after_download"] else "false"
+
+            # sources_enabled: ["hifi", "soulseek"] controls which adapter groups are active.
+            # Empty or absent = all enabled (auto).
+            sources_enabled = settings.get("sources_enabled") or []
+            if sources_enabled:
+                os.environ["SOURCES_ENABLED"] = ",".join(sources_enabled)
+            else:
+                os.environ["SOURCES_ENABLED"] = ""
+
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Failed to load config: {e}"}))
 
-    # We want to force auto mode since the user is in standard flow
+    # Source preference is now driven by sources_enabled; keep auto as the resolver default.
     os.environ["SOURCE_PREFERENCE"] = "auto"
 
     from antra.core.config import load_config
+    from antra.utils.organizer import LibraryOrganizer
     cfg = load_config()
 
     service = AntraService(cfg)
@@ -343,22 +389,34 @@ def main():
 
     playlists_to_run = args.playlists
 
-    # To process them normally
+    # Build the organizer once — it scans the entire library on init, which can
+    # be very slow on a NAS. Reusing one instance across all URLs in this batch
+    # means the scan happens exactly once per run, not once per URL.
+    try:
+        organizer = LibraryOrganizer(cfg.output_dir)
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
+        print(json.dumps({"type": "done"}))
+        return
+
     print(json.dumps({"type": "log", "level": "info", "message": f"Preparing library update for {len(playlists_to_run)} source(s)"}))
 
-    # We will fetch tracks for all playlists and then download
+    import os as _os
+    from datetime import datetime
+
     for url in playlists_to_run:
+        _url_start = time.time()
         try:
             print(json.dumps({"type": "log", "level": "info", "message": f"Syncing playlist to library: {url}"}))
-            results = service.download_playlist(
-                url,
+            tracks = service.fetch_playlist_tracks(url, options=options)
+            results = service.download_tracks(
+                tracks,
                 options=options,
-                event_callback=emit_event
+                event_callback=emit_event,
+                organizer=organizer,
             )
 
-            import os as _os
-            from datetime import datetime
-            _elapsed = time.time() - _start_time
+            _elapsed = time.time() - _url_start
             _total_bytes = sum(
                 _os.path.getsize(r.file_path)
                 for r in results
@@ -371,6 +429,7 @@ def main():
                 "downloaded": sum(1 for r in results if r.status.name == "COMPLETED"),
                 "failed": sum(1 for r in results if r.status.name == "FAILED"),
                 "skipped": sum(1 for r in results if r.status.name == "SKIPPED"),
+                "error": None,
                 "sources": {},
                 "date": datetime.now().isoformat(),
                 "total_mb": round(_total_bytes / (1024 * 1024), 1),
@@ -381,14 +440,30 @@ def main():
                 if r.status.name == "COMPLETED" and r.source_used:
                     summary["sources"][r.source_used] = summary["sources"].get(r.source_used, 0) + 1
 
-            # Emit structured library update events
             downloaded = summary["downloaded"]
             print(json.dumps({"type": "library_update", "tracks_added": downloaded, "url": url}), flush=True)
-
             print(json.dumps(summary), flush=True)
 
         except Exception as e:
-            print(json.dumps({"type": "log", "level": "error", "message": str(e)}))
+            error_msg = str(e)
+            print(json.dumps({"type": "log", "level": "error", "message": error_msg}))
+            # Always emit a summary even on hard failure so the frontend can
+            # record this URL in history and let the user retry it.
+            _elapsed = time.time() - _url_start
+            summary = {
+                "type": "playlist_summary",
+                "url": url,
+                "total": 0,
+                "downloaded": 0,
+                "failed": 0,
+                "skipped": 0,
+                "error": error_msg,
+                "sources": {},
+                "date": datetime.now().isoformat(),
+                "total_mb": 0,
+                "elapsed_seconds": round(_elapsed),
+            }
+            print(json.dumps(summary), flush=True)
 
     # Send a hard termination message
     print(json.dumps({"type": "done"}))

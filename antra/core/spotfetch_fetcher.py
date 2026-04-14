@@ -2,9 +2,10 @@
 SpotFetch URL fetcher — retrieves Spotify track/album/playlist metadata
 without requiring Spotify credentials.
 
-Uses sp.afkarxyz.qzz.io, a community proxy that wraps the Spotify API
-and returns full metadata (title, artists, ISRC, artwork, duration) for
-any public Spotify URL.
+Uses a pool of community mirror proxies that wrap the Spotify API and return
+full metadata (title, artists, ISRC, artwork, duration) for any public
+Spotify URL. Mirrors are tried in order; DNS/connection failures are skipped
+immediately so a single down host doesn't block the others.
 
 Supported URLs:
   - Tracks:    https://open.spotify.com/track/{id}
@@ -22,8 +23,13 @@ from antra.core.models import TrackMetadata
 
 logger = logging.getLogger(__name__)
 
-_BASE = "https://sp.afkarxyz.qzz.io/api"
-_SPOTIFY_ID_RE = re.compile(r"spotify\.com/(track|album|playlist|artist)/([A-Za-z0-9]+)")
+_DEFAULT_BASES = [
+    "https://sp.afkarxyz.qzz.io/api",
+    "https://sp.vov.li/api",
+    "https://sp.rnb.su/api",
+    "https://spotify.squid.wtf/api",
+]
+_SPOTIFY_ID_RE = re.compile(r"spotify\.com/(?:intl-[a-z]+/)?(track|album|playlist|artist)/([A-Za-z0-9]+)")
 
 REQUEST_TIMEOUT = 15
 
@@ -45,9 +51,12 @@ class SpotFetchFetcher:
     duration, artwork) for the Antra waterfall to act on.
 
     Intended as a no-credentials fallback when Spotify auth is not configured.
+    Tries multiple mirror bases in order; skips mirrors that fail with DNS/
+    connection errors so a single down host doesn't block the other mirrors.
     """
 
-    def __init__(self):
+    def __init__(self, bases: Optional[list[str]] = None):
+        self._bases = [b.rstrip("/") for b in (bases or _DEFAULT_BASES) if b]
         self._session = requests.Session()
         self._session.headers.update(_HEADERS)
 
@@ -68,6 +77,8 @@ class SpotFetchFetcher:
             return self._fetch_album(spotify_id)
         elif url_type == "playlist":
             return self._fetch_playlist(spotify_id)
+        elif url_type == "artist":
+            return self._fetch_artist(spotify_id)
         else:
             raise ValueError(f"[SpotFetch] Unsupported URL type: {url_type}")
 
@@ -92,13 +103,66 @@ class SpotFetchFetcher:
 
     def _fetch_album(self, spotify_id: str) -> list[TrackMetadata]:
         data = self._get(f"/album/{spotify_id}")
-        tracks_raw = data.get("tracks") or []
+
+        # The SpotFetch API nests album metadata under "album_info"
+        album_info = data.get("album_info") or {}
+
+        # Album-level artwork — "images" key holds a URL string (not a list here)
+        album_artwork = (
+            album_info.get("images")
+            or album_info.get("artwork_url")
+            or album_info.get("image")
+            or None
+        )
+        if isinstance(album_artwork, list):
+            album_artwork = album_artwork[0].get("url") if album_artwork and isinstance(album_artwork[0], dict) else (album_artwork[0] if album_artwork else None)
+
+        # Album-level artists — "artists" is a comma-separated string like "PARTYNEXTDOOR, Drake"
+        raw_album_artists = album_info.get("artists") or data.get("artists") or ""
+        if isinstance(raw_album_artists, str):
+            album_artists = [a.strip() for a in raw_album_artists.split(",") if a.strip()]
+        elif isinstance(raw_album_artists, list):
+            album_artists = [
+                a.get("name", a) if isinstance(a, dict) else str(a)
+                for a in raw_album_artists
+            ]
+        else:
+            album_artists = []
+
+        # Album release date
+        album_release_date = album_info.get("release_date") or ""
+        album_release_year = int(album_release_date[:4]) if album_release_date and album_release_date[:4].isdigit() else None
+
+        # Tracks are in "track_list" or legacy fallback keys
+        tracks_raw = (
+            data.get("track_list")
+            or data.get("tracks")
+            or data.get("items")
+            or data.get("trackList")
+            or []
+        )
+        if not tracks_raw:
+            logger.debug(f"[SpotFetch] Album response keys for {spotify_id}: {list(data.keys())}")
         result = []
         for t in tracks_raw:
             if not isinstance(t, dict):
                 continue
+            # Some responses nest the track under a "track" key
+            track_data = t.get("track") if "track" in t else t
+            if not isinstance(track_data, dict):
+                continue
             try:
-                result.append(self._parse_track(t))
+                track = self._parse_track(track_data)
+                # Stamp album-level data that individual tracks don't carry
+                if album_artists and not track.album_artists:
+                    track.album_artists = album_artists
+                if album_artwork and not track.artwork_url:
+                    track.artwork_url = album_artwork
+                if album_release_year and not track.release_year:
+                    track.release_year = album_release_year
+                if album_release_date and not track.release_date:
+                    track.release_date = album_release_date
+                result.append(track)
             except Exception as e:
                 logger.debug(f"[SpotFetch] Skipping album track: {e}")
         if not result:
@@ -127,6 +191,33 @@ class SpotFetchFetcher:
                 f"[SpotFetch] No tracks found in playlist response for {spotify_id}"
             )
         return result
+
+    def _fetch_artist(self, artist_id: str) -> list[TrackMetadata]:
+        """Fetch all tracks from an artist's discography via the SpotFetch proxy."""
+        info = self.fetch_artist_discography_info(artist_id)
+        tracks: list[TrackMetadata] = []
+        albums = info.get("albums", [])
+        logger.info(f"[SpotFetch] Artist has {len(albums)} releases — fetching tracks...")
+        for album in albums:
+            album_url = album.get("url", "")
+            album_name = album.get("name", "")
+            if not album_url:
+                continue
+            # Extract album ID from URL
+            m = _SPOTIFY_ID_RE.search(album_url)
+            if not m:
+                continue
+            album_spotify_id = m.group(2)
+            try:
+                album_tracks = self._fetch_album(album_spotify_id)
+                tracks.extend(album_tracks)
+            except Exception as e:
+                logger.warning(f"[SpotFetch] Skipping album '{album_name}': {e}")
+        if not tracks:
+            raise RuntimeError(
+                f"[SpotFetch] No tracks found for artist {artist_id}"
+            )
+        return tracks
 
     def fetch_artist_discography_info(self, url_or_id: str) -> dict:
         """
@@ -168,22 +259,31 @@ class SpotFetchFetcher:
     # ── HTTP ──────────────────────────────────────────────────────────────────
 
     def _get(self, path: str) -> dict:
-        url = f"{_BASE}{path}"
-        try:
-            resp = self._session.get(url, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            raise RuntimeError(f"[SpotFetch] Request failed for {path}: {e}") from e
+        last_error: Exception = RuntimeError(f"[SpotFetch] No mirrors available for {path}")
+        for base in self._bases:
+            url = f"{base}{path}"
+            try:
+                resp = self._session.get(url, timeout=REQUEST_TIMEOUT)
+            except Exception as e:
+                # DNS / connection failure — skip this mirror immediately
+                logger.debug(f"[SpotFetch] Mirror {base} unreachable: {e}")
+                last_error = RuntimeError(f"[SpotFetch] Request failed for {path}: {e}")
+                continue
 
-        if resp.status_code == 404:
-            raise ValueError(f"[SpotFetch] Not found: {path}")
-        if not resp.ok:
-            raise RuntimeError(
-                f"[SpotFetch] API error {resp.status_code} for {path}"
-            )
-        try:
-            return resp.json()
-        except Exception as e:
-            raise RuntimeError(f"[SpotFetch] Invalid JSON response: {e}") from e
+            if resp.status_code == 404:
+                raise ValueError(f"[SpotFetch] Not found: {path}")
+            if not resp.ok:
+                logger.debug(f"[SpotFetch] Mirror {base} returned {resp.status_code} for {path} — trying next")
+                last_error = RuntimeError(f"[SpotFetch] API error {resp.status_code} for {path}")
+                continue
+
+            try:
+                return resp.json()
+            except Exception as e:
+                last_error = RuntimeError(f"[SpotFetch] Invalid JSON response from {base}: {e}")
+                continue
+
+        raise last_error
 
     # ── Parsing ───────────────────────────────────────────────────────────────
 
@@ -198,18 +298,46 @@ class SpotFetchFetcher:
         else:
             artists = [a.strip() for a in str(raw_artists).split(",") if a.strip()]
 
+        # album_artist may be a comma-separated string
+        raw_album_artist = data.get("album_artist") or ""
+        if isinstance(raw_album_artist, str) and raw_album_artist.strip():
+            album_artists = [a.strip() for a in raw_album_artist.split(",") if a.strip()]
+        else:
+            album_artists = []
+
         album = data.get("album_name") or data.get("album") or ""
+        album_id: Optional[str] = data.get("album_id") or None
         duration_ms: Optional[int] = data.get("duration_ms")
         isrc: Optional[str] = data.get("isrc") or None
-        artwork_url: Optional[str] = data.get("artwork_url") or data.get("image") or None
+
+        # artwork: "images" key is a URL string in this API (not a list)
+        raw_images = data.get("images") or data.get("artwork_url") or data.get("image") or None
+        if isinstance(raw_images, list):
+            artwork_url = raw_images[0].get("url") if raw_images and isinstance(raw_images[0], dict) else (raw_images[0] if raw_images else None)
+        else:
+            artwork_url = raw_images  # already a string URL
+
         spotify_id: Optional[str] = data.get("spotify_id") or data.get("id") or None
+        track_number: Optional[int] = data.get("track_number")
+        disc_number: Optional[int] = data.get("disc_number")
+        total_tracks: Optional[int] = data.get("total_tracks")
+
+        release_date: Optional[str] = data.get("release_date") or None
+        release_year: Optional[int] = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
 
         return TrackMetadata(
             title=title,
             artists=artists,
             album=album,
+            album_artists=album_artists,
+            album_id=album_id,
             duration_ms=duration_ms,
             isrc=isrc,
             artwork_url=artwork_url,
             spotify_id=spotify_id,
+            track_number=track_number,
+            disc_number=disc_number,
+            total_tracks=total_tracks,
+            release_date=release_date,
+            release_year=release_year,
         )

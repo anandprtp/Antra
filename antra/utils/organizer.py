@@ -62,7 +62,13 @@ class LibraryOrganizer:
             folder.mkdir(parents=True, exist_ok=True)
             return str(folder / filename)
 
-        artist_dir = self._safe(track.primary_artist)
+        # Use album-level artists for the folder name so joint albums
+        # (e.g. "PARTYNEXTDOOR & Drake") land in one combined folder
+        # instead of splitting by per-track artist.
+        if track.album_artists:
+            artist_dir = self._safe(", ".join(track.album_artists))
+        else:
+            artist_dir = self._safe(track.primary_artist)
         album_part = self._safe(track.album)
         if track.release_year:
             album_dir = f"{album_part} ({track.release_year})"

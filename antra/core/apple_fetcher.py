@@ -27,8 +27,9 @@ from antra.core.models import TrackMetadata
 logger = logging.getLogger(__name__)
 
 # ── Apple Music URL patterns ───────────────────────────────────────────────────
-_RE_SONG     = re.compile(r"music\.apple\.com/([a-z]{2})/album/[^/]+/(\d+)\?i=(\d+)")
-_RE_ALBUM    = re.compile(r"music\.apple\.com/([a-z]{2})/album/[^/]+/(\d+)(?!\?i=)")
+# Slug segment is optional — Apple Music search results return bare /album/{id} URLs
+_RE_SONG     = re.compile(r"music\.apple\.com/([a-z]{2})/album/(?:[^/]+/)?(\d+)\?i=(\d+)")
+_RE_ALBUM    = re.compile(r"music\.apple\.com/([a-z]{2})/album/(?:[^/]+/)?(\d+)(?!\?i=)")
 _RE_PLAYLIST = re.compile(r"music\.apple\.com/([a-z]{2})/playlist/[^/]+/(pl\.[a-zA-Z0-9]+)")
 
 # ── iTunes API ────────────────────────────────────────────────────────────────
@@ -129,18 +130,27 @@ class AppleFetcher:
 
     def _fetch_song(self, track_id: str, storefront: str = "us") -> Optional[TrackMetadata]:
         """Look up a single song by iTunes track ID."""
-        try:
-            resp = self._session.get(
-                _ITUNES_LOOKUP,
-                params={"id": track_id, "entity": "song"},
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            raise RuntimeError(f"[Apple] iTunes lookup failed for track {track_id}: {e}") from e
+        def _lookup(country: str) -> list:
+            try:
+                resp = self._session.get(
+                    _ITUNES_LOOKUP,
+                    params={"id": track_id, "entity": "song", "country": country},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                items = resp.json().get("results", [])
+                return [i for i in items if i.get("wrapperType") == "track" and i.get("kind") == "song"]
+            except Exception as e:
+                raise RuntimeError(f"[Apple] iTunes lookup failed for track {track_id}: {e}") from e
 
-        items = resp.json().get("results", [])
-        songs = [i for i in items if i.get("wrapperType") == "track" and i.get("kind") == "song"]
+        songs = _lookup(storefront)
+        if not songs:
+            for sf in [s for s in ["cn", "tw", "hk", "jp", "kr", "gb", "au"] if s != storefront]:
+                songs = _lookup(sf)
+                if songs:
+                    logger.debug(f"[Apple] Track {track_id} not in '{storefront}' catalog — found via '{sf}'")
+                    break
+
         if not songs:
             logger.warning(f"[Apple] No song found for track ID {track_id}")
             return None
@@ -154,17 +164,34 @@ class AppleFetcher:
         Fetch all tracks in an album via iTunes lookup.
         Returns track objects with album artwork from the album-level item.
         """
-        try:
-            resp = self._session.get(
-                _ITUNES_LOOKUP,
-                params={"id": album_id, "entity": "song", "limit": 200},
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-        except Exception as e:
-            raise RuntimeError(f"[Apple] iTunes album lookup failed for {album_id}: {e}") from e
+        def _lookup(country: str) -> list:
+            try:
+                resp = self._session.get(
+                    _ITUNES_LOOKUP,
+                    params={"id": album_id, "entity": "song", "limit": 200, "country": country},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                return resp.json().get("results", [])
+            except Exception as e:
+                raise RuntimeError(f"[Apple] iTunes album lookup failed for {album_id}: {e}") from e
 
-        results = resp.json().get("results", [])
+        results = _lookup(storefront)
+
+        # Region-exclusive albums (e.g. Chinese releases on a /us/ URL with ?l=zh-Hans-CN)
+        # iTunes may return the album collection item but 0 song tracks for the wrong storefront.
+        # Fall back through other storefronts if no songs were returned.
+        def _has_songs(r: list) -> bool:
+            return any(x.get("wrapperType") == "track" and x.get("kind") == "song" for x in r)
+
+        if not _has_songs(results):
+            fallback_storefronts = [sf for sf in ["cn", "tw", "hk", "jp", "kr", "gb", "au"] if sf != storefront]
+            for sf in fallback_storefronts:
+                fallback = _lookup(sf)
+                if _has_songs(fallback):
+                    results = fallback
+                    logger.debug(f"[Apple] Album {album_id} not in '{storefront}' catalog — found via '{sf}'")
+                    break
 
         # First result is the album itself; rest are songs
         album_item = next((r for r in results if r.get("wrapperType") == "collection"), None)
@@ -173,11 +200,17 @@ class AppleFetcher:
         total_tracks = None
         release_date = ""
 
+        album_artists: list[str] = []
         if album_item:
             album_art = self._upgrade_artwork_url(album_item.get("artworkUrl100", ""))
             album_name = album_item.get("collectionName", "")
             total_tracks = album_item.get("trackCount")
             release_date = (album_item.get("releaseDate") or "")[:10]
+            # Album-level artist (e.g. "PARTYNEXTDOOR & Drake") — stored verbatim
+            # so all tracks land in one folder regardless of per-track features.
+            album_artist_name = album_item.get("artistName", "").strip()
+            if album_artist_name:
+                album_artists = [album_artist_name]
 
         songs = [r for r in results if r.get("wrapperType") == "track" and r.get("kind") == "song"]
         if not songs:
@@ -193,13 +226,29 @@ class AppleFetcher:
                     meta.artwork_url = album_art
                 if total_tracks and meta.total_tracks is None:
                     meta.total_tracks = total_tracks
-                if not meta.release_date and release_date:
+                if release_date:
                     meta.release_date = release_date
                     try:
                         meta.release_year = int(release_date[:4])
                     except ValueError:
                         pass
+                # Override track collection name with the parent album name so
+                # anomalous Apple multi-disc segments (e.g. "Disc 29") fall under the parent folder.
+                if album_name:
+                    meta.album = album_name
+
+                # Stamp album-level artists so all tracks share one folder
+                if album_artists and not meta.album_artists:
+                    meta.album_artists = album_artists
                 tracks.append(meta)
+
+        # Apple Music sometimes glitches and assigns arbitrary high disc numbers (like 29 or 39)
+        # to tracks on standard albums, which splits the album in music players
+        unique_discs = {t.disc_number for t in tracks if t.disc_number is not None}
+        if unique_discs and max(unique_discs) > 10:
+            logger.debug(f"[Apple] Wiping anomalously high disc numbers: {sorted(list(unique_discs))}")
+            for t in tracks:
+                t.disc_number = 1
 
         logger.info(f"[Apple] Fetched {len(tracks)} tracks from album '{album_name or album_id}'")
         return tracks
@@ -513,7 +562,8 @@ class AppleFetcher:
         Uses the iTunes Lookup API (no auth required).
         """
         # Extract artist ID and storefront from URL
-        id_match = re.search(r"/artist/[^/]+/(\d+)", url_or_id)
+        # Handles /artist/name/271256 (with slug) and /artist/271256 (bare ID)
+        id_match = re.search(r"/artist/(?:[^/]+/)?(\d+)", url_or_id)
         if id_match:
             artist_id = id_match.group(1)
         elif url_or_id.strip().isdigit():
@@ -580,6 +630,42 @@ class AppleFetcher:
             "artwork_url": artwork_url,
             "albums": albums,
         }
+
+    def search_artists(self, query: str, limit: int = 8) -> list[dict]:
+        """Search Apple Music for artists by name via the iTunes Search API.
+
+        Returns a list of artist dicts sorted by match_score descending:
+        {artist_id, name, artwork_url, genres, followers, match_score, profile_url, source}
+        """
+        from antra.utils.matching import normalize, string_similarity
+        try:
+            resp = self._session.get(
+                _ITUNES_SEARCH,
+                params={"term": query, "entity": "musicArtist", "limit": limit, "media": "music"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("results", [])
+            results = []
+            for a in items:
+                name = a.get("artistName", "")
+                artist_id = str(a.get("artistId", ""))
+                score = string_similarity(normalize(query), normalize(name))
+                results.append({
+                    "artist_id": artist_id,
+                    "name": name,
+                    "artwork_url": None,  # iTunes Search API doesn't return artist photos
+                    "genres": [a["primaryGenreName"]] if a.get("primaryGenreName") else [],
+                    "followers": None,
+                    "match_score": round(score, 3),
+                    "profile_url": f"https://music.apple.com/us/artist/{artist_id}",
+                    "source": "apple",
+                })
+            results.sort(key=lambda x: x["match_score"], reverse=True)
+            return results
+        except Exception as e:
+            logger.debug(f"[Apple] Artist search failed: {e}")
+            return []
 
     def _fetch_artist_artwork(self, artist_id: str, storefront: str) -> Optional[str]:
         """Try to get artist photo from the Apple Music Catalog API."""

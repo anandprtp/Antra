@@ -50,8 +50,59 @@ class QobuzAdapter(BaseSourceAdapter):
         return bool((self.email and self.password) or self._user_auth_token)
 
     def _refresh_credentials(self) -> bool:
-        """Fetch fresh credentials if supported by the environment. Currently disabled for public versions."""
-        return False
+        """
+        Scrape fresh app_id and app_secret from open.qobuz.com's JS bundle.
+        Qobuz rotates these periodically; this keeps the adapter working without
+        requiring users to manually update them.
+        """
+        if self._creds_refreshed:
+            return False
+        self._creds_refreshed = True
+        try:
+            import re
+            client = requests.Session()
+            client.headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+            )
+
+            # Step 1: fetch the open.qobuz.com shell to find the JS bundle URL
+            shell = client.get("https://open.qobuz.com/track/1", timeout=15)
+            shell.raise_for_status()
+            script_match = re.search(
+                r'<script[^>]+src="([^"]+(?:/js/main\.js|/resources/[^"]+/js/[^"]+\.js))"',
+                shell.text,
+            )
+            if not script_match:
+                logger.debug("[Qobuz] Could not find bundle script tag in open.qobuz.com shell")
+                return False
+
+            bundle_url = script_match.group(1)
+            if bundle_url.startswith("/"):
+                bundle_url = "https://open.qobuz.com" + bundle_url
+
+            # Step 2: fetch the JS bundle and extract the embedded credentials
+            bundle = client.get(bundle_url, timeout=30)
+            bundle.raise_for_status()
+            creds_match = re.search(
+                r'app_id:"(?P<app_id>\d{9})",app_secret:"(?P<app_secret>[a-f0-9]{32})"',
+                bundle.text,
+            )
+            if not creds_match:
+                logger.debug("[Qobuz] app_id/app_secret pattern not found in bundle")
+                return False
+
+            new_id = creds_match.group("app_id")
+            new_secret = creds_match.group("app_secret")
+            self.app_id = new_id
+            self.app_secret = new_secret
+            self._session.headers["X-App-Id"] = new_id
+            logger.info(f"[Qobuz] Refreshed credentials from open.qobuz.com (app_id={new_id})")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[Qobuz] Credential refresh failed: {e}")
+            return False
 
     def _login(self):
         """Authenticate and store user auth token."""

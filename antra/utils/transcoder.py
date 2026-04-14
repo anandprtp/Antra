@@ -31,10 +31,19 @@ class ConversionPlan:
 
 
 class AudioTranscoder:
+    _LOSSY_EXTENSIONS = {".mp3", ".aac"}
+
+    def _is_lossy(self, file_path: str) -> bool:
+        return os.path.splitext(file_path)[1].lower() in self._LOSSY_EXTENSIONS
+
     def needs_conversion(self, file_path: str, target_format: str) -> bool:
         if target_format == "source":
             return False
-        if target_format == "lossless":
+        if target_format in {"lossless", "flac"}:
+            # Never upscale lossy → lossless container (fake FLAC, no quality gain).
+            # Applies whether the user chose "lossless" mode or explicit "flac" format.
+            if self._is_lossy(file_path):
+                return False
             ext = os.path.splitext(file_path)[1].lower()
             # .m4a can be ALAC (lossless) but we still convert to .flac for uniformity
             return ext not in {".flac"}

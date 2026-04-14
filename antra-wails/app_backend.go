@@ -19,12 +19,14 @@ import (
 )
 
 type Config struct {
-	DownloadPath     string `json:"download_path"`
-	SoulseekEnabled  bool   `json:"soulseek_enabled"`
-	SoulseekUsername string `json:"soulseek_username,omitempty"`
-	SoulseekPassword string `json:"soulseek_password,omitempty"`
-	FirstRunComplete bool   `json:"first_run_complete"`
-	OutputFormat     string `json:"output_format,omitempty"`
+	DownloadPath          string   `json:"download_path"`
+	SoulseekEnabled       bool     `json:"soulseek_enabled"`
+	SoulseekUsername      string   `json:"soulseek_username,omitempty"`
+	SoulseekPassword      string   `json:"soulseek_password,omitempty"`
+	SoulseekSeedAfterDL   bool     `json:"soulseek_seed_after_download"`
+	SourcesEnabled        []string `json:"sources_enabled,omitempty"`
+	FirstRunComplete      bool     `json:"first_run_complete"`
+	OutputFormat          string   `json:"output_format,omitempty"`
 }
 
 type HistoryItem struct {
@@ -34,6 +36,7 @@ type HistoryItem struct {
 	Downloaded int            `json:"downloaded"`
 	Failed     int            `json:"failed"`
 	Skipped    int            `json:"skipped"`
+	Error      string         `json:"error,omitempty"`
 	Sources    map[string]int `json:"sources"`
 }
 
@@ -484,6 +487,55 @@ func unwrapDiscographyJSON(out []byte) string {
 	return string(result)
 }
 
+// SearchArtists searches for artists by name using the given source ("spotify" or "apple").
+// Returns a JSON string: {"type":"artist_search","data":[...]} or {"error":"..."}
+func (a *App) SearchArtists(query string, source string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if source == "" {
+		source = "spotify"
+	}
+
+	backend, err := ensureBundledBackend()
+	var out []byte
+	if err == nil {
+		cmd := exec.CommandContext(ctx, backend, "--search-artists", query, "--search-source", source, "--config", getConfigPath())
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	} else {
+		// Dev fallback
+		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
+		if resolveErr != nil {
+			return `{"error":"could not resolve backend"}`
+		}
+		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--search-artists", query, "--search-source", source, "--config", getConfigPath())
+		cmd.Dir = workDir
+		cmd.Env = env
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	}
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"artist search timed out"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+
+	// Unwrap {"type":"artist_search","data":[...]} → just the data array as JSON string
+	var wrapper map[string]interface{}
+	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
+		return string(out)
+	}
+	if wrapper["type"] == "error" {
+		msg, _ := wrapper["message"].(string)
+		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+	}
+	result, _ := json.Marshal(wrapper["data"])
+	return string(result)
+}
+
 func (a *App) GetSpotifyStatus() string {
 	output, err := a.runPythonCommand([]string{"spotify", "status", "--json"})
 	if err != nil {
@@ -537,7 +589,7 @@ func (a *App) resolveBackendCommand(playlists []string) (string, []string, strin
 	if bundledBackend, err := ensureBundledBackend(); err == nil {
 		args := append([]string{}, playlists...)
 		args = append(args, "--config", getConfigPath())
-		return bundledBackend, args, filepath.Dir(bundledBackend), os.Environ(), nil
+		return bundledBackend, args, filepath.Dir(bundledBackend), append(os.Environ(), "PYTHONUTF8=1"), nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", nil, "", nil, fmt.Errorf("failed to prepare bundled backend: %w", err)
 	}
@@ -579,7 +631,7 @@ func (a *App) resolveBackendCommand(playlists []string) (string, []string, strin
 	args := []string{jsonCliScript}
 	args = append(args, playlists...)
 	args = append(args, "--config", getConfigPath())
-	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir))
+	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir), "PYTHONUTF8=1")
 	return pythonExe, args, parentDir, env, nil
 }
 

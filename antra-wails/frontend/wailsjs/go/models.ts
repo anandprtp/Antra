@@ -5,6 +5,8 @@ export namespace main {
 	    soulseek_enabled: boolean;
 	    soulseek_username?: string;
 	    soulseek_password?: string;
+	    soulseek_seed_after_download: boolean;
+	    sources_enabled?: string[];
 	    first_run_complete: boolean;
 	    output_format?: string;
 	
@@ -18,6 +20,8 @@ export namespace main {
 	        this.soulseek_enabled = source["soulseek_enabled"];
 	        this.soulseek_username = source["soulseek_username"];
 	        this.soulseek_password = source["soulseek_password"];
+	        this.soulseek_seed_after_download = source["soulseek_seed_after_download"];
+	        this.sources_enabled = source["sources_enabled"];
 	        this.first_run_complete = source["first_run_complete"];
 	        this.output_format = source["output_format"];
 	    }
@@ -29,6 +33,7 @@ export namespace main {
 	    downloaded: number;
 	    failed: number;
 	    skipped: number;
+	    error?: string;
 	    sources: Record<string, number>;
 	
 	    static createFrom(source: any = {}) {
@@ -43,6 +48,7 @@ export namespace main {
 	        this.downloaded = source["downloaded"];
 	        this.failed = source["failed"];
 	        this.skipped = source["skipped"];
+	        this.error = source["error"];
 	        this.sources = source["sources"];
 	    }
 	}

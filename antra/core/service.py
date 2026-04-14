@@ -226,6 +226,7 @@ class AntraService:
                 soulseek = SoulseekAdapter(
                     base_url=soulseek_base_url,
                     api_key=soulseek_api_key or None,
+                    seed_after_download=getattr(cfg, "soulseek_seed_after_download", False),
                 )
                 if soulseek.is_available():
                     adapters.append(soulseek)
@@ -266,6 +267,16 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Tidal adapter failed to initialize: {e}")
 
+        # NetEase Cloud Music (no credentials — 320kbps MP3, excellent Chinese catalog)
+        try:
+            from antra.sources.netease import NetEaseAdapter
+            netease = NetEaseAdapter()
+            if netease.is_available():
+                adapters.append(netease)
+                logger.info("[OK] NetEase adapter enabled (320kbps MP3, Chinese catalog)")
+        except Exception as e:
+            logger.warning(f"NetEase adapter failed to initialize: {e}")
+
         # JioSaavn (no credentials needed — good MP3 320kbps fallback)
         if cfg.jiosaavn_enabled:
             try:
@@ -278,6 +289,22 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"JioSaavn adapter failed to initialize: {e}")
 
+
+        # Filter by user-selected source groups ("hifi", "soulseek").
+        # "hifi" covers Amazon + HiFi + JioSaavn (all non-P2P free sources).
+        # "soulseek" covers the Soulseek/slskd adapter.
+        # Empty = all enabled.
+        sources_enabled_raw = (getattr(cfg, "sources_enabled", "") or "").strip()
+        if sources_enabled_raw:
+            enabled_groups = {s.strip().lower() for s in sources_enabled_raw.split(",") if s.strip()}
+            _HIFI_NAMES = {"amazon", "hifi", "jiosaavn", "netease", "qobuz", "tidal", "dab", "yams"}
+            _SOULSEEK_NAMES = {"soulseek"}
+            def _in_enabled_group(adapter) -> bool:
+                name = adapter.name.lower()
+                if name in _SOULSEEK_NAMES:
+                    return "soulseek" in enabled_groups
+                return "hifi" in enabled_groups
+            adapters = [a for a in adapters if _in_enabled_group(a)]
 
         source_preference = getattr(cfg, "source_preference", None)
         filtered = self._filter_adapters_by_source_preference(adapters, source_preference)
@@ -308,27 +335,36 @@ class AntraService:
             return self._fetch_soundcloud_tracks(playlist, cfg)
 
         # Handle Amazon Music URLs
-        if "music.amazon.com" in playlist:
-            return self._fetch_amazon_music_tracks(playlist, cfg)
+        if "music.amazon." in playlist:
+            tracks = self._fetch_amazon_music_tracks(playlist, cfg)
+            if getattr(cfg, "enrich_album_data", False):
+                try:
+                    spotify = self._make_spotify_client(cfg)
+                    logger.info("Enriching Amazon tracks with Spotify metadata...")
+                    tracks = spotify.batch_enrich_album_data(tracks)
+                except Exception as e:
+                    logger.debug(f"[Service] Spotify hydration failed: {e}")
+            return tracks
 
-        # Try Spotify first; fall back to SpotFetch if credentials are missing
-        # or if the anonymous public-page scraper fails (Spotify changed their
-        # web app and no longer embeds __NEXT_DATA__ JSON).
+        # Try authenticated Spotify client first.
+        # On auth failure → fall back to:
+        #   1. SpotFetch proxy (returns ISRC + full metadata)
+        #   2. Direct Spotify public-page scraping (no 3rd-party dependency)
+        spotify = self._make_spotify_client(cfg)
         try:
-            spotify = self._make_spotify_client(cfg)
             tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
             return tracks
         except SpotifyResourceError as e:
-            logger.info(
-                f"[SpotFetch] Spotify metadata unavailable ({e}) — falling back to SpotFetch proxy"
+            logger.debug(
+                f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
             )
-            return self._fetch_spotfetch_tracks(playlist, cfg)
+            return self._fetch_spotfetch_tracks(playlist, cfg, spotify)
         except Exception as e:
             if _is_auth_error(e):
-                logger.info(
-                    "[SpotFetch] Spotify auth not configured — falling back to SpotFetch proxy"
+                logger.debug(
+                    "[Spotify] Auth not configured — trying SpotFetch proxy"
                 )
-                return self._fetch_spotfetch_tracks(playlist, cfg)
+                return self._fetch_spotfetch_tracks(playlist, cfg, spotify)
             raise
 
     def _fetch_apple_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
@@ -352,14 +388,61 @@ class AntraService:
         client_id = getattr(cfg, "soundcloud_client_id", "") or None
         return SoundCloudFetcher(client_id=client_id).fetch(url)
 
-    def _fetch_spotfetch_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+    def _fetch_spotfetch_tracks(
+        self, url: str, cfg: Config, spotify: Optional[SpotifyClient] = None
+    ) -> list[TrackMetadata]:
+        import re as _re
+
+        # ── Attempt 1: SpotFetch proxy (has ISRC + full metadata) ─────────────
         try:
             from antra.core.spotfetch_fetcher import SpotFetchFetcher
+            mirrors = getattr(cfg, "spotfetch_mirrors", None) or None
+            return SpotFetchFetcher(bases=mirrors).fetch(url)
         except ImportError:
-            raise RuntimeError(
-                "Spotify playlist fetching via proxy is not available in this distribution."
-            )
-        return SpotFetchFetcher().fetch(url)
+            pass
+        except ValueError:
+            raise  # bad URL / 404 — no point trying further
+        except Exception as e:
+            logger.debug(f"[SpotFetch] All proxies failed ({e}) — falling back to public scraper")
+
+        # ── Attempt 2: Direct Spotify partner API (TOTP token, no 3rd-party) ──
+        if spotify is None:
+            spotify = self._make_spotify_client(cfg)
+
+        # Album — partner GraphQL API (most reliable, full track listing)
+        m_album = _re.search(r"spotify\.com/(?:intl-[a-z]+/)?album/([A-Za-z0-9]+)", url)
+        if m_album:
+            album_id = m_album.group(1)
+            tracks = spotify._fetch_album_via_partner_api(album_id)
+            if tracks:
+                logger.info("[Spotify] Used partner GraphQL API for album (no credentials)")
+                return tracks
+            # last-resort HTML scrape
+            tracks = spotify._fetch_public_album_page(album_id)
+            if tracks:
+                logger.info("[Spotify] Used public album page scraper")
+                return tracks
+
+        # Track
+        m_track = _re.search(r"spotify\.com/(?:intl-[a-z]+/)?track/([A-Za-z0-9]+)", url)
+        if m_track:
+            meta = spotify._fetch_public_track_page(m_track.group(1))
+            if meta:
+                logger.info("[Spotify] Used public track page scraper")
+                return [meta]
+
+        # Playlist — partner GraphQL API
+        m_pl = _re.search(r"spotify\.com/(?:intl-[a-z]+/)?playlist/([A-Za-z0-9]+)", url)
+        if m_pl:
+            tracks = spotify._fetch_public_playlist_embed(m_pl.group(1))
+            if tracks:
+                logger.info("[Spotify] Used partner GraphQL API for playlist (no credentials)")
+                return tracks
+
+        raise RuntimeError(
+            "Spotify metadata unavailable: all no-credentials methods failed. "
+            "Configure Spotify credentials to get reliable metadata."
+        )
 
     def _fetch_amazon_music_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:
@@ -373,14 +456,46 @@ class AntraService:
             cookies_path=cfg.amazon_cookies_path,
         ).fetch(url)
 
+    def search_artists(self, query: str, source: str = "spotify") -> list[dict]:
+        """Search for artists by name. Returns scored results for the UI.
+
+        source: "spotify" | "apple"
+        Each result: {artist_id, name, artwork_url, genres, followers, match_score, profile_url, source}
+        """
+        if source == "apple":
+            from antra.core.apple_fetcher import AppleFetcher
+            return AppleFetcher().search_artists(query)
+
+        # Spotify — try with credentials first, then anonymous token (handled inside
+        # spotify.search_artists). If that returns nothing (e.g. rate-limited), fall
+        # back to Apple Music / iTunes search so the user gets results. Apple Music
+        # profile URLs are handled correctly by the discography flow.
+        try:
+            spotify = self._make_spotify_client(self._base_config)
+            results = spotify.search_artists(query)
+            if results:
+                return results
+        except Exception as e:
+            logger.debug(f"[Service] Spotify artist search unavailable ({e})")
+
+        logger.debug("[Service] Spotify search returned no results — falling back to Apple Music")
+        try:
+            from antra.core.apple_fetcher import AppleFetcher
+            return AppleFetcher().search_artists(query)
+        except Exception as e:
+            logger.debug(f"[Service] Apple fallback artist search failed: {e}")
+        return []
+
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
-        return self._spotify_client_factory(
+        client = self._spotify_client_factory(
             cfg.spotify_client_id,
             cfg.spotify_client_secret,
             cfg.spotify_market,
             redirect_uri=cfg.spotify_redirect_uri,
             auth_storage_path=cfg.spotify_auth_path,
         )
+        client._spotfetch_mirrors = getattr(cfg, "spotfetch_mirrors", None)
+        return client
 
     def _fetch_tracks_with_client(
         self,
@@ -395,8 +510,7 @@ class AntraService:
 
         if cfg.enrich_album_data:
             logger.info("Enriching tracks with album metadata...")
-            for i, track in enumerate(tracks):
-                tracks[i] = spotify.enrich_album_data(track)
+            tracks = spotify.batch_enrich_album_data(tracks)
 
         return tracks
 
@@ -583,6 +697,7 @@ class AntraService:
         cfg: Config,
         event_callback: Optional[Callable[[EngineEvent], None]] = None,
         controller: Optional[DownloadController] = None,
+        organizer: Optional[LibraryOrganizer] = None,
     ) -> DownloadEngine:
         adapters = self.build_adapters(cfg)
         if not adapters:
@@ -604,7 +719,8 @@ class AntraService:
             preferred_output_format=cfg.output_format,
             preserve_input_order=preserve_input_order,
         )
-        organizer = LibraryOrganizer(cfg.output_dir)
+        if organizer is None:
+            organizer = LibraryOrganizer(cfg.output_dir)
 
         lyrics_fetcher = None
         if cfg.fetch_lyrics:
@@ -635,9 +751,10 @@ class AntraService:
         options: Optional[RuntimeOptions] = None,
         event_callback: Optional[Callable[[EngineEvent], None]] = None,
         controller: Optional[DownloadController] = None,
+        organizer: Optional[LibraryOrganizer] = None,
     ) -> list[DownloadResult]:
         cfg = self.build_runtime_config(options)
-        engine = self.build_engine(cfg, event_callback=event_callback, controller=controller)
+        engine = self.build_engine(cfg, event_callback=event_callback, controller=controller, organizer=organizer)
         return engine.download_playlist(tracks)
 
     def download_playlist(

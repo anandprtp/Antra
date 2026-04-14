@@ -270,9 +270,19 @@ class SourceResolver:
                 )
                 return accepted_result, accepted_adapter
 
-        # In true FLAC mode, never degrade to lossy fallbacks.
+        # In lossless-prefer mode: if no lossless candidate was acceptable but a
+        # lossy source did find the track (e.g. region-exclusive Chinese content
+        # only available on NetEase), use the best lossy match as a last resort
+        # rather than hard-failing. Log a clear warning so the user can see it.
         if self._is_lossless_only_mode():
-            logger.warning(f"[Resolver] No lossless source found for: {track.title} — {track.artist_string}")
+            if best_result and best_adapter:
+                logger.info(
+                    f"[Resolver] No lossless source found — using best available "
+                    f"({best_adapter.name}, {best_result.quality_label}) for: "
+                    f"{track.title}"
+                )
+                return best_result, best_adapter
+            logger.warning(f"[Resolver] No source found for: {track.title} — {track.artist_string}")
             return None
 
         # Nothing cleared the threshold — fall back to the best we found

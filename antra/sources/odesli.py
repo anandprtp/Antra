@@ -36,7 +36,7 @@ _ODESLI_API = "https://api.song.link/v1-alpha.1/links"
 _SONGWHIP_API = "https://api.songwhip.com/v3/resolve"
 _AMAZON_SEARCH = "https://www.amazon.com/s"
 _CACHE_FILE = os.path.join(os.path.expanduser("~"), ".antra_link_cache.json")
-_ODESLI_RETRY_DELAYS = [10, 30, 60]
+_ODESLI_RETRY_DELAYS = []
 
 _HEADERS = {
     "User-Agent": (
@@ -101,6 +101,12 @@ class OdesliEnricher:
         """
         Return {platform: id} for the given track.
         Merges results from all resolvers, caches on first success.
+
+        Resolver order:
+          1. Odesli (if Spotify ID or ISRC available) — exact cross-platform match,
+             rate-limited but authoritative. Prevents wrong ASINs from text search.
+          2. Songwhip — slug-based, returns streaming-specific ASINs.
+          3. Amazon product scraper — fuzzy title search, last resort for amazonMusic.
         """
         cache_key = getattr(track, "spotify_id", None) or getattr(track, "isrc", None)
 
@@ -110,22 +116,25 @@ class OdesliEnricher:
 
         result: dict[str, str] = {}
 
-        # 1. Amazon product search (no limits, always try first for amazonMusic)
-        amazon_asin = self._search_amazon(track)
-        if amazon_asin:
-            result["amazonMusic"] = amazon_asin
-            logger.debug(f"[LinkResolver] Amazon ASIN via product search: {amazon_asin}")
+        # 1. Odesli — exact match via Spotify ID or ISRC (highest accuracy).
+        #    Run first when we have a reliable identifier so scraper results
+        #    don't shadow authoritative IDs with wrong ASINs.
+        if getattr(track, "spotify_id", None) or getattr(track, "isrc", None):
+            od = self._try_odesli(track)
+            for k, v in od.items():
+                result[k] = v
 
-        # 2. Songwhip (no limits, fills tidal/qobuz/apple if not already found)
+        # 2. Songwhip — fills any platforms still missing (streaming-specific ASINs).
         sw = self._try_songwhip(track)
         for k, v in sw.items():
             result.setdefault(k, v)
 
-        # 3. Odesli (rate-limited fallback — only if still missing key IDs)
-        if not result:
-            od = self._try_odesli(track)
-            for k, v in od.items():
-                result.setdefault(k, v)
+        # 3. Amazon product scraper — fuzzy fallback, only if amazonMusic still absent.
+        if "amazonMusic" not in result:
+            amazon_asin = self._search_amazon(track)
+            if amazon_asin:
+                result["amazonMusic"] = amazon_asin
+                logger.debug(f"[LinkResolver] Amazon ASIN via product search: {amazon_asin}")
 
         if result:
             logger.debug(f"[LinkResolver] Resolved '{track.title}': {list(result.keys())}")
