@@ -206,7 +206,7 @@ jobs:
 
   build-macos-intel:
     name: Build macOS (Intel)
-    runs-on: macos-13
+    runs-on: macos-12
     env:
       WAILS_VERSION: v2.12.0
     steps:
