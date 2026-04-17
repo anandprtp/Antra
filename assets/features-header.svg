@@ -1,0 +1,64 @@
+<svg width="860" height="120" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0a0e1a"/>
+      <stop offset="40%" style="stop-color:#0d1520"/>
+      <stop offset="100%" style="stop-color:#0a0e1a"/>
+    </linearGradient>
+    <linearGradient id="lineGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0a0e1a"/>
+      <stop offset="20%" style="stop-color:#0ea5e9"/>
+      <stop offset="50%" style="stop-color:#7DD3FC"/>
+      <stop offset="80%" style="stop-color:#0ea5e9"/>
+      <stop offset="100%" style="stop-color:#0a0e1a"/>
+    </linearGradient>
+    <filter id="glow2">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <!-- animated dash for scanning line effect -->
+    <linearGradient id="scanGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:transparent"/>
+      <stop offset="45%" style="stop-color:transparent"/>
+      <stop offset="50%" style="stop-color:#38BDF8"/>
+      <stop offset="55%" style="stop-color:transparent"/>
+      <stop offset="100%" style="stop-color:transparent"/>
+      <animateTransform attributeName="gradientTransform" type="translate" values="-1 0;2 0;-1 0" dur="3s" repeatCount="indefinite"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="860" height="120" fill="url(#bg2)"/>
+
+  <!-- scanning horizontal line -->
+  <rect x="0" y="59" width="860" height="1.5" fill="url(#scanGrad)" opacity="0.6"/>
+
+  <!-- top horizontal rule -->
+  <rect x="0" y="18" width="860" height="0.8" fill="url(#lineGrad)" opacity="0.35"/>
+  <!-- bottom horizontal rule -->
+  <rect x="0" y="100" width="860" height="0.8" fill="url(#lineGrad)" opacity="0.35"/>
+
+  <!-- left bracket -->
+  <text x="40" y="72" font-family="'Courier New', monospace" font-size="52" fill="#0ea5e9" opacity="0.18" filter="url(#glow2)">[</text>
+  <!-- right bracket -->
+  <text x="790" y="72" font-family="'Courier New', monospace" font-size="52" fill="#0ea5e9" opacity="0.18" filter="url(#glow2)">]</text>
+
+  <!-- corner ticks -->
+  <rect x="24" y="24" width="12" height="1.5" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="24" y="24" width="1.5" height="12" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="824" y="24" width="12" height="1.5" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="834.5" y="24" width="1.5" height="12" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="24" y="94.5" width="12" height="1.5" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="24" y="83" width="1.5" height="12" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="824" y="94.5" width="12" height="1.5" fill="#0ea5e9" opacity="0.5"/>
+  <rect x="834.5" y="83" width="1.5" height="12" fill="#0ea5e9" opacity="0.5"/>
+
+  <!-- main label -->
+  <text x="430" y="55" text-anchor="middle" font-family="'Courier New', Courier, monospace" font-size="11" fill="#38BDF8" letter-spacing="6" opacity="0.5">ANTRA</text>
+  <text x="430" y="80" text-anchor="middle" font-family="'Courier New', Courier, monospace" font-size="22" font-weight="700" fill="#7DD3FC" letter-spacing="10" filter="url(#glow2)">FEATURES</text>
+
+  <!-- small dots left/right of title -->
+  <circle cx="222" cy="72" r="2" fill="#0ea5e9" opacity="0.4"/>
+  <circle cx="212" cy="72" r="1.5" fill="#0ea5e9" opacity="0.25"/>
+  <circle cx="638" cy="72" r="2" fill="#0ea5e9" opacity="0.4"/>
+  <circle cx="648" cy="72" r="1.5" fill="#0ea5e9" opacity="0.25"/>
+</svg>
