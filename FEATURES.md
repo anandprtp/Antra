@@ -14,22 +14,22 @@
 
 ## Multi-Source Audio Engine
 
-Antra doesn't rely on a single source. It works through a waterfall of community-run servers, always trying the highest-quality lossless format first — and falls back gracefully when a source is unavailable or rate-limited.
+Antra doesn't rely on a single source. It works through a waterfall of community-run servers, always trying the highest-quality lossless format first and falling back gracefully when a source is unavailable or rate-limited.
 
 ```
 Priority chain (per track):
 
   Community-run APIs  →  Tidal · Qobuz · Amazon Music  (FLAC, up to 24-bit/192kHz)
-  Soulseek P2P        →  anything the community has — rare pressings, out-of-print releases
+  Soulseek P2P        →  anything the community has, including rare and out-of-print releases
 ```
 
-Load is distributed evenly across same-tier sources. When a server is temporarily rate-limited, Antra moves it to the back of the queue and continues from the others — no stalls, no dead time.
+Load is distributed evenly across same-tier sources. When a server is temporarily rate-limited, Antra moves it to the back of the queue and continues from the others with no stalls or dead time.
 
 ---
 
 ## ISRC-Based Exact Matching
 
-Most tools match by title + artist and often grab the wrong version — a remaster, a radio edit, a regional pressing. Antra uses **ISRC codes** (the unique identifier of every recording) to guarantee you get the exact track from the exact release you requested.
+Most tools match by title + artist and often grab the wrong version: a remaster, a radio edit, a regional pressing. Antra uses **ISRC codes** (the unique identifier of every recording) to guarantee you get the exact track from the exact release you requested.
 
 When ISRCs are available, Antra uses them to match against source APIs directly. When they're not, it falls back to a scored similarity search with title-artist weighting.
 
@@ -37,7 +37,7 @@ When ISRCs are available, Antra uses them to match against source APIs directly.
 
 ## Explicit Version Preference
 
-If the track you requested is the explicit (unedited) version, Antra will prefer it. Radio edits and censored versions are penalised in the match scoring and skipped when a clean result is the only option — keeping the rest of the queue searching until an explicit source is found, or marking the track as a clean-only result.
+If the track you requested is the explicit (unedited) version, Antra will prefer it. Radio edits and censored versions are penalised in the match scoring and skipped when a clean result is the only option, keeping the rest of the queue searching until an explicit source is found.
 
 Configurable in Settings: **Prefer explicit versions** (on by default).
 
@@ -45,13 +45,13 @@ Configurable in Settings: **Prefer explicit versions** (on by default).
 
 ## Hi-Res Awareness
 
-Apple Music's catalog API includes per-track quality hints (`hi-res-lossless`, `lossless`, `atmos`). When a track is known to have a 24-bit master, Antra keeps searching even if a 16-bit lossless result is found — only settling for CD quality if no hi-res source can be located.
+Apple Music's catalog API includes per-track quality hints (`hi-res-lossless`, `lossless`, `atmos`). When a track is known to have a 24-bit master, Antra keeps searching even if a 16-bit lossless result is found, only settling for CD quality if no hi-res source can be located.
 
 ---
 
 ## Auto-Tagging
 
-Every downloaded file is tagged automatically — no manual editing, no missing artwork, no "Track 01".
+Every downloaded file is tagged automatically. No manual editing, no missing artwork, no "Track 01".
 
 | Tag | Source |
 |---|---|
@@ -62,7 +62,7 @@ Every downloaded file is tagged automatically — no manual editing, no missing 
 | Lyrics | Genius + Musixmatch fallback |
 | ISRC | Embedded for future matching |
 
-Tags are written in the correct format for every container: ID3v2 for MP3, Vorbis comments for FLAC, MP4 atoms for M4A — fully readable by Windows Media Player, VLC, foobar2000, and all major media servers.
+Tags are written in the correct format for every container: ID3v2 for MP3, Vorbis comments for FLAC, MP4 atoms for M4A, fully readable by Windows Media Player, VLC, foobar2000, and all major media servers.
 
 ---
 
@@ -85,8 +85,8 @@ Multi-disc albums use prefixed numbering (`101`, `201`, ...) so Plex, Navidrome,
 
 | Mode | Layout |
 |---|---|
-| **Standard** (default) | `Artist / Album / files` — optimal for Navidrome, Jellyfin, Plex |
-| **Flat** | `Album / files` — no artist wrapper, good for manual organisation |
+| **Standard** (default) | `Artist / Album / files`. Optimal for Navidrome, Jellyfin, Plex. |
+| **Flat** | `Album / files`. No artist wrapper, good for manual organisation. |
 
 ### Filename Format Options
 
@@ -103,14 +103,14 @@ Both options are set during first-run setup and adjustable later in Settings.
 
 ## Smart Deduplication
 
-Antra builds an identity index of your library using ISRCs, track IDs, and normalised title+artist keys. Before downloading, it checks if a track already exists — even if it was saved under a different artist folder name or album edition.
+Antra builds an identity index of your library using ISRCs, track IDs, and normalised title+artist keys. Before downloading, it checks if a track already exists, even if it was saved under a different artist folder name or album edition.
 
 ### Library Mode Options
 
 | Mode | Behaviour |
 |---|---|
-| **Smart Dedup** (default) | Skip a track if the same ISRC exists anywhere in your library — saves storage |
-| **Full Albums** | Skip only if the file already exists in the same destination folder — lets you own the same track in multiple album contexts |
+| **Smart Dedup** (default) | Skip a track if the same ISRC exists anywhere in your library. Saves storage. |
+| **Full Albums** | Skip only if the file already exists in the same destination folder. Lets you own the same track across multiple album contexts. |
 
 ---
 
@@ -139,9 +139,9 @@ Parallel:     track 1 ↘
 
 ## Rich Tracklist UI
 
-When a URL is pasted, the full tracklist appears immediately — before any download starts.
+When a URL is pasted, the full tracklist appears immediately before any download starts.
 
-Each row shows the track title, artist, duration, and a real-time progress bar as the file downloads. The playlist header displays the cover art, type (ALBUM / PLAYLIST / SINGLE), artist, track count, total duration, and release date — the same layout as a streaming app.
+Each row shows the track title, artist, duration, and a real-time progress bar as the file downloads. The playlist header displays the cover art, type (ALBUM / PLAYLIST / SINGLE), artist, track count, total duration, and release date in the same layout as a streaming app.
 
 When multiple URLs are queued in one session, a divider with the album cover and title separates each batch so you always know which tracks belong where.
 
@@ -157,7 +157,7 @@ Three chips below the URL bar let you check whether the community-run Tidal, Qob
 
 ## Library History
 
-Every completed download session is saved to history with its cover art thumbnail, album/playlist title, URL, track count, and timestamp — so you can quickly identify what you've downloaded without opening the folder.
+Every completed download session is saved to history with its cover art thumbnail, album/playlist title, URL, track count, and timestamp, so you can quickly identify what you've downloaded without opening the folder.
 
 ---
 
@@ -173,9 +173,9 @@ Supports batch analysis with gallery view, side-by-side comparison, and PNG expo
 
 Antra works out of the box with no logins, no API keys, and no subscription:
 
-- Spotify metadata — anonymous, no credentials
-- Apple Music metadata — anonymous catalog access
-- Amazon Music metadata — anonymous page parsing
+- Spotify metadata: anonymous, no credentials needed
+- Apple Music metadata: anonymous catalog access
+- Amazon Music metadata: anonymous page parsing
 
 Optionally wire in a Spotify account or Apple Developer token for private playlists and deeper metadata.
 
@@ -183,11 +183,11 @@ Optionally wire in a Spotify account or Apple Developer token for private playli
 
 ## Soulseek / P2P Integration
 
-For tracks that aren't available through any streaming-adjacent source — rare albums, limited pressings, out-of-print releases — Antra integrates with the Soulseek P2P network.
+For tracks that aren't available through any streaming-adjacent source (rare albums, limited pressings, out-of-print releases), Antra integrates with the Soulseek P2P network.
 
-**Zero setup:** Antra downloads, configures, and manages the backend automatically. Just provide your Soulseek credentials once on first run.
+**Zero setup.** Antra downloads, configures, and manages the backend automatically. Just provide your Soulseek credentials once on first run.
 
-> The Soulseek network runs on sharing. If you use it, please share back — leave the client running when you can.
+> The Soulseek network runs on sharing. If you use it, please share back and leave the client running when you can.
 
 ---
 
@@ -195,22 +195,22 @@ For tracks that aren't available through any streaming-adjacent source — rare 
 
 | Mode | Output |
 |---|---|
-| **Auto** (default) | Best available — lossless preferred, MP3 fallback if no lossless source exists |
-| **Lossless** | FLAC only — track is marked failed rather than falling back to lossy |
-| **MP3** | Uses dedicated MP3 sources directly — no FLAC download + transcode |
+| **Auto** (default) | Best available. Lossless preferred, MP3 fallback if no lossless source exists. |
+| **Lossless** | FLAC only. Track is marked failed rather than falling back to lossy. |
+| **MP3** | Uses dedicated MP3 sources directly. No FLAC download and transcode. |
 
 ---
 
 ## Platform Support
 
-All builds ship as **single self-contained binaries** — no Python, no runtime, no dependencies to install.
+All builds ship as **single self-contained binaries** with no Python, no runtime, and no dependencies to install.
 
 | Platform | Minimum | File |
 |---|---|---|
 | Windows | 10+ | `Antra.exe` |
 | macOS | 12+ (Apple Silicon) | `Antra-macOS.dmg` |
 | macOS | 12+ (Intel) | `Antra-macOS-Intel.dmg` |
-| Linux | Ubuntu 24.04+ | `Antra-Linux.AppImage` |
+| Linux | Any | `Antra-Linux.AppImage` |
 
 ---
 
@@ -222,7 +222,7 @@ Frontend UI     →  Svelte · TypeScript · Vite
 Download engine →  Python 3.11
 IPC             →  newline-delimited JSON over stdout
 Packaging       →  PyInstaller · wails build · AppImage · create-dmg
-CI/CD           →  GitHub Actions — 4-platform matrix build on tag push
+CI/CD           →  GitHub Actions, 4-platform matrix build on tag push
 ```
 
 ---
