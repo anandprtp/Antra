@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Resolve Spotify · Apple Music · Amazon Music and download lossless audio. Free, forever.</strong>
+  <strong>Resolve Spotify · Apple Music · Amazon Music and get lossless audio. Free, forever.</strong>
 </p>
 
 <p align="center">
