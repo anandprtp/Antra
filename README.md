@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/Windows%20·%20macOS%20·%20Linux-supported-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <img src="https://img.shields.io/badge/License-MIT-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <img src="https://img.shields.io/badge/Free-Forever-0ea5e9?style=flat-square&labelColor=0d1117"/>
-  <a href="https://www.reddit.com/r/antraverse/"><img src="https://img.shields.io/badge/Community-Reddit-FF4500?style=flat-square&labelColor=0d1117&logo=reddit&logoColor=white"/></a>
+  <a href="https://t.me/antraaverse"><img src="https://img.shields.io/badge/Community-Telegram-26A5E4?style=flat-square&labelColor=0d1117&logo=telegram&logoColor=white"/></a>
 </p>
 
 <p align="center">
@@ -132,5 +132,5 @@ This repository and its contents are provided strictly for educational and resea
 ---
 
 <p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://www.reddit.com/r/antraverse/">Join the Community</a></sub>
+  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Join the Community</a></sub>
 </p>

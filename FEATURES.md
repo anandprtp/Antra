@@ -86,7 +86,7 @@ Multi-disc albums use prefixed numbering (`101`, `201`, ...) so Plex, Navidrome,
 | Mode | Layout |
 |---|---|
 | **Standard** (default) | `Artist / Album / files`. Optimal for Navidrome, Jellyfin, Plex. |
-| **Flat** | `Album / files`. No artist wrapper, good for manual organisation. |
+| **Flat** | `Album / files` directly inside your Music folder. No artist or category subdirectories. |
 
 ### Filename Format Options
 
@@ -94,8 +94,8 @@ Multi-disc albums use prefixed numbering (`101`, `201`, ...) so Plex, Navidrome,
 |---|---|
 | **Default** | `01 - Track Title.flac` |
 | **Title only** | `Track Title.flac` |
-| **Artist - Title** | `Artist - Track Title.flac` |
-| **Title - Artist** | `Track Title - Artist.flac` |
+| **Artist - Title** | `01 - Artist - Track Title.flac` |
+| **Title - Artist** | `01 - Track Title - Artist.flac` |
 
 Both options are set during first-run setup and adjustable later in Settings.
 
@@ -240,8 +240,8 @@ CI/CD           →  GitHub Actions, 4-platform matrix build on tag push
     <img src="https://img.shields.io/badge/⭐_Star_on_GitHub-FFD700?style=for-the-badge&logo=github&logoColor=black"/>
   </a>
   &nbsp;
-  <a href="https://www.reddit.com/r/antraverse/">
-    <img src="https://img.shields.io/badge/Community-Reddit-FF4500?style=for-the-badge&logo=reddit&logoColor=white"/>
+  <a href="https://t.me/antraaverse">
+    <img src="https://img.shields.io/badge/Community-Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white"/>
   </a>
   <br/><br/>
   <sub><a href="README.md">← Back to README</a></sub>
