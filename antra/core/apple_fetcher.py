@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 # ── Apple Music URL patterns ───────────────────────────────────────────────────
 # Slug segment is optional — Apple Music search results return bare /album/{id} URLs
 _RE_SONG     = re.compile(r"music\.apple\.com/([a-z]{2})/album/(?:[^/]+/)?(\d+)\?i=(\d+)")
+_RE_SONG_DIRECT = re.compile(r"music\.apple\.com/([a-z]{2})/song/(?:[^/]+/)?(\d+)")
 _RE_ALBUM    = re.compile(r"music\.apple\.com/([a-z]{2})/album/(?:[^/]+/)?(\d+)(?!\?i=)")
-_RE_PLAYLIST = re.compile(r"music\.apple\.com/([a-z]{2})/playlist/[^/]+/(pl\.[a-zA-Z0-9]+)")
+_RE_PLAYLIST = re.compile(r"music\.apple\.com/([a-z]{2})/playlist/[^/]+/(pl\.[a-zA-Z0-9-]+)")
 
 # ── iTunes API ────────────────────────────────────────────────────────────────
 _ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
@@ -86,6 +87,10 @@ class AppleFetcher:
         if m:
             return ("song", m.group(3))  # iTunes track ID from ?i=<id>
 
+        m = _RE_SONG_DIRECT.search(url)
+        if m:
+            return ("song", m.group(2))  # iTunes track ID from /song/id
+
         m = _RE_ALBUM.search(url)
         if m:
             return ("album", m.group(2))  # iTunes collection ID
@@ -129,7 +134,23 @@ class AppleFetcher:
     # ── Song ──────────────────────────────────────────────────────────────────
 
     def _fetch_song(self, track_id: str, storefront: str = "us") -> Optional[TrackMetadata]:
-        """Look up a single song by iTunes track ID."""
+        """Look up a single song."""
+        token = self._get_developer_token()
+        if token:
+            try:
+                resp = self._session.get(
+                    f"{_AM_CATALOG.format(storefront=storefront)}/songs/{track_id}",
+                    headers={"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.ok:
+                    data = resp.json().get("data", [])
+                    if data:
+                        logger.debug(f"[Apple] Song {track_id} fetched via Catalog API")
+                        return self._catalog_item_to_metadata(data[0].get("attributes", {}))
+            except Exception as e:
+                logger.debug(f"[Apple] Catalog API song fetch failed: {e}")
+
         def _lookup(country: str) -> list:
             try:
                 resp = self._session.get(
@@ -160,10 +181,53 @@ class AppleFetcher:
     # ── Album ─────────────────────────────────────────────────────────────────
 
     def _fetch_album(self, album_id: str, storefront: str = "us") -> list[TrackMetadata]:
-        """
-        Fetch all tracks in an album via iTunes lookup.
-        Returns track objects with album artwork from the album-level item.
-        """
+        """Fetch all tracks in an album."""
+        token = self._get_developer_token()
+        if token:
+            try:
+                resp = self._session.get(
+                    f"{_AM_CATALOG.format(storefront=storefront)}/albums/{album_id}",
+                    headers={"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"},
+                    params={"include": "tracks"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.ok:
+                    album_data = resp.json().get("data", [])
+                    if album_data:
+                        album_attrs = album_data[0].get("attributes", {})
+                        upc = album_attrs.get("upc")
+                        cat_album_name = album_attrs.get("name", "")
+                        cat_release_raw = (album_attrs.get("releaseDate") or "")[:10]
+                        cat_artist_name = (album_attrs.get("artistName") or "").strip()
+                        cat_album_artists = [cat_artist_name] if cat_artist_name else []
+
+                        track_relationships = album_data[0].get("relationships", {}).get("tracks", {}).get("data", [])
+                        tracks = []
+                        for t in track_relationships:
+                            meta = self._catalog_item_to_metadata(t.get("attributes", {}))
+                            if meta:
+                                if upc and not meta.upc:
+                                    meta.upc = upc
+                                # Override per-track albumName with the parent album name so
+                                # edition variants (e.g. "Shady Edition") use their own folder
+                                # instead of the canonical album name from the track attribute.
+                                if cat_album_name:
+                                    meta.album = cat_album_name
+                                if cat_release_raw and not meta.release_date:
+                                    meta.release_date = cat_release_raw
+                                    try:
+                                        meta.release_year = int(cat_release_raw[:4])
+                                    except ValueError:
+                                        pass
+                                if cat_album_artists and not meta.album_artists:
+                                    meta.album_artists = cat_album_artists
+                                tracks.append(meta)
+                        if tracks:
+                            logger.info(f"[Apple] Fetched {len(tracks)} tracks from album '{cat_album_name}' (via Catalog API)")
+                            return tracks
+            except Exception as e:
+                logger.debug(f"[Apple] Catalog API album fetch failed: {e}")
+
         def _lookup(country: str) -> list:
             try:
                 resp = self._session.get(
@@ -261,6 +325,7 @@ class AppleFetcher:
 
         Tries two strategies:
         1. Apple Music Catalog API (needs a developer token — we try to auto-fetch one)
+           Works for both Apple-curated and public user-created (pl.u-) playlists.
         2. iTunes URL fallback via RSS feed (only works for Apple-curated playlists)
         """
         token = self._get_developer_token()
@@ -271,22 +336,31 @@ class AppleFetcher:
                 return tracks
             logger.warning("[Apple] Catalog API returned no tracks — trying RSS fallback")
 
-        # RSS fallback (Apple curated playlists only, ~20 tracks)
-        tracks = self._playlist_via_rss(playlist_id, storefront)
-        if tracks:
-            for i, track in enumerate(tracks):
-                if not track.playlist_name:
-                    track.playlist_name = url_slug_name
-                    track.playlist_position = track.playlist_position or (i + 1)
-            return tracks
+        # RSS fallback only works for Apple-curated playlists (pl. without the u- prefix).
+        # User-created playlists (pl.u-) are not surfaced by the RSS/iTunes lookup endpoint.
+        if not playlist_id.startswith("pl.u-"):
+            tracks = self._playlist_via_rss(playlist_id, storefront)
+            if tracks:
+                for i, track in enumerate(tracks):
+                    if not track.playlist_name:
+                        track.playlist_name = url_slug_name
+                        track.playlist_position = track.playlist_position or (i + 1)
+                return tracks
+
+        if playlist_id.startswith("pl.u-"):
+            raise RuntimeError(
+                f"[Apple] Could not fetch playlist {playlist_id}.\n"
+                "Make sure this playlist is set to public/shareable in Apple Music. "
+                "Private user-created playlists cannot be accessed without an Apple Music developer token."
+            )
 
         raise RuntimeError(
             f"[Apple] Could not fetch playlist {playlist_id}.\n"
             "For user-created or private Apple Music playlists, set APPLE_DEVELOPER_TOKEN in your .env."
         )
 
-    def _fetch_playlist_name(self, playlist_id: str, storefront: str, token: str) -> str:
-        """Fetch the playlist name from the Catalog API."""
+    def _fetch_playlist_meta(self, playlist_id: str, storefront: str, token: str) -> tuple[str, Optional[str]]:
+        """Return (playlist_name, playlist_artwork_url) from the Catalog API."""
         try:
             resp = self._session.get(
                 f"{_AM_CATALOG.format(storefront=storefront)}/playlists/{playlist_id}",
@@ -299,12 +373,24 @@ class AppleFetcher:
             if resp.ok:
                 data = resp.json().get("data", [])
                 if data:
-                    name = data[0].get("attributes", {}).get("name", "")
-                    if name:
-                        return name
+                    attrs = data[0].get("attributes", {})
+                    name = attrs.get("name", "") or "Apple Music Playlist"
+                    artwork = attrs.get("artwork", {})
+                    artwork_url: Optional[str] = None
+                    if artwork:
+                        w = artwork.get("width") or 3000
+                        h = artwork.get("height") or 3000
+                        url_tpl = artwork.get("url", "")
+                        if url_tpl:
+                            artwork_url = url_tpl.replace("{w}", str(w)).replace("{h}", str(h))
+                    return name, artwork_url
         except Exception as e:
-            logger.debug(f"[Apple] Could not fetch playlist name: {e}")
-        return "Apple Music Playlist"
+            logger.debug(f"[Apple] Could not fetch playlist meta: {e}")
+        return "Apple Music Playlist", None
+
+    def _fetch_playlist_name(self, playlist_id: str, storefront: str, token: str) -> str:
+        name, _ = self._fetch_playlist_meta(playlist_id, storefront, token)
+        return name
 
     def _playlist_via_catalog_api(
         self,
@@ -313,7 +399,7 @@ class AppleFetcher:
         token: str,
     ) -> list[TrackMetadata]:
         """Paginate through the Apple Music Catalog API to fetch all playlist tracks."""
-        playlist_name = self._fetch_playlist_name(playlist_id, storefront, token)
+        playlist_name, playlist_artwork = self._fetch_playlist_meta(playlist_id, storefront, token)
 
         base_url = f"{_AM_CATALOG.format(storefront=storefront)}/playlists/{playlist_id}/tracks"
         headers = {
@@ -357,6 +443,8 @@ class AppleFetcher:
                 if meta:
                     meta.playlist_name = playlist_name
                     meta.playlist_position = len(tracks) + 1
+                    if playlist_artwork:
+                        meta.playlist_artwork_url = playlist_artwork
                     tracks.append(meta)
 
             # Pagination
@@ -493,7 +581,7 @@ class AppleFetcher:
 
             return TrackMetadata(
                 title=title,
-                artists=[artist],
+                artists=self._split_artists(artist),
                 album=album,
                 duration_ms=int(duration_ms) if duration_ms else None,
                 isrc=isrc,
@@ -525,21 +613,31 @@ class AppleFetcher:
             release_year = int(release_raw[:4]) if len(release_raw) >= 4 else None
             isrc         = attrs.get("isrc") or None
 
-            # Artwork: catalog API provides a URL template with {w}x{h}
+            # Artwork: raw 3000x3000cc lossless quality
             art_raw = attrs.get("artwork", {})
             artwork_url = None
             if art_raw:
                 artwork_url = (
                     art_raw.get("url", "")
-                    .replace("{w}", "1200")
-                    .replace("{h}", "1200")
+                    .replace("{w}", "3000")
+                    .replace("{h}", "3000")
                 )
-
+                
             genres = attrs.get("genreNames", [])
+            audio_traits = attrs.get("audioTraits", [])
+            content_rating = attrs.get("contentRating")  # "explicit", "clean", or absent
+            is_explicit = (
+                True if content_rating == "explicit"
+                else False if content_rating == "clean"
+                else None
+            )
+
+            # Note: upc is usually not at the track level in catalog API (it's at album level)
+            # but we pass it down by injecting it externally.
 
             return TrackMetadata(
                 title=title,
-                artists=[artist],
+                artists=self._split_artists(artist),
                 album=album,
                 duration_ms=int(duration_ms) if duration_ms else None,
                 isrc=isrc,
@@ -549,6 +647,8 @@ class AppleFetcher:
                 release_year=release_year,
                 artwork_url=artwork_url,
                 genres=genres,
+                audio_traits=audio_traits,
+                is_explicit=is_explicit,
             )
         except Exception as e:
             logger.debug(f"[Apple] Failed to parse catalog item: {e}")
@@ -638,6 +738,7 @@ class AppleFetcher:
         {artist_id, name, artwork_url, genres, followers, match_score, profile_url, source}
         """
         from antra.utils.matching import normalize, string_similarity
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         try:
             resp = self._session.get(
                 _ITUNES_SEARCH,
@@ -654,7 +755,7 @@ class AppleFetcher:
                 results.append({
                     "artist_id": artist_id,
                     "name": name,
-                    "artwork_url": None,  # iTunes Search API doesn't return artist photos
+                    "artwork_url": None,
                     "genres": [a["primaryGenreName"]] if a.get("primaryGenreName") else [],
                     "followers": None,
                     "match_score": round(score, 3),
@@ -662,6 +763,22 @@ class AppleFetcher:
                     "source": "apple",
                 })
             results.sort(key=lambda x: x["match_score"], reverse=True)
+            # Fetch artist photos in parallel via the Catalog API (requires developer token;
+            # silently skipped per-artist if token is unavailable or request fails).
+            artwork_by_id: dict[str, Optional[str]] = {}
+            with ThreadPoolExecutor(max_workers=min(len(results), 4)) as pool:
+                futures = {
+                    pool.submit(self._fetch_artist_artwork, r["artist_id"], "us"): r["artist_id"]
+                    for r in results
+                }
+                for fut in as_completed(futures):
+                    aid = futures[fut]
+                    try:
+                        artwork_by_id[aid] = fut.result()
+                    except Exception:
+                        artwork_by_id[aid] = None
+            for r in results:
+                r["artwork_url"] = artwork_by_id.get(r["artist_id"])
             return results
         except Exception as e:
             logger.debug(f"[Apple] Artist search failed: {e}")
@@ -690,6 +807,22 @@ class AppleFetcher:
         except Exception as e:
             logger.debug(f"[Apple] Could not fetch artist artwork: {e}")
         return None
+
+    @staticmethod
+    def _split_artists(artist_name: str) -> list[str]:
+        """Split a combined artist string into individual names.
+
+        Apple Music / iTunes returns a single ``artistName`` string like
+        ``"Future, Metro Boomin & The Weeknd"`` instead of a proper list.
+        Splitting it lets downstream adapters search for just the primary
+        artist name, which dramatically improves search accuracy.
+        """
+        if not artist_name:
+            return ["Unknown Artist"]
+        # Split on ' & ', ', ', ' and ', ' feat. ', ' feat ', ' ft. ', ' ft '
+        parts = re.split(r'\s*[,&]\s*|\s+(?:and|feat\.?|ft\.?)\s+', artist_name, flags=re.IGNORECASE)
+        artists = [p.strip() for p in parts if p.strip()]
+        return artists if artists else [artist_name]
 
     @staticmethod
     def _upgrade_artwork_url(url: str) -> Optional[str]:

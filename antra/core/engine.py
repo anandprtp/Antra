@@ -48,7 +48,7 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     output_format: str = "source"
-    max_workers: int = 5
+    max_workers: int = 3
 
 
 class DownloadEngine:
@@ -198,10 +198,80 @@ class DownloadEngine:
         if actual_seconds is None:
             return False
         expected_seconds = expected_duration_ms / 1000.0
-        return (
+
+        # Original duration-based check (unchanged)
+        if (
             actual_seconds < expected_seconds * 0.8
             and (expected_seconds - actual_seconds) >= 20
-        )
+        ):
+            return True
+
+        # Secondary file-size check for FLAC files.
+        # FLAC headers declare total samples upfront, so Mutagen reports the
+        # *intended* duration even when the stream was cut short mid-download.
+        # This catches those cases by comparing actual file size against a
+        # conservative minimum estimate derived from the header's own
+        # bit_depth / sample_rate.
+        if cls._is_truncated_flac_by_size(file_path):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_truncated_flac_by_size(file_path: str) -> bool:
+        """
+        Detect truncated FLAC downloads by comparing actual file size against
+        the minimum expected size based on the FLAC header's own metadata.
+
+        FLAC headers write the total sample count up front, so Mutagen
+        reports the full *intended* duration even when the file was truncated
+        mid-stream.  This check catches those cases.
+
+        Only runs on .flac files.  Uses a very conservative ratio threshold
+        of 0.25 — real FLAC files never compress below ~0.35x of raw PCM,
+        while truncated files typically show 0.15–0.26x.
+        """
+        if not file_path.lower().endswith(".flac"):
+            return False
+
+        try:
+            from mutagen.flac import FLAC as FLACFile
+
+            audio = FLACFile(file_path)
+            if not audio or not audio.info:
+                return False
+
+            bits = getattr(audio.info, "bits_per_sample", None)
+            rate = getattr(audio.info, "sample_rate", None)
+            channels = getattr(audio.info, "channels", None)
+            length = getattr(audio.info, "length", None)
+
+            if not all((bits, rate, channels, length)):
+                return False
+            if length < 60:
+                return False  # Don't flag short tracks
+
+            actual_size = os.path.getsize(file_path)
+            # Raw PCM size for the declared duration
+            raw_pcm_bytes = length * rate * channels * (bits / 8)
+            # FLAC typically compresses to 50-70% of raw.
+            # Use 0.25 as our floor — anything below this is definitely truncated.
+            # (Even the most silence-heavy FLAC only compresses to ~35%.)
+            min_expected_bytes = raw_pcm_bytes * 0.25
+
+            if actual_size < min_expected_bytes:
+                ratio = actual_size / raw_pcm_bytes if raw_pcm_bytes > 0 else 0
+                logger.debug(
+                    f"[Engine] FLAC size check: {file_path} is {actual_size / (1024*1024):.1f}MB "
+                    f"but expected ≥{min_expected_bytes / (1024*1024):.1f}MB "
+                    f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s)"
+                )
+                return True
+
+        except Exception as e:
+            logger.debug(f"[Engine] FLAC size check failed: {e}")
+
+        return False
 
     @staticmethod
     def _discard_file(path: str) -> None:
@@ -357,11 +427,9 @@ class DownloadEngine:
                         )
                     file_path = candidate_path
                     break
-                except OSError as e:
+                except Exception as e:
                     if _is_mount_lost_error(e):
                         self._signal_output_lost(e)
-                    final_error = e
-                except Exception as e:
                     final_error = e
                     last_error = str(e)
                     last_source = adapter.name
@@ -447,6 +515,32 @@ class DownloadEngine:
             # Rate-limited adapters already placed in rate_limited_adapters above — skip
             # the regular exclude logic so they don't also land in excluded_adapters.
             if isinstance(final_error, RateLimitedError):
+                continue
+
+            # Truncated downloads: the adapter found the track but the stream ended early
+            # (network blip, proxy cut it off). Don't permanently exclude — instead:
+            # 1. Mark the adapter as globally rate-limited in the resolver (120s cooldown)
+            #    so ALL parallel workers immediately start preferring other adapters.
+            #    Without this, workers running in parallel each independently queue on the
+            #    broken adapter, discovering the truncation one at a time.
+            # 2. Defer the adapter to the end of this track's queue (rate_limited_adapters)
+            #    so Amazon/DAB get a fair shot first; the adapter gets one last retry if
+            #    nothing else works (useful when the adapter is the only one that can find
+            #    the track, e.g. featured-artist titles that defeat DAB/Amazon search).
+            if final_error is not None and "appears truncated" in str(final_error):
+                # Signal all parallel workers to stop queuing on this adapter.
+                self.resolver._mark_rate_limited(adapter.name, cooldown_seconds=120)
+
+                if adapter.name in rate_limited_retried:
+                    # Already had its second chance and still truncated — give up.
+                    excluded_adapters.add(adapter.name)
+                    logger.info(f"  [NEXT]  {adapter.name} truncated on second attempt — no more retries")
+                else:
+                    logger.info(
+                        f"  [TRUNC]  {adapter.name} truncated — trying other sources first, "
+                        f"will retry {adapter.name} as last resort if nothing else works"
+                    )
+                    rate_limited_adapters.add(adapter.name)
                 continue
 
             should_exclude = True

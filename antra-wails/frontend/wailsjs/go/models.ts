@@ -9,6 +9,10 @@ export namespace main {
 	    sources_enabled?: string[];
 	    first_run_complete: boolean;
 	    output_format?: string;
+	    library_mode?: string;
+	    prefer_explicit?: boolean;
+	    folder_structure?: string;
+	    filename_format?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -24,11 +28,17 @@ export namespace main {
 	        this.sources_enabled = source["sources_enabled"];
 	        this.first_run_complete = source["first_run_complete"];
 	        this.output_format = source["output_format"];
+	        this.library_mode = source["library_mode"];
+	        this.prefer_explicit = source["prefer_explicit"];
+	        this.folder_structure = source["folder_structure"];
+	        this.filename_format = source["filename_format"];
 	    }
 	}
 	export class HistoryItem {
 	    date: string;
 	    url: string;
+	    title?: string;
+	    artwork_url?: string;
 	    total: number;
 	    downloaded: number;
 	    failed: number;
@@ -44,6 +54,8 @@ export namespace main {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.date = source["date"];
 	        this.url = source["url"];
+	        this.title = source["title"];
+	        this.artwork_url = source["artwork_url"];
 	        this.total = source["total"];
 	        this.downloaded = source["downloaded"];
 	        this.failed = source["failed"];

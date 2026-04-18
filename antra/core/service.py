@@ -26,7 +26,7 @@ from antra.utils.organizer import LibraryOrganizer
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PREFERENCE_CHOICES = ("auto", "hifi", "amazon", "soulseek", "jiosaavn")
+SOURCE_PREFERENCE_CHOICES = ("auto", "hifi", "amazon", "dab", "soulseek", "jiosaavn")
 OUTPUT_FORMAT_CHOICES = ("source", "flac", "m4a", "aac", "mp3")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
 SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
@@ -191,6 +191,16 @@ class AntraService:
         except Exception as e:
             logger.warning(f"HiFi adapter failed to initialize: {e}")
 
+        # Dab Music (free FLAC via Qobuz API wrapper)
+        try:
+            from antra.sources.dab import DabAdapter
+            dab = DabAdapter()
+            if dab.is_available():
+                adapters.append(dab)
+                logger.info("[OK] Dab adapter enabled (free FLAC via Qobuz proxy)")
+        except Exception as e:
+            logger.warning(f"Dab adapter failed to initialize: {e}")
+
         # Soulseek via slskd
         soulseek_base_url = (getattr(cfg, "soulseek_base_url", "") or "").strip()
         soulseek_api_key = getattr(cfg, "soulseek_api_key", "") or ""
@@ -305,6 +315,13 @@ class AntraService:
                     return "soulseek" in enabled_groups
                 return "hifi" in enabled_groups
             adapters = [a for a in adapters if _in_enabled_group(a)]
+            if adapters:
+                logger.info(f"[Sources] Active after group filter: {', '.join(a.name for a in adapters)}")
+            elif "soulseek" in enabled_groups and "hifi" not in enabled_groups:
+                logger.warning(
+                    "[Sources] Soulseek-only mode: no adapters available. "
+                    "Ensure your Soulseek username and password are set in Settings and slskd is reachable."
+                )
 
         source_preference = getattr(cfg, "source_preference", None)
         filtered = self._filter_adapters_by_source_preference(adapters, source_preference)
@@ -318,6 +335,54 @@ class AntraService:
                 return adapters
         return filtered
 
+    @staticmethod
+    def _enrich_isrcs(tracks: list[TrackMetadata]) -> None:
+        """Bulk-enrich ISRCs and release dates for Spotify-sourced tracks missing them.
+
+        Uses the Spotify v1 /tracks endpoint with an anonymous TOTP token (same
+        mechanism as the main Spotify client).  Only fires when at least one track
+        has a spotify_id but no isrc — skipped entirely otherwise so there is zero
+        overhead for fully-enriched track lists (e.g. tracks from authenticated
+        Spotify or Apple Music catalog API).
+        """
+        missing = [t for t in tracks if t.spotify_id and not t.isrc]
+        if not missing:
+            return
+        try:
+            from antra.core.isrc_enricher import ISRCEnricher
+            logger.info(
+                f"[Service] Enriching ISRCs for {len(missing)}/{len(tracks)} tracks "
+                "via Spotify API"
+            )
+            ISRCEnricher().enrich_tracks(tracks)
+        except Exception as e:
+            logger.warning(f"[Service] ISRC enrichment failed (non-fatal): {e}")
+
+    @staticmethod
+    def _stamp_disc_totals(tracks: list[TrackMetadata]) -> list[TrackMetadata]:
+        """Compute total_discs per album and stamp it on each track.
+
+        Groups tracks by album_id (or album+artist as fallback), finds the max
+        disc_number in each group, and writes it back to every track in that group.
+        This lets the organizer use Plex-compatible disc-prefixed filenames (101, 201)
+        without needing per-track album-level context at write time.
+        """
+        from collections import defaultdict
+        album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
+        for track in tracks:
+            key = track.album_id or f"{track.album}||{track.primary_artist}"
+            album_groups[key].append(track)
+
+        for group in album_groups.values():
+            disc_numbers = [t.disc_number for t in group if t.disc_number is not None]
+            if not disc_numbers:
+                continue
+            total = max(disc_numbers)
+            for track in group:
+                track.total_discs = total
+
+        return tracks
+
     def fetch_playlist_tracks(
         self,
         playlist: str,
@@ -328,14 +393,14 @@ class AntraService:
 
         # Handle Apple Music URLs
         if "music.apple.com" in playlist:
-            return self._fetch_apple_tracks(playlist, cfg)
+            tracks = self._fetch_apple_tracks(playlist, cfg)
 
         # Handle SoundCloud URLs
-        if "soundcloud.com" in playlist:
-            return self._fetch_soundcloud_tracks(playlist, cfg)
+        elif "soundcloud.com" in playlist:
+            tracks = self._fetch_soundcloud_tracks(playlist, cfg)
 
         # Handle Amazon Music URLs
-        if "music.amazon." in playlist:
+        elif "music.amazon." in playlist:
             tracks = self._fetch_amazon_music_tracks(playlist, cfg)
             if getattr(cfg, "enrich_album_data", False):
                 try:
@@ -344,28 +409,30 @@ class AntraService:
                     tracks = spotify.batch_enrich_album_data(tracks)
                 except Exception as e:
                     logger.debug(f"[Service] Spotify hydration failed: {e}")
-            return tracks
 
-        # Try authenticated Spotify client first.
-        # On auth failure → fall back to:
-        #   1. SpotFetch proxy (returns ISRC + full metadata)
-        #   2. Direct Spotify public-page scraping (no 3rd-party dependency)
-        spotify = self._make_spotify_client(cfg)
-        try:
-            tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
-            return tracks
-        except SpotifyResourceError as e:
-            logger.debug(
-                f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
-            )
-            return self._fetch_spotfetch_tracks(playlist, cfg, spotify)
-        except Exception as e:
-            if _is_auth_error(e):
+        else:
+            # Try authenticated Spotify client first.
+            # On auth failure → fall back to:
+            #   1. SpotFetch proxy (returns ISRC + full metadata)
+            #   2. Direct Spotify public-page scraping (no 3rd-party dependency)
+            spotify = self._make_spotify_client(cfg)
+            try:
+                tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
+            except SpotifyResourceError as e:
                 logger.debug(
-                    "[Spotify] Auth not configured — trying SpotFetch proxy"
+                    f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
                 )
-                return self._fetch_spotfetch_tracks(playlist, cfg, spotify)
-            raise
+                tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
+            except Exception as e:
+                if _is_auth_error(e):
+                    logger.debug(
+                        "[Spotify] Auth not configured — trying SpotFetch proxy"
+                    )
+                    tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
+                else:
+                    raise
+
+        return self._stamp_disc_totals(tracks)
 
     def _fetch_apple_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:
@@ -718,9 +785,16 @@ class AntraService:
             resolver_adapters,
             preferred_output_format=cfg.output_format,
             preserve_input_order=preserve_input_order,
+            prefer_explicit=getattr(cfg, "prefer_explicit", True),
         )
         if organizer is None:
-            organizer = LibraryOrganizer(cfg.output_dir)
+            full_albums = getattr(cfg, "library_mode", "smart_dedup") == "full_albums"
+            organizer = LibraryOrganizer(
+                cfg.output_dir,
+                full_albums=full_albums,
+                folder_structure=getattr(cfg, "folder_structure", "standard"),
+                filename_format=getattr(cfg, "filename_format", "default"),
+            )
 
         lyrics_fetcher = None
         if cfg.fetch_lyrics:

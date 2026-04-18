@@ -74,12 +74,12 @@ Output is structured the way every media server expects:
 ~/Music/
 └── Artist Name/
     └── Album Name (Year)/
-        ├── 01 - Track Title.flac
-        ├── 02 - Track Title.flac
+        ├── 101 - Track Title.flac
+        ├── 102 - Track Title.flac
         └── cover.jpg
 ```
 
-Multi-disc albums use prefixed numbering (`101`, `201`, ...) so Plex, Navidrome, and Jellyfin can distinguish discs without manual intervention.
+All tracks use disc-prefixed numbering (`101`, `102`, ..., `201`, `202`, ...) so Plex, Navidrome, and Jellyfin always know which disc a track belongs to — single-disc albums use the `1xx` prefix, multi-disc albums use `1xx` / `2xx` / etc.
 
 ### Folder Structure Options
 
@@ -92,10 +92,10 @@ Multi-disc albums use prefixed numbering (`101`, `201`, ...) so Plex, Navidrome,
 
 | Mode | Example |
 |---|---|
-| **Default** | `01 - Track Title.flac` |
+| **Default** | `101 - Track Title.flac` |
 | **Title only** | `Track Title.flac` |
-| **Artist - Title** | `01 - Artist - Track Title.flac` |
-| **Title - Artist** | `01 - Track Title - Artist.flac` |
+| **Artist - Title** | `101 - Artist - Track Title.flac` |
+| **Title - Artist** | `101 - Track Title - Artist.flac` |
 
 Both options are set during first-run setup and adjustable later in Settings.
 

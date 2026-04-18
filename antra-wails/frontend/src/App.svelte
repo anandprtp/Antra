@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { GetConfig, SaveConfig, PickDirectory, StartDownload, CancelDownload, GetHistory, AddHistory, ClearHistory } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
 
@@ -13,7 +13,11 @@
     soulseek_seed_after_download: false,
     sources_enabled: [],
     first_run_complete: false,
-    output_format: 'lossless'
+    output_format: 'lossless',
+    library_mode: 'smart_dedup',
+    prefer_explicit: true,
+    folder_structure: 'standard',
+    filename_format: 'default'
   };
 
   // Derived: true if a source group is enabled (or sources_enabled is empty = all on)
@@ -22,13 +26,17 @@
   $: soulseekSourceEnabled = sourcesAll || config.sources_enabled.includes('soulseek');
 
   function toggleSourceGroup(group: string, checked: boolean) {
-    let current = config.sources_enabled ? [...config.sources_enabled] : [];
+    // sources_enabled = [] means "all on" — materialize explicit list before mutating,
+    // otherwise filtering an empty array always returns [] (no change).
+    let current = (config.sources_enabled && config.sources_enabled.length > 0)
+      ? [...config.sources_enabled]
+      : ['hifi', 'soulseek'];
     if (checked) {
       if (!current.includes(group)) current.push(group);
     } else {
       current = current.filter(g => g !== group);
     }
-    // If both are selected, normalize to empty (= all)
+    // If both are selected, normalize back to empty (= all)
     const both = current.includes('hifi') && current.includes('soulseek');
     config.sources_enabled = both ? [] : current;
   }
@@ -37,9 +45,67 @@
   let setupMode = false;
   let showHistory = false;
   let showSettings = false;
+  let slskdWebUIInfo: {url: string, username: string, password: string} | null = null;
   let historyItems: any[] = [];
   let inputUrl = '';
   let isDownloading = false;
+
+  // ── Source health check ─────────────────────────────────────────────────────
+  interface EndpointStatus { url: string; alive: boolean; latency_ms: number; }
+  interface SourceHealth { source: string; total: number; live: number; endpoints: EndpointStatus[]; }
+  let healthCache: Record<string, SourceHealth> = {};
+  let healthPopoverSource = '';
+  let healthLoading = false;
+  let showHealthPopover = false;
+
+  const healthSources = [
+    { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', border: '#1DB9DE', text: '#1DB9DE' },
+    { key: 'amazon', label: 'Amazon',  abbr: 'a', bg: '#1a1200', border: '#FF9900', text: '#FF9900' },
+    { key: 'dab',    label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', border: '#7B5EA7', text: '#7B5EA7' },
+  ];
+
+  async function checkHealth(src: string) {
+    healthPopoverSource = src;
+    healthLoading = true;
+    showHealthPopover = true;
+    try {
+      const raw = await CheckSourceHealth(src);
+      healthCache[src] = JSON.parse(raw);
+      healthCache = { ...healthCache };
+    } catch (e) { console.error(e); }
+    finally { healthLoading = false; }
+  }
+
+  // ── Tracklist scroll state ─────────────────────────────────────────────────
+  let tracklistEl: HTMLDivElement;
+  let tracklistAtBottom = true;
+  let tracklistHasScrolled = false;
+
+  function updateTracklistScroll() {
+    if (!tracklistEl) return;
+    const d = tracklistEl.scrollHeight - tracklistEl.scrollTop - tracklistEl.clientHeight;
+    tracklistAtBottom = d <= 40;
+    tracklistHasScrolled = true;
+  }
+
+  function scrollTracklistToBottom() {
+    if (tracklistEl) { tracklistEl.scrollTop = tracklistEl.scrollHeight; tracklistAtBottom = true; }
+  }
+
+  // ── Multi-URL separators ────────────────────────────────────────────────────
+  let separatorMeta: Record<string, { title: string; artwork: string }> = {};
+
+  // ── Sponsor toast ────────────────────────────────────────────────────────────
+  let showSponsorToast = false;
+  let sponsorToastLeaving = false;
+  let kofiTooltipVisible = false;
+  let sponsorToastTimer: ReturnType<typeof setTimeout>;
+
+  function dismissSponsorToast() {
+    sponsorToastLeaving = true;
+    clearTimeout(sponsorToastTimer);
+    setTimeout(() => { showSponsorToast = false; sponsorToastLeaving = false; }, 450);
+  }
 
   // Logs terminal
   let logs: {id: number, type: string, text: string, isRawHtml?: boolean}[] = [];
@@ -47,17 +113,29 @@
   let terminalContainer: HTMLDivElement;
   let terminalEnd: HTMLElement;
   let shouldAutoScroll = true;
+  let logAtBottom = true;
+  let showLog = false;
+  let trackOrder: string[] = [];
+  let playlistTitle = '';
+  let playlistArtwork = '';
+  let playlistArtists = '';
+  let playlistReleaseDate = '';
+  let playlistContentType = '';
+  let playlistQualityBadge = '';
+  let playlistTotalDurationMs = 0;
+  let playlistTotalTracks = 0;
 
   // Track progress mapping
   let activeTracks: Record<string, {
     progress?: number,
     text: string,
     error?: string,
-    mode: 'status' | 'progress'
+    mode: 'status' | 'progress',
+    status: 'resolving' | 'downloading' | 'done' | 'failed' | 'skipped',
   }> = {};
 
   function updateActiveTrack(trackName: string, patch: Partial<typeof activeTracks[string]>) {
-    const existing = activeTracks[trackName] || { mode: 'status' as const, text: 'Resolving source...' };
+    const existing = activeTracks[trackName] || { mode: 'status' as const, text: 'Resolving source...', status: 'resolving' as const };
     activeTracks[trackName] = { ...existing, ...patch };
     activeTracks = { ...activeTracks };
   }
@@ -85,6 +163,18 @@
       if (typeof config.soulseek_seed_after_download !== 'boolean') {
         config.soulseek_seed_after_download = false;
       }
+      if (!config.library_mode) {
+        config.library_mode = 'smart_dedup';
+      }
+      if (config.prefer_explicit === undefined || config.prefer_explicit === null) {
+        config.prefer_explicit = true;
+      }
+      if (!config.folder_structure) {
+        config.folder_structure = 'standard';
+      }
+      if (!config.filename_format) {
+        config.filename_format = 'default';
+      }
     } catch (e) {
       console.error('Failed to load config', e);
       setupMode = true;
@@ -94,6 +184,14 @@
 
     // Listen to backend events
     EventsOn("backend-event", handleEvent);
+
+    // Show sponsor toast after UI settles (skip during first-run setup)
+    if (!setupMode) {
+      setTimeout(() => {
+        showSponsorToast = true;
+        sponsorToastTimer = setTimeout(() => dismissSponsorToast(), 9000);
+      }, 1200);
+    }
   });
 
   function updateAutoScrollState() {
@@ -101,6 +199,7 @@
     const distanceFromBottom =
       terminalContainer.scrollHeight - terminalContainer.scrollTop - terminalContainer.clientHeight;
     shouldAutoScroll = distanceFromBottom <= 80;
+    logAtBottom = distanceFromBottom <= 40;
   }
 
   function scrollToBottom(force: boolean = false) {
@@ -117,6 +216,15 @@
   function addLog(type: string, text: string, isRawHtml: boolean = false) {
     logs = [...logs, { id: logId++, type, text, isRawHtml }];
     scrollToBottom();
+  }
+
+  function formatDuration(ms: number): string {
+    const totalSec = Math.floor(ms / 1000);
+    const hours = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    if (hours > 0) return `${hours} hr ${mins} min`;
+    if (mins > 0) return `${mins} min`;
+    return `${totalSec} sec`;
   }
 
   function formatAsciiRundown(summary: any): string {
@@ -147,28 +255,49 @@
   }
 
   function handleEvent(payload: any) {
+    if (payload.type === 'playlist_loaded') {
+      playlistTitle = payload.title || '';
+      playlistArtwork = payload.artwork_url || '';
+      playlistArtists = payload.artists_string || '';
+      playlistReleaseDate = payload.release_date || '';
+      playlistContentType = payload.content_type || '';
+      playlistQualityBadge = payload.quality_badge || '';
+      const trkList: any[] = payload.tracks || [];
+      playlistTotalTracks = trkList.length;
+      playlistTotalDurationMs = trkList.reduce((sum: number, t: any) => sum + (t.duration_ms || 0), 0);
+      // Insert a visual separator when a second+ URL's tracks arrive
+      if (trackOrder.length > 0) {
+        const sepKey = `__SEP__${Date.now()}`;
+        separatorMeta[sepKey] = { title: payload.title || '', artwork: payload.artwork_url || '' };
+        separatorMeta = { ...separatorMeta };
+        trackOrder = [...trackOrder, sepKey];
+      }
+
+      // Pre-populate the full tracklist in waiting state before downloads begin
+      const incoming: string[] = trkList.map((t: any) => `${t.artist} - ${t.title}`);
+      for (const name of incoming) {
+        if (!trackOrder.includes(name)) {
+          trackOrder = [...trackOrder, name];
+        }
+        if (!activeTracks[name]) {
+          activeTracks[name] = { mode: 'status', text: 'Waiting...', status: 'resolving' };
+        }
+      }
+      activeTracks = { ...activeTracks };
+      return;
+    }
+
     if (payload.type === 'process_ended') {
       isDownloading = false;
       Object.keys(activeTracks).forEach(clearTrackInterval);
       if (payload.status === 'cancelled') {
+        trackOrder = [];
         activeTracks = {};
         addLog('warning', '■ Library sync stopped');
       } else if (payload.status === 'failed') {
-        activeTracks = {};
         addLog('error', '✖ Library sync stopped with errors');
       } else {
-        for (const trackName of Object.keys(activeTracks)) {
-          updateActiveTrack(trackName, {
-            mode: 'progress',
-            progress: 100,
-            text: '✓ Added to library',
-            error: undefined,
-          });
-        }
         addLog('success', '✔ Library updated successfully');
-        setTimeout(() => {
-          activeTracks = {};
-        }, 900);
       }
       return;
     }
@@ -190,21 +319,24 @@
       const trackName = data.track ? `${data.artist} - ${data.track}` : 'Unknown Track';
 
       if (name === 'track_started') {
+        if (!trackOrder.includes(trackName)) {
+          trackOrder = [...trackOrder, trackName];
+        }
         updateActiveTrack(trackName, {
           mode: 'status',
           progress: undefined,
-          text: 'Resolving best source...'
+          text: 'Resolving best source...',
+          status: 'resolving',
         });
-        scrollToBottom();
 
       } else if (name === 'track_resolved') {
         clearTrackInterval(trackName);
         updateActiveTrack(trackName, {
           mode: 'status',
           progress: undefined,
-          text: `Accepted via ${data.source || 'auto'}${data.quality_label ? ` • ${data.quality_label}` : ''}`
+          text: `Accepted via ${data.source || 'auto'}${data.quality_label ? ` • ${data.quality_label}` : ''}`,
+          status: 'resolving',
         });
-        scrollToBottom();
 
       } else if (name === 'track_download_attempt') {
         const source = String(data.source || 'auto');
@@ -215,9 +347,9 @@
           updateActiveTrack(trackName, {
             mode: 'status',
             progress: undefined,
-            text: 'Waiting for Soulseek transfer...'
+            text: 'Waiting for Soulseek transfer...',
+            status: 'downloading',
           });
-          scrollToBottom();
           return;
         }
 
@@ -225,7 +357,8 @@
         updateActiveTrack(trackName, {
           mode: 'progress',
           progress: 8,
-          text: `Downloading${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`
+          text: `Downloading${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`,
+          status: 'downloading',
         });
 
         const intervalId = setInterval(() => {
@@ -240,47 +373,33 @@
 
         (activeTracks[trackName] as any)._intervalId = intervalId;
         activeTracks = { ...activeTracks };
-        scrollToBottom();
 
       } else if (name === 'track_completed') {
         addLog('success', `[✓] Added to library: ${trackName}`);
-        if (activeTracks[trackName]) {
-          clearTrackInterval(trackName);
-          updateActiveTrack(trackName, {
-            mode: 'progress',
-            progress: 100,
-            text: '✓ Added to library',
-            error: undefined
-          });
-
-          setTimeout(() => {
-            delete activeTracks[trackName];
-            activeTracks = { ...activeTracks };
-          }, 600);
-        }
+        clearTrackInterval(trackName);
+        updateActiveTrack(trackName, {
+          mode: 'progress',
+          progress: 100,
+          text: '✓ Added to library',
+          error: undefined,
+          status: 'done',
+        });
       } else if (name === 'track_failed') {
-        if (activeTracks[trackName]) {
-          clearTrackInterval(trackName);
-          updateActiveTrack(trackName, {
-            mode: 'status',
-            progress: undefined,
-            error: data.error || 'Failed'
-          });
-
-          setTimeout(() => {
-            delete activeTracks[trackName];
-            activeTracks = { ...activeTracks };
-            addLog('error', `[FAIL] ${trackName} - ${data.error}`);
-          }, 2000);
-        } else {
-          addLog('error', `[FAIL] ${trackName} - ${data.error}`);
-        }
+        addLog('error', `[FAIL] ${trackName} - ${data.error}`);
+        clearTrackInterval(trackName);
+        updateActiveTrack(trackName, {
+          mode: 'status',
+          progress: undefined,
+          error: data.error || 'Failed',
+          status: 'failed',
+        });
       } else if (name === 'track_skipped') {
-        if (activeTracks[trackName]) {
-          delete activeTracks[trackName];
-          activeTracks = { ...activeTracks };
-        }
         addLog('warning', `[—] Already in library: ${trackName}`);
+        updateActiveTrack(trackName, {
+          mode: 'status',
+          text: 'Already in library',
+          status: 'skipped',
+        });
       } else if (name === 'playlist_started') {
         addLog('info', `Creating playlist structure and syncing tracks: ${data.message}`);
       }
@@ -619,8 +738,18 @@
     if (otherUrls.length > 0) {
       isDownloading = true;
       logs = [];
+      trackOrder = [];
+      playlistTitle = '';
+      playlistArtwork = '';
+      playlistArtists = '';
+      playlistReleaseDate = '';
+      playlistContentType = '';
+      playlistQualityBadge = '';
+      playlistTotalDurationMs = 0;
+      playlistTotalTracks = 0;
       Object.keys(activeTracks).forEach(clearTrackInterval);
       activeTracks = {};
+      separatorMeta = {};
       shouldAutoScroll = true;
       addLog('info', `━━━ Building your music library ━━━`);
       addLog('info', `Searching best available source (lossless prioritized)...`);
@@ -787,6 +916,48 @@
         </div>
       </div>
       <div class="field" style="margin-top: 20px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 8px;">Folder Structure</p>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="standard" bind:group={config.folder_structure} style="margin-top: 2px;" />
+            <div>
+              Standard <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist / Album / files</span>
+              <p style="font-size: 11px; color: #555; margin: 3px 0 0;">Recommended for Navidrome, Jellyfin, and Plex.</p>
+            </div>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="flat" bind:group={config.folder_structure} style="margin-top: 2px;" />
+            <div>
+              Flat <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Album / files</span>
+              <p style="font-size: 11px; color: #555; margin: 3px 0 0;">No artist folder. Good for manual organisation.</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top: 20px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 8px;">Filename Format</p>
+        <div style="display: flex; flex-direction: column; gap: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="default" bind:group={config.filename_format} />
+            <span>Default <span style="font-size: 11px; opacity: 0.6;">01 - Title.flac</span></span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_only" bind:group={config.filename_format} />
+            <span>Title only <span style="font-size: 11px; opacity: 0.6;">Title.flac</span></span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="artist_title" bind:group={config.filename_format} />
+            <span>Artist – Title <span style="font-size: 11px; opacity: 0.6;">Artist - Title.flac</span></span>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_artist" bind:group={config.filename_format} />
+            <span>Title – Artist <span style="font-size: 11px; opacity: 0.6;">Title - Artist.flac</span></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top: 20px;">
         <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
           <input type="checkbox" bind:checked={config.soulseek_enabled} style="margin-top: 2px;" />
           <div>
@@ -822,17 +993,29 @@
         <div style="display: flex; gap: 8px; align-items: center;">
           <button on:click={openHistory} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🕒 Library History</button>
           <button on:click={() => { showAnalyzer = true; }} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🔬 Analyzer</button>
-          <button on:click={() => showSettings = true} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">⚙️ Settings</button>
+          <button on:click={async () => { showSettings = true; try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; } }} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">⚙️ Settings</button>
           <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
-          <button title="Support on Ko-fi" on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+          <div class="kofi-wrap" on:mouseenter={() => kofiTooltipVisible = true} on:mouseleave={() => kofiTooltipVisible = false}>
+            <button on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/>
+              </svg>
+            </button>
+            {#if kofiTooltipVisible}
+              <div class="kofi-tooltip">
+                <p class="kofi-tooltip-title">Support Antra</p>
+                <p class="kofi-tooltip-body">Real effort goes into maintaining Antra and keeping it free. If it saves you time, consider supporting continued development.</p>
+                <button class="kofi-tooltip-btn" on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
+                  Support on Ko-fi
+                </button>
+              </div>
+            {/if}
+          </div>
+          <button title="Join our Telegram community" on:click={() => BrowserOpenURL('https://t.me/antraaverse')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/>
-            </svg>
-          </button>
-          <button title="Join our Reddit community" on:click={() => BrowserOpenURL('https://www.reddit.com/r/antraverse/')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-              <circle cx="12" cy="12" r="12" fill="#FF4500"/>
-              <path d="M20 12c0-1.1-.9-2-2-2-.5 0-1 .2-1.4.5C15.3 9.6 13.8 9 12 9l.7-3.3 2.3.5c0 .6.5 1 1 1s1-.4 1-1-.4-1-1-1c-.4 0-.8.3-.9.7l-2.6-.5c-.1 0-.2.1-.3.2L11.4 9c-1.8.1-3.3.7-4.5 1.6C6.5 10.2 6 10 5.5 10c-1.1 0-2 .9-2 2 0 .8.5 1.5 1.1 1.8-.1.3-.1.6-.1.9 0 2.8 3.1 5.1 7 5.1s7-2.3 7-5.1c0-.3 0-.6-.1-.9.5-.3 1-.9 1-1.8zm-11 1c0-.6.4-1 1-1s1 .4 1 1-.4 1-1 1-1-.4-1-1zm5.8 2.8c-.7.7-1.9 1-2.8 1s-2.1-.3-2.8-1c-.2-.2-.2-.4 0-.6.2-.2.4-.2.6 0 .5.5 1.4.8 2.2.8s1.7-.3 2.2-.8c.2-.2.4-.2.6 0 .2.2.2.4 0 .6zm-.3-1.8c-.6 0-1-.4-1-1s.4-1 1-1 1 .4 1 1-.4 1-1 1z" fill="white"/>
+              <circle cx="12" cy="12" r="12" fill="#26A5E4"/>
+              <path d="M17.93 6.56L5.54 11.17c-.83.33-.82.8-.15 1l3.17.99 7.34-4.63c.35-.21.66-.1.4.14L9.4 14.1l-.22 3.37c.32 0 .46-.15.63-.3l1.52-1.48 3.16 2.33c.58.32 1 .16 1.14-.54l2.07-9.73c.2-.8-.3-1.16-.77-.95z" fill="white"/>
             </svg>
           </button>
         </div>
@@ -884,38 +1067,168 @@
           {/if}
         </div>
       {/if}
+
+      <!-- Source health chips -->
+      <div class="source-health-bar">
+        {#each healthSources as src}
+          {@const cached = healthCache[src.key]}
+          {@const isDown = cached && cached.live === 0}
+          <button
+            class="health-chip"
+            style="background:{src.bg}; border-color:{cached ? (isDown ? '#553333' : src.border) : 'rgba(255,255,255,0.1)'};"
+            on:click={() => checkHealth(src.key)}
+            title="{src.label}{cached ? ` — ${cached.live}/${cached.total} live` : ' — click to check'}"
+          >
+            {#if src.key === 'hifi'}
+              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1};" />
+            {:else if src.key === 'amazon'}
+              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1}; border-radius: 4px;" />
+            {:else if src.key === 'dab'}
+              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1};" />
+            {/if}
+            {#if cached}
+              <span class="health-chip-count" style="color:{isDown ? '#f87171' : src.text}">{cached.live}/{cached.total}</span>
+            {:else}
+              <span class="health-chip-idle">?</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
     </div>
 
-    <div class="terminal" bind:this={terminalContainer} on:scroll={updateAutoScrollState}>
+    <!-- Playlist header: cover art + rich metadata, shown once playlist_loaded fires -->
+    {#if playlistTitle || playlistArtwork}
+      <div class="playlist-header">
+        {#if playlistArtwork}
+          <img src={playlistArtwork} alt="" class="playlist-cover" />
+        {/if}
+        <div class="playlist-meta">
+          {#if playlistContentType}
+            <span class="playlist-type">{playlistContentType}</span>
+          {/if}
+          <span class="playlist-title">{playlistTitle || '—'}</span>
+          {#if playlistArtists}
+            <span class="playlist-artists">{playlistArtists}</span>
+          {/if}
+          <div class="playlist-info-line">
+            {#if playlistTotalTracks > 0}
+              <span>{playlistTotalTracks} song{playlistTotalTracks !== 1 ? 's' : ''}</span>
+            {/if}
+            {#if playlistTotalDurationMs > 0}
+              <span class="playlist-info-sep">·</span>
+              <span>{formatDuration(playlistTotalDurationMs)}</span>
+            {/if}
+            {#if playlistReleaseDate}
+              <span class="playlist-info-sep">·</span>
+              <span>{playlistReleaseDate}</span>
+            {/if}
+          </div>
+          {#if playlistQualityBadge}
+            <span class="playlist-quality-badge">{playlistQualityBadge}</span>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Tracklist: shows all tracks that have started, persists until next download -->
+    <div class="tracklist-wrapper">
+      <div class="tracklist" bind:this={tracklistEl} on:scroll={updateTracklistScroll}>
+        {#if trackOrder.length === 0}
+          <div class="tracklist-empty">
+            <p>Paste a URL above and press <strong>Add to Library</strong></p>
+          </div>
+        {:else}
+          {#each trackOrder as trackName (trackName)}
+            {#if trackName.startsWith('__SEP__')}
+              {@const sep = separatorMeta[trackName]}
+              <div class="tracklist-album-sep">
+                {#if sep?.artwork}
+                  <img src={sep.artwork} alt="" class="sep-artwork" />
+                {/if}
+                <span class="sep-title">{sep?.title || 'Next album'}</span>
+              </div>
+            {:else}
+              {@const state = activeTracks[trackName]}
+              {#if state}
+                <div class="track-row"
+                  class:track-done={state.status === 'done'}
+                  class:track-failed={state.status === 'failed'}
+                  class:track-skipped={state.status === 'skipped'}>
+                  <div class="track-row-main">
+                    <span class="track-row-name">{trackName}</span>
+                    <span class="track-row-status">{state.error || state.text}</span>
+                  </div>
+                  {#if state.mode === 'progress'}
+                    <div class="progress-bar-bg" style="margin-top:6px;">
+                      <div class="progress-bar-fg"
+                           class:error={!!state.error}
+                           style="width: {state.progress ?? 0}%">
+                      </div>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            {/if}
+          {/each}
+        {/if}
+      </div>
+      {#if !tracklistAtBottom && tracklistHasScrolled && trackOrder.length > 0}
+        <button class="tracklist-jump-btn" on:click={scrollTracklistToBottom} title="Jump to bottom">↓</button>
+      {/if}
+    </div>
+
+    <!-- Floating log toggle button -->
+    <button class="log-toggle" on:click={() => showLog = !showLog} title="Activity Log">
+      📋 {showLog ? 'Hide Log' : 'Log'}
+    </button>
+  </main>
+
+  <!-- Slide-in log panel (outside main so it overlays everything) -->
+  {#if showLog}
+  <div class="log-panel">
+    <div class="log-panel-head">
+      <span>Activity Log</span>
+      <div style="display:flex; gap:6px; align-items:center;">
+        {#if !logAtBottom}
+          <button class="log-jump-btn" on:click={() => scrollToBottom(true)} title="Jump to bottom">↓</button>
+        {/if}
+        <button on:click={() => showLog = false} style="padding: 2px 8px; font-size: 12px;">✕</button>
+      </div>
+    </div>
+    <div class="log-panel-body" bind:this={terminalContainer} on:scroll={updateAutoScrollState}>
       {#each logs as log (log.id)}
         <div class="log-line {log.type}">
-           {#if log.isRawHtml}
-             {@html log.text}
-           {:else}
-             <span class="prefix">❯</span> {log.text}
-           {/if}
-        </div>
-      {/each}
-
-      {#each Object.entries(activeTracks) as [track, state] (track)}
-        <div class="active-track">
-          <div class="track-header">
-            <span>{track}</span>
-            <span class="status">{state.error ? state.error : state.text}</span>
-          </div>
-          {#if state.mode === 'progress'}
-            <div class="progress-bar-bg">
-              <div class="progress-bar-fg"
-                   class:error={!!state.error}
-                   style="width: {state.progress ?? 0}%">
-              </div>
-            </div>
+          {#if log.isRawHtml}
+            {@html log.text}
+          {:else}
+            <span class="prefix">❯</span> {log.text}
           {/if}
         </div>
       {/each}
       <div bind:this={terminalEnd}></div>
     </div>
-  </main>
+  </div>
+  {/if}
+{/if}
+
+<!-- ── Sponsor toast ────────────────────────────────────────────────────────── -->
+{#if showSponsorToast}
+  <div class="sponsor-toast" class:leaving={sponsorToastLeaving}
+    on:mouseenter={() => clearTimeout(sponsorToastTimer)}
+    on:mouseleave={() => { sponsorToastTimer = setTimeout(() => dismissSponsorToast(), 3000); }}
+  >
+    <div class="sponsor-toast-icon">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
+    </div>
+    <div class="sponsor-toast-body">
+      <p class="sponsor-toast-title">Support Antra</p>
+      <p class="sponsor-toast-text">Real effort goes into maintaining Antra and keeping it free. If it saves you time, consider supporting continued development.</p>
+      <button class="sponsor-toast-btn" on:click={() => { BrowserOpenURL('https://ko-fi.com/antraverse'); dismissSponsorToast(); }}>
+        Support on Ko-fi
+      </button>
+    </div>
+    <button class="sponsor-toast-close" on:click={dismissSponsorToast} title="Dismiss">×</button>
+  </div>
 {/if}
 
 {#if showHistory}
@@ -931,33 +1244,43 @@
       {:else}
         {#each historyItems as item}
           <div class="history-card" style={item.error ? 'border-color: rgba(248,113,113,0.4); background: rgba(248,113,113,0.04);' : ''}>
-            <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
-              <div style="font-weight: 500; font-size: 14px; margin-bottom: 4px; word-break: break-all; flex: 1;">{item.url}</div>
+            <div style="display: flex; align-items: flex-start; gap: 10px;">
+              {#if item.artwork_url}
+                <img src={item.artwork_url} alt="" style="width:44px; height:44px; border-radius:5px; object-fit:cover; flex-shrink:0;" />
+              {:else}
+                <div style="width:44px; height:44px; border-radius:5px; background:rgba(255,255,255,0.06); flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:20px;">🎵</div>
+              {/if}
+              <div style="flex: 1; min-width: 0;">
+                <div style="font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 2px;">
+                  {item.title || item.url}
+                </div>
+                {#if item.title}
+                  <div style="font-size: 11px; opacity: 0.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 3px;">{item.url}</div>
+                {/if}
+                <div style="font-size: 11px; opacity: 0.55; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                  <span>{item.total || 0} tracks</span>
+                  {#if item.failed > 0}<span style="color:#f87171;">· {item.failed} failed</span>{/if}
+                  <span>· {new Date(item.date).toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'})}</span>
+                </div>
+              </div>
               <button
                 title="Re-queue this URL"
                 on:click={() => { inputUrl = (inputUrl ? inputUrl + '\n' : '') + item.url; showHistory = false; }}
-                style="flex-shrink: 0; padding: 2px 8px; font-size: 11px; border-color: rgba(0,255,204,0.3); color: var(--accent-color); background: rgba(0,255,204,0.05); margin-top: 1px;"
+                style="flex-shrink: 0; padding: 2px 8px; font-size: 11px; border-color: rgba(0,255,204,0.3); color: var(--accent-color); background: rgba(0,255,204,0.05);"
               >↩ Re-queue</button>
             </div>
-            <div style="font-size: 11px; opacity: 0.6; margin-bottom: 8px;">{new Date(item.date).toLocaleString()}</div>
             {#if item.error}
-              <div style="font-size: 11px; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 4px; padding: 4px 8px; margin-bottom: 8px; word-break: break-word;">
+              <div style="margin-top: 8px; font-size: 11px; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 4px; padding: 4px 8px; word-break: break-word;">
                 ✗ {item.error}
               </div>
             {/if}
-            <div style="display: flex; gap: 12px; font-size: 12px;">
-              <span style="color: #4ade80;">↓ {item.downloaded || 0}</span>
-              <span style="color: var(--error-color);">× {item.failed || 0}</span>
-              <span style="color: #facc15;">- {item.skipped || 0}</span>
-              <span style="color: #94a3b8;">Total: {item.total || 0}</span>
-            </div>
-            <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; display: flex; gap: 4px; flex-wrap: wrap;">
-              {#if item.sources}
+            {#if item.sources && Object.keys(item.sources).length > 0}
+              <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; display: flex; gap: 4px; flex-wrap: wrap;">
                 {#each Object.entries(item.sources) as [src, count]}
                   <span style="background: rgba(0,255,204,0.1); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(0,255,204,0.2)">{src}: {count}</span>
                 {/each}
-              {/if}
-            </div>
+              </div>
+            {/if}
           </div>
         {/each}
       {/if}
@@ -970,11 +1293,11 @@
 {/if}
 
 {#if showSettings}
-<div class="modal-overlay" on:click={() => showSettings = false}>
+<div class="modal-overlay" on:click={saveSettings}>
   <div class="modal-content" on:click|stopPropagation style="max-height: 88vh; display: flex; flex-direction: column;">
     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,204,0.2); padding-bottom: 16px; margin-bottom: 16px; flex-shrink: 0;">
       <h3 style="margin:0; color:var(--accent-color);">⚙️ Settings</h3>
-      <button on:click={() => showSettings = false} style="padding: 4px 8px; font-size: 12px;">Close</button>
+      <button on:click={saveSettings} style="padding: 4px 8px; font-size: 12px;">Save & Close</button>
     </div>
     <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
@@ -984,20 +1307,86 @@
           <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
             <input type="radio" value="auto" bind:group={config.output_format} />
             <div>
-              Auto <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Lossless → M4A → MP3)</span>
+              Auto <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Best available — lossless preferred, MP3 fallback)</span>
             </div>
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
             <input type="radio" value="lossless" bind:group={config.output_format} />
-            <div>Lossless <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(FLAC/ALAC exclusively)</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="m4a" bind:group={config.output_format} />
-            <div>M4A <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(AAC ~256kbps)</span></div>
+            <div>Lossless <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(FLAC only — skip if unavailable)</span></div>
           </label>
           <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
             <input type="radio" value="mp3" bind:group={config.output_format} />
-            <div>MP3 <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(~320kbps)</span></div>
+            <div>MP3 <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(~320kbps — uses JioSaavn/NetEase directly)</span></div>
+          </label>
+        </div>
+
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-top: 14px;">
+          <input type="checkbox" bind:checked={config.prefer_explicit} style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500; font-size: 13px;">Prefer explicit versions</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Avoid radio edits and clean versions. When a track is marked explicit, Antra keeps searching if the first result looks censored.</p>
+          </div>
+        </label>
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Library Mode</p>
+        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="smart_dedup" bind:group={config.library_mode} style="margin-top: 2px;" />
+            <div>
+              Smart Dedup <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Default — skip if already in library anywhere)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Saves storage. If a track was downloaded as part of a Best Of, it won't be re-downloaded for the studio album.</p>
+            </div>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="full_albums" bind:group={config.library_mode} style="margin-top: 2px;" />
+            <div>
+              Full Albums <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Each album complete — allows cross-album duplicates)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Every album folder is always complete. A track on both a studio album and a compilation will exist in both folders.</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Folder Structure</p>
+        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="standard" bind:group={config.folder_structure} style="margin-top: 2px;" />
+            <div>
+              Standard <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Artist / Album / files)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Default. Compatible with Navidrome, Jellyfin, and Plex.</p>
+            </div>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="flat" bind:group={config.folder_structure} style="margin-top: 2px;" />
+            <div>
+              Flat <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Album / files — no artist folder)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Simpler layout for manual organisation or single-artist libraries.</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Filename Format</p>
+        <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="default" bind:group={config.filename_format} />
+            <div>Default <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">01 - Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_only" bind:group={config.filename_format} />
+            <div>Title only <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="artist_title" bind:group={config.filename_format} />
+            <div>Artist – Title <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist - Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_artist" bind:group={config.filename_format} />
+            <div>Title – Artist <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title - Artist.flac</span></div>
           </label>
         </div>
       </div>
@@ -1020,8 +1409,8 @@
             on:change={(e) => toggleSourceGroup('hifi', e.currentTarget.checked)}
             style="margin-top: 2px;" />
           <div>
-            <span style="font-weight: 500;">Hi-Fi (Amazon, Tidal proxy)</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Free lossless FLAC via community proxies. No account required.</p>
+            <span style="font-weight: 500;">Hi-Fi (Amazon, HiFi, DAB)</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Free lossless FLAC via community proxies — Amazon, HiFi API, DAB Music. No account required.</p>
           </div>
         </label>
 
@@ -1051,6 +1440,14 @@
                 <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Keep a hardlink in slskd's folder so files are seeded back to the Soulseek network. Zero extra disk space.</p>
               </div>
             </label>
+
+            {#if slskdWebUIInfo}
+            <div style="margin-top: 14px; padding: 10px 12px; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid rgba(255,255,255,0.07);">
+              <p style="font-size: 11px; opacity: 0.5; margin: 0 0 6px; text-transform: uppercase; letter-spacing: 0.05em;">slskd Web UI</p>
+              <p style="font-size: 12px; margin: 0 0 4px; font-family: monospace; color: var(--accent-color);">{slskdWebUIInfo.url}</p>
+              <p style="font-size: 11px; margin: 0; opacity: 0.65; font-family: monospace;">user: {slskdWebUIInfo.username} &nbsp;·&nbsp; pass: {slskdWebUIInfo.password}</p>
+            </div>
+            {/if}
           </div>
         {/if}
       </div>
@@ -1058,8 +1455,7 @@
     </div>
 
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
-      <button on:click={saveSettings} style="width: 100%;">Save Settings</button>
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 10px 0 0;">Antra v1.1.2</p>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.3</p>
     </div>
   </div>
 </div>
@@ -1152,8 +1548,18 @@
       <div style="overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:4px; padding-right:4px;">
         {#each [['album','Albums'], ['single','Singles'], ['compilation','EPs & Compilations']] as [type, label]}
           {#if discographyArtist.albums.filter(a => a.type === type).length > 0}
-            <div style="font-size:11px; color:#555; letter-spacing:0.08em; margin-top:12px; margin-bottom:4px;">{label.toUpperCase()}</div>
-            {#each discographyArtist.albums.filter(a => a.type === type) as album (album.id)}
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-top:12px; margin-bottom:4px;">
+              <span style="font-size:11px; color:#555; letter-spacing:0.08em;">{label.toUpperCase()}</span>
+              <div style="display:flex; gap:4px;">
+                <button
+                  on:click={() => { discographyArtist.albums.filter(a => a.type === type).forEach(a => discographySelected.add(a.url)); discographySelected = discographySelected; }}
+                  style="font-size:10px; padding:2px 7px; opacity:0.55; border-color:rgba(255,255,255,0.1);">All</button>
+                <button
+                  on:click={() => { discographyArtist.albums.filter(a => a.type === type).forEach(a => discographySelected.delete(a.url)); discographySelected = discographySelected; }}
+                  style="font-size:10px; padding:2px 7px; opacity:0.55; border-color:rgba(255,255,255,0.1);">None</button>
+              </div>
+            </div>
+            {#each discographyArtist.albums.filter(a => a.type === type).sort((a, b) => (b.year ?? 0) - (a.year ?? 0) || (a.name ?? '').localeCompare(b.name ?? '')) as album (album.id)}
               <label style="display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:6px; cursor:pointer;"
                      on:mouseenter={(e) => e.currentTarget.style.background='rgba(255,255,255,0.04)'}
                      on:mouseleave={(e) => e.currentTarget.style.background='transparent'}>
@@ -1187,8 +1593,18 @@
           showDiscography = false;
           isDownloading = true;
           logs = [];
+          trackOrder = [];
+          playlistTitle = '';
+          playlistArtwork = '';
+          playlistArtists = '';
+          playlistReleaseDate = '';
+          playlistContentType = '';
+          playlistQualityBadge = '';
+          playlistTotalDurationMs = 0;
+          playlistTotalTracks = 0;
           Object.keys(activeTracks).forEach(clearTrackInterval);
           activeTracks = {};
+          separatorMeta = {};
           shouldAutoScroll = true;
           addLog('info', `━━━ Building your music library ━━━`);
           addLog('info', `Downloading ${albumUrls.length} release${albumUrls.length !== 1 ? 's' : ''} (lossless prioritized)...`);
@@ -1200,6 +1616,55 @@
       </button>
     {/if}
 
+  </div>
+</div>
+{/if}
+
+<!-- ── Source Health Popover ────────────────────────────────────────────────── -->
+{#if showHealthPopover}
+  {@const activeSrc = healthSources.find(s => s.key === healthPopoverSource)}
+<div class="modal-overlay" on:click={() => showHealthPopover = false}>
+  <div class="modal-content" on:click|stopPropagation style="max-width: 320px;">
+    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid rgba(255,255,255,0.07); padding-bottom:14px; margin-bottom:16px;">
+      <div style="display:flex; align-items:center; gap:10px;">
+        {#if healthPopoverSource === 'hifi'}
+          <img src="/icons/tidal.webp" alt="Tidal" style="width:26px; height:26px; object-fit:contain;" />
+        {:else if healthPopoverSource === 'amazon'}
+          <img src="/icons/amazon-music.jpg" alt="Amazon Music" style="width:26px; height:26px; object-fit:contain; border-radius:4px;" />
+        {:else if healthPopoverSource === 'dab'}
+          <img src="/icons/qobuz.png" alt="Qobuz" style="width:26px; height:26px; object-fit:contain;" />
+        {/if}
+        <span style="font-size:14px; font-weight:600; color:{activeSrc?.text ?? '#e2e8f0'};">{activeSrc?.label ?? ''}</span>
+      </div>
+      <button on:click={() => showHealthPopover = false} style="padding:4px 8px; font-size:12px;">✕</button>
+    </div>
+
+    {#if healthLoading}
+      <div style="text-align:center; padding:28px 0; color:#555; font-size:13px;">Checking endpoints...</div>
+    {:else}
+      {@const result = healthCache[healthPopoverSource]}
+      {#if result}
+        <!-- Summary -->
+        <div style="display:flex; align-items:baseline; gap:6px; margin-bottom:18px;">
+          <span style="font-size:32px; font-weight:700; line-height:1; color:{result.live > 0 ? (activeSrc?.text ?? '#4ade80') : '#f87171'};">{result.live}</span>
+          <span style="font-size:13px; color:#555;">of {result.total} servers reachable</span>
+        </div>
+        <!-- Dot grid — no URLs, just alive/down dots with latency on hover -->
+        <div class="health-dot-grid">
+          {#each result.endpoints as ep}
+            <span
+              class="health-status-dot"
+              class:dot-alive={ep.alive}
+              class:dot-dead={!ep.alive}
+              title={ep.alive ? `${ep.latency_ms}ms` : 'unreachable'}
+            ></span>
+          {/each}
+        </div>
+        <p style="font-size:10px; color:#333; margin:12px 0 0; text-align:center;">Hover dots for latency</p>
+      {:else}
+        <div style="text-align:center; padding:24px 0; color:#555; font-size:13px;">No data yet — click to check.</div>
+      {/if}
+    {/if}
   </div>
 </div>
 {/if}
@@ -1433,70 +1898,223 @@
     flex-shrink: 0;
   }
 
-  .terminal {
-    flex: 1;
-    min-height: 0;
-    margin-top: 16px;
-    background: rgba(0, 0, 0, 0.4);
-    border: 1px solid rgba(0, 255, 204, 0.2);
-    border-radius: 8px;
-    padding: 16px;
-    overflow-y: auto;
-    overscroll-behavior: contain;
+  /* ── Playlist header ────────────────────────────────────────────────────── */
+  .playlist-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 0 10px;
+    flex-shrink: 0;
+  }
+  .playlist-cover {
+    width: 76px;
+    height: 76px;
+    border-radius: 6px;
+    object-fit: cover;
+    flex-shrink: 0;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
+  }
+  .playlist-meta {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
+    min-width: 0;
+    justify-content: center;
+    padding-top: 2px;
   }
-
-  .log-line {
-    font-family: var(--font-mono);
+  .playlist-type {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    color: #556;
+    text-transform: uppercase;
+    line-height: 1;
+    margin-bottom: 1px;
+  }
+  .playlist-title {
+    font-size: 17px;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #e2e8f0;
+    line-height: 1.2;
+    max-width: 440px;
+  }
+  .playlist-artists {
     font-size: 13px;
-    opacity: 0.9;
-    word-wrap: break-word;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 440px;
   }
-  .log-line.error { color: var(--error-color); }
-  .log-line.warning { color: #facc15; }
-  .log-line.success { color: #4ade80; }
-  .log-line.info { color: #94a3b8; }
-
-  .prefix {
-    color: var(--accent-color);
-    margin-right: 8px;
-  }
-
-  .active-track {
-    margin-top: 8px;
-    margin-bottom: 8px;
-    background: rgba(0, 255, 204, 0.05);
-    border: 1px dashed rgba(0, 255, 204, 0.3);
-    border-radius: 4px;
-    padding: 12px;
-  }
-  .track-header {
+  .playlist-info-line {
     display: flex;
-    justify-content: space-between;
-    font-size: 13px;
-    margin-bottom: 8px;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: #556;
+    line-height: 1;
+    margin-top: 1px;
+    flex-wrap: wrap;
   }
-  .status {
-    opacity: 0.7;
-    font-size: 11px;
+  .playlist-info-sep { opacity: 0.45; }
+  .playlist-quality-badge {
+    display: inline-block;
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.12em;
+    color: #0a0a0a;
+    background: var(--accent-color);
+    padding: 2px 6px;
+    border-radius: 3px;
+    margin-top: 4px;
+    width: fit-content;
     text-transform: uppercase;
   }
+
+  /* ── Tracklist ──────────────────────────────────────────────────────────── */
+  .tracklist-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #444;
+    font-size: 13px;
+    text-align: center;
+  }
+  .tracklist-empty strong { color: #666; }
+
+  .track-row {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 10px 12px;
+    transition: border-color 0.25s;
+  }
+  .track-row.track-done  { border-color: rgba(74, 222, 128, 0.35); }
+  .track-row.track-failed { border-color: rgba(248, 113, 113, 0.35); }
+  .track-row.track-skipped { opacity: 0.45; }
+
+  .track-row-main {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .track-row-name {
+    font-size: 13px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+    min-width: 0;
+  }
+  .track-row-status {
+    font-size: 11px;
+    opacity: 0.55;
+    flex-shrink: 0;
+    max-width: 220px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: right;
+  }
+
   .progress-bar-bg {
     width: 100%;
-    height: 4px;
-    background: rgba(255, 255, 255, 0.1);
+    height: 3px;
+    background: rgba(255, 255, 255, 0.08);
     border-radius: 2px;
     overflow: hidden;
   }
   .progress-bar-fg {
     height: 100%;
     background: var(--accent-color);
-    transition: width 0.3s ease;
+    transition: width 0.35s ease;
   }
-  .progress-bar-fg.error {
-    background: var(--error-color);
+  .progress-bar-fg.error { background: var(--error-color); }
+
+  /* ── Floating log toggle ─────────────────────────────────────────────────── */
+  .log-toggle {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 7px 14px;
+    font-size: 12px;
+    background: rgba(10, 10, 10, 0.85);
+    border: 1px solid rgba(0, 255, 204, 0.3);
+    color: var(--accent-color);
+    border-radius: 20px;
+    cursor: pointer;
+    z-index: 55;
+    backdrop-filter: blur(10px);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    letter-spacing: 0.02em;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .log-toggle:hover {
+    background: rgba(0, 255, 204, 0.08);
+    border-color: rgba(0, 255, 204, 0.55);
+  }
+
+  /* ── Slide-in log panel ──────────────────────────────────────────────────── */
+  .log-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 380px;
+    background: rgba(8, 8, 8, 0.97);
+    border-left: 1px solid rgba(0, 255, 204, 0.18);
+    display: flex;
+    flex-direction: column;
+    z-index: 60;
+    backdrop-filter: blur(14px);
+    box-shadow: -8px 0 32px rgba(0, 0, 0, 0.6);
+  }
+
+  .log-panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 13px;
+    font-weight: 500;
+    flex-shrink: 0;
+    color: #aaa;
+    letter-spacing: 0.03em;
+  }
+
+  .log-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .log-line {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    opacity: 0.9;
+    word-wrap: break-word;
+    line-height: 1.5;
+  }
+  .log-line.error   { color: var(--error-color); }
+  .log-line.warning { color: #facc15; }
+  .log-line.success { color: #4ade80; }
+  .log-line.info    { color: #94a3b8; }
+
+  .prefix {
+    color: var(--accent-color);
+    margin-right: 6px;
   }
 
   .modal-overlay {
@@ -1827,5 +2445,306 @@
     background: rgba(0,255,204,0.1);
     border-color: rgba(0,255,204,0.3);
     color: var(--accent-color);
+  }
+
+  /* ── Sponsor toast ───────────────────────────────────────────────────────── */
+  .sponsor-toast {
+    position: fixed;
+    top: 58px;
+    right: 16px;
+    width: 260px;
+    background: rgba(14, 10, 10, 0.96);
+    border: 1px solid rgba(255, 94, 91, 0.25);
+    border-radius: 10px;
+    padding: 14px 14px 14px 12px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    z-index: 200;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(16px);
+    animation: toast-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .sponsor-toast.leaving {
+    animation: toast-out 0.45s cubic-bezier(0.55, 0, 1, 0.45) both;
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(-10px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0)    scale(1);    }
+  }
+  @keyframes toast-out {
+    from { opacity: 1; transform: translateY(0)     scale(1);    }
+    to   { opacity: 0; transform: translateY(-18px) scale(0.88); }
+  }
+
+  .sponsor-toast-icon {
+    flex-shrink: 0;
+    margin-top: 1px;
+    opacity: 0.9;
+  }
+
+  .sponsor-toast-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .sponsor-toast-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #e2e8f0;
+    line-height: 1.2;
+  }
+
+  .sponsor-toast-text {
+    margin: 0;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.55;
+  }
+
+  .sponsor-toast-btn {
+    margin-top: 6px;
+    padding: 5px 11px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(255, 94, 91, 0.12);
+    border: 1px solid rgba(255, 94, 91, 0.35);
+    border-radius: 20px;
+    color: #FF5E5B;
+    cursor: pointer;
+    align-self: flex-start;
+    transition: background 0.15s, border-color 0.15s;
+    letter-spacing: 0.02em;
+  }
+  .sponsor-toast-btn:hover {
+    background: rgba(255, 94, 91, 0.22);
+    border-color: rgba(255, 94, 91, 0.6);
+  }
+
+  .sponsor-toast-close {
+    flex-shrink: 0;
+    background: transparent;
+    border: none;
+    color: #444;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    margin-top: -2px;
+    transition: color 0.15s;
+  }
+  .sponsor-toast-close:hover { color: #888; }
+
+  /* ── Ko-fi icon hover tooltip ────────────────────────────────────────────── */
+  .kofi-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .kofi-tooltip {
+    position: absolute;
+    top: calc(100% + 10px);
+    right: 0;
+    width: 220px;
+    background: rgba(14, 10, 10, 0.97);
+    border: 1px solid rgba(255, 94, 91, 0.22);
+    border-radius: 9px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    z-index: 300;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(14px);
+    animation: tooltip-in 0.18s ease both;
+  }
+  @keyframes tooltip-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0);    }
+  }
+
+  .kofi-tooltip-title {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    color: #e2e8f0;
+  }
+
+  .kofi-tooltip-body {
+    margin: 0;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.5;
+  }
+
+  .kofi-tooltip-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(255, 94, 91, 0.1);
+    border: 1px solid rgba(255, 94, 91, 0.3);
+    border-radius: 20px;
+    color: #FF5E5B;
+    cursor: pointer;
+    align-self: flex-start;
+    transition: background 0.15s;
+    letter-spacing: 0.02em;
+  }
+  .kofi-tooltip-btn:hover {
+    background: rgba(255, 94, 91, 0.2);
+  }
+
+  /* ── Source health bar ───────────────────────────────────────────────────── */
+  .source-health-bar {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+
+  .health-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 99px;
+    border: 1px solid;
+    font-size: 11px;
+    cursor: pointer;
+    transition: filter 0.15s, opacity 0.15s;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .health-chip:hover { filter: brightness(1.25); }
+  .health-chip-count { font-weight: 700; font-size: 10px; }
+  .health-chip-idle { opacity: 0.3; font-size: 10px; }
+  .health-chip-icon { width: 20px; height: 20px; object-fit: contain; flex-shrink: 0; transition: opacity 0.2s; }
+
+  /* ── Health popover dot grid ─────────────────────────────────────────────── */
+  .health-dot-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .health-status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    cursor: default;
+    transition: transform 0.1s;
+  }
+  .health-status-dot:hover { transform: scale(1.4); }
+  .dot-alive {
+    background: #4ade80;
+    box-shadow: 0 0 5px #4ade8066;
+  }
+  .dot-dead {
+    background: #3a1a1a;
+    border: 1px solid #553333;
+  }
+
+  /* ── Tracklist wrapper + scroll arrow ────────────────────────────────────── */
+  .tracklist-wrapper {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .tracklist {
+    flex: 1;
+    min-height: 0;
+    margin-top: 16px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tracklist-jump-btn {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    background: rgba(10, 10, 10, 0.25);
+    border: 1px solid rgba(0, 255, 204, 0.2);
+    color: rgba(0, 255, 204, 0.5);
+    font-size: 15px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 10;
+    backdrop-filter: blur(4px);
+    padding: 0;
+    line-height: 1;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
+  }
+  .tracklist-jump-btn:hover {
+    background: rgba(10, 10, 10, 0.7);
+    border-color: rgba(0, 255, 204, 0.55);
+    color: var(--accent-color);
+  }
+
+  /* ── Log panel scroll arrow ──────────────────────────────────────────────── */
+  .log-jump-btn {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: rgba(0, 255, 204, 0.08);
+    border: 1px solid rgba(0, 255, 204, 0.3);
+    color: var(--accent-color);
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+    transition: background 0.15s;
+    flex-shrink: 0;
+  }
+  .log-jump-btn:hover { background: rgba(0, 255, 204, 0.18); }
+
+  /* ── Album separator row in tracklist ────────────────────────────────────── */
+  .tracklist-album-sep {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 4px 4px;
+    margin-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .sep-artwork {
+    width: 28px;
+    height: 28px;
+    border-radius: 3px;
+    object-fit: cover;
+    flex-shrink: 0;
+    opacity: 0.8;
+  }
+  .sep-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #556;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

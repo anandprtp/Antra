@@ -10,10 +10,10 @@ the portion of the catalog that is freely streamable.
 Priority 4 — same tier as JioSaavn; inserted before it in build_adapters()
 so the stable sort places NetEase first in this tier.
 
-always_lossy is set False here because:
-  - We don't know ahead of search time whether a result will be lossless
-  - The resolver should try us even in lossless-prefer mode
-  - We mark each individual result with the correct is_lossless flag
+always_lossy = True because NetEase's freely streamable tier only provides
+MP3 (128/320kbps). The VIP-only lossless tier is not accessible without an
+authenticated session, which this adapter does not support. Skipped entirely
+when the resolver is in lossless-only mode.
 """
 import glob
 import logging
@@ -57,7 +57,7 @@ def _cjk_sim(a: str, b: str) -> float:
 class NetEaseAdapter(BaseSourceAdapter):
     name = "netease"
     priority = 4      # same tier as JioSaavn; stable-sort places us first
-    always_lossy = False  # individual results carry the correct is_lossless flag
+    always_lossy = True   # MP3 only — VIP lossless tier requires auth we don't have
 
     def is_available(self) -> bool:
         try:

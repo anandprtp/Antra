@@ -61,7 +61,7 @@ class AudioTranscoder:
                 return file_path
         if not self.needs_conversion(file_path, target_format):
             return file_path
-        from antra.utils.runtime import get_ffmpeg_exe
+        from antra.utils.runtime import get_ffmpeg_exe, get_clean_subprocess_env
         ffmpeg = get_ffmpeg_exe()
         if not ffmpeg:
             raise RuntimeError("ffmpeg is required for output format conversion")
@@ -83,7 +83,8 @@ class AudioTranscoder:
             *plan.codec_args,
             temp_output,
         ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=240, **_SUBPROCESS_FLAGS)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=240,
+                                env=get_clean_subprocess_env(), **_SUBPROCESS_FLAGS)
         if result.returncode != 0:
             raise RuntimeError(
                 f"ffmpeg conversion to {target_format} failed: {result.stderr.strip() or result.stdout.strip()}"

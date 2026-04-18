@@ -380,7 +380,7 @@ class SpotifyClient:
                 playlist_id, RuntimeError("All authentication methods failed")
             )
 
-        playlist_name = self._fetch_playlist_name(active_sp, playlist_id)
+        playlist_name, playlist_artwork, playlist_owner, playlist_desc = self._fetch_playlist_meta(active_sp, playlist_id)
 
         # Paginate through ALL pages — Spotify returns at most `limit` items
         # per request.  We keep advancing `offset` until the response contains
@@ -410,7 +410,11 @@ class SpotifyClient:
                 meta = self._parse_track(track)
                 if meta:
                     meta.playlist_name = playlist_name
+                    meta.playlist_owner = playlist_owner
+                    meta.playlist_description = playlist_desc
                     meta.playlist_position = len(tracks) + 1
+                    if playlist_artwork:
+                        meta.playlist_artwork_url = playlist_artwork
                     tracks.append(meta)
 
             logger.info(f"  Fetched {len(tracks)} tracks so far...")
@@ -482,12 +486,22 @@ class SpotifyClient:
             logger.warning(f"Playlist client validation failed (likely invalid credentials): {e}")
             return None
 
-    def _fetch_playlist_name(self, sp: spotipy.Spotify, playlist_id: str) -> str:
+    def _fetch_playlist_meta(self, sp: spotipy.Spotify, playlist_id: str) -> tuple[str, Optional[str], Optional[str], Optional[str]]:
+        """Return (playlist_name, playlist_artwork_url, owner, description) for an authenticated playlist."""
         try:
-            playlist = sp.playlist(playlist_id, fields="name")
-            return playlist.get("name", "Unknown Playlist")
+            playlist = sp.playlist(playlist_id, fields="name,images,owner,description")
+            name = playlist.get("name", "Unknown Playlist")
+            owner = playlist.get("owner", {}).get("display_name")
+            desc = playlist.get("description")
+            images = playlist.get("images", [])
+            artwork = images[0]["url"] if images else None
+            return name, artwork, owner, desc
         except Exception:
-            return "Unknown Playlist"
+            return "Unknown Playlist", None, None, None
+
+    def _fetch_playlist_name(self, sp: spotipy.Spotify, playlist_id: str) -> str:
+        name, _, _, _ = self._fetch_playlist_meta(sp, playlist_id)
+        return name
 
     def _get_with_retry_public(self, url: str) -> requests.Response:
         for attempt in range(4):
@@ -542,7 +556,19 @@ class SpotifyClient:
                     .get("entity", {})
             )
             playlist_title = entity.get("title") or entity.get("name") or "Unknown Playlist"
-            
+            playlist_owner = entity.get("subtitle") or entity.get("owner", {}).get("name")
+            playlist_desc = entity.get("description")
+            # Extract playlist-level cover art from the embed entity
+            _entity_images = (
+                entity.get("coverArt", {}).get("sources", [])
+                or entity.get("images")
+                or entity.get("visuals", {}).get("headerImage", {}).get("sources", [])
+            )
+            playlist_artwork: Optional[str] = None
+            if isinstance(_entity_images, list) and _entity_images:
+                first = _entity_images[0]
+                playlist_artwork = first.get("url") if isinstance(first, dict) else None
+
             token = self._get_anonymous_access_token(playlist_id)
             if not token:
                 logger.warning(f"Could not extract token from embed page for {playlist_id}")
@@ -634,9 +660,12 @@ class SpotifyClient:
                         album=album,
                         album_id=album_id,
                         artwork_url=artwork_url,
+                        playlist_artwork_url=playlist_artwork,
                         release_year=release_year,
                         release_date=release_date or None,
                         playlist_name=playlist_title,
+                        playlist_owner=playlist_owner,
+                        playlist_description=playlist_desc,
                         playlist_position=len(tracks) + 1,
                         duration_ms=int(duration_ms) if duration_ms else None,
                         track_number=v2_data.get("trackNumber"),
@@ -1223,8 +1252,9 @@ class SpotifyClient:
             except Exception as e:
                 logger.debug(f"[Spotify] Anonymous artist search failed: {e}")
 
-        # Nothing worked — return empty (caller decides whether to surface an error)
-        return []
+        # Spotify paths exhausted — fall back to iTunes Search API (no auth required)
+        logger.debug("[Spotify] Anonymous artist search failed — falling back to iTunes")
+        return self._search_artists_itunes(query, limit)
 
     def _search_artists_itunes(self, query: str, limit: int = 8) -> list[dict]:
         """Artist search via public iTunes Search API — no credentials required."""
@@ -1968,6 +1998,7 @@ class SpotifyClient:
             artwork_url = images[0]["url"] if images else None
             album_artists = [a["name"] for a in album_data.get("artists", []) if a.get("name")]
 
+            explicit = track.get("explicit")
             return TrackMetadata(
                 title=track["name"],
                 artists=artists,
@@ -1982,6 +2013,7 @@ class SpotifyClient:
                 spotify_id=track.get("id"),
                 album_id=album_data.get("id"),
                 artwork_url=artwork_url,
+                is_explicit=bool(explicit) if explicit is not None else None,
             )
         except Exception as e:
             logger.warning(f"Failed to parse track: {e} — raw: {track.get('name')}")

@@ -34,8 +34,17 @@ class LibraryOrganizer:
     becomes canonical and later playlist/album/song downloads reuse that file.
     """
 
-    def __init__(self, root: str):
+    def __init__(
+        self,
+        root: str,
+        full_albums: bool = False,
+        folder_structure: str = "standard",
+        filename_format: str = "default",
+    ):
         self.root = Path(root).resolve()
+        self.full_albums = full_albums
+        self.folder_structure = folder_structure
+        self.filename_format = filename_format
         self.root.mkdir(parents=True, exist_ok=True)
         self.albums_root = self.root / "Albums"
         self.playlists_root = self.root / "Playlists"
@@ -44,7 +53,8 @@ class LibraryOrganizer:
         self._state_path = self.root / STATE_FILE
         self._state = self._load_state()
         self._identity_index: dict[str, str] = {}
-        self._build_identity_index()
+        if not full_albums:
+            self._build_identity_index()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -53,12 +63,11 @@ class LibraryOrganizer:
         if track.playlist_name:
             playlist_dir = self._safe(track.playlist_name)
             track_number = track.playlist_position or track.track_number
-            if track_number:
-                filename = f"{track_number:02d} - {self._safe(track.title)}"
+            filename = self._format_filename(track, track_number, is_playlist=True)
+            if self.folder_structure == "flat":
+                folder = self.root / playlist_dir
             else:
-                filename = self._safe(track.title)
-
-            folder = self.playlists_root / playlist_dir
+                folder = self.playlists_root / playlist_dir
             folder.mkdir(parents=True, exist_ok=True)
             return str(folder / filename)
 
@@ -75,23 +84,75 @@ class LibraryOrganizer:
         else:
             album_dir = album_part
 
-        if track.track_number:
-            filename = f"{track.track_number:02d} - {self._safe(track.title)}"
-        else:
-            filename = self._safe(track.title)
+        filename = self._format_filename(track, track.track_number, is_playlist=False)
 
-        folder = self.albums_root / artist_dir / album_dir
+        if self.folder_structure == "flat":
+            folder = self.root / album_dir
+        else:
+            folder = self.albums_root / artist_dir / album_dir
         folder.mkdir(parents=True, exist_ok=True)
         return str(folder / filename)
 
-    def is_already_downloaded(self, track: TrackMetadata) -> Optional[str]:
-        """Return canonical file path if the track already exists anywhere."""
-        for key in self._track_identity_keys(track):
-            existing = self._identity_index.get(key)
-            if existing and os.path.exists(existing):
-                return existing
+    def _format_filename(self, track: TrackMetadata, track_number: Optional[int], is_playlist: bool = False) -> str:
+        """Build the filename stem according to self.filename_format."""
+        title = self._safe(track.title)
+        artist = self._safe(track.primary_artist)
 
-        # Fallback: check the expected canonical path for this exact request.
+        # Always disc-prefixed: use the actual disc number if known, otherwise
+        # treat as disc 1. This produces 101/102/201/202 for every source and
+        # every album type. However, for playlists, we force semantic disc 1
+        # to ensure the sequence remains purely numerical (101, 102...) instead
+        # of mistakenly injecting the track's original album disc number.
+        if is_playlist:
+            disc = 1
+        else:
+            disc = track.disc_number or 1
+
+        # title_only keeps its original behaviour (no number prefix at all,
+        # except when the album is explicitly multi-disc to avoid collisions).
+        if self.filename_format == "title_only":
+            is_multi_disc = (
+                (track.total_discs is not None and track.total_discs > 1)
+                or (track.disc_number is not None and track.disc_number >= 2)
+            )
+            if is_multi_disc and track.disc_number and track_number:
+                return f"{track.disc_number}{track_number:02d} - {title}"
+            return title
+
+        if self.filename_format == "artist_title":
+            if track_number:
+                return f"{disc}{track_number:02d} - {artist} - {title}"
+            return f"{artist} - {title}"
+
+        if self.filename_format == "title_artist":
+            if track_number:
+                return f"{disc}{track_number:02d} - {title} - {artist}"
+            return f"{title} - {artist}"
+
+        # default: 101 - Title, 201 - Title (disc always prefixed)
+        if track_number:
+            return f"{disc}{track_number:02d} - {title}"
+        return title
+
+    def is_already_downloaded(self, track: TrackMetadata) -> Optional[str]:
+        """Return canonical file path if the track already exists in the library.
+
+        In smart_dedup mode (default): checks the global identity index first
+        (ISRC, Spotify ID, title+artist keys) — finds the track anywhere in the
+        library regardless of which album folder it lives in.
+
+        In full_albums mode: skips the cross-library index and only checks
+        whether a file already exists at the exact target path for this track.
+        This lets the same track appear in multiple album folders (e.g. studio
+        album and a Best Of compilation) without one blocking the other.
+        """
+        if not self.full_albums:
+            for key in self._track_identity_keys(track):
+                existing = self._identity_index.get(key)
+                if existing and os.path.exists(existing):
+                    return existing
+
+        # Check the expected canonical path for this exact request.
         base = self.get_output_path(track)
         for ext in SUPPORTED_AUDIO_EXTENSIONS:
             candidate = base + ext
@@ -128,7 +189,8 @@ class LibraryOrganizer:
         return playlist_path
 
     def write_playlist_manifest(self, playlist_name: str, file_paths: list[str]) -> str:
-        manifest_path = self.playlists_root / f"{self._safe(playlist_name)}.m3u"
+        manifest_root = self.root if self.folder_structure == "flat" else self.playlists_root
+        manifest_path = manifest_root / f"{self._safe(playlist_name)}.m3u"
         lines = ["#EXTM3U"]
         for file_path in file_paths:
             if not file_path:
@@ -162,6 +224,15 @@ class LibraryOrganizer:
             keys.append(f"title_artist:{title_key}:{artist_key}")
         if title_key and artist_key and album_key and album_key != "unknown album":
             keys.append(f"title_artist_album:{title_key}:{artist_key}:{album_key}")
+
+        # Source-independent all-artists key: splits combined strings like
+        # "Future & Metro Boomin", normalizes each part, sorts them — so
+        # ["Future", "Metro Boomin"], ["Metro Boomin", "Future"], and
+        # ["Future & Metro Boomin"] (single combined tag) all produce the same key.
+        if track.artists:
+            canonical = self._artists_canonical_key(track.artists)
+            if title_key and canonical:
+                keys.append(f"title_artists:{title_key}:{canonical}")
 
         return list(dict.fromkeys(keys))
 
@@ -293,6 +364,14 @@ class LibraryOrganizer:
         elif title_key:
             keys.append(f"title:{title_key}")
 
+        # All-artists key: same logic as _track_identity_keys.
+        # When the file has a combined tag like artist = ["Future & Metro Boomin"],
+        # _artists_canonical_key splits it to the same key as ["Future", "Metro Boomin"].
+        if artists:
+            canonical = self._artists_canonical_key(artists)
+            if title_key and canonical:
+                keys.append(f"title_artists:{title_key}:{canonical}")
+
         return list(dict.fromkeys(keys))
 
     @staticmethod
@@ -345,6 +424,27 @@ class LibraryOrganizer:
         value = re.sub(r"\s+", " ", value)
         value = re.sub(r"[^a-z0-9 ]+", "", value)
         return value.strip()
+
+    @staticmethod
+    def _artists_canonical_key(artists: list[str]) -> str:
+        """Return a source-independent sorted key for a set of artists.
+
+        Splits combined strings (e.g. "Future & Metro Boomin") into individual
+        names before normalizing and sorting, so different ways of expressing the
+        same collaboration all produce the same key:
+          ["Future", "Metro Boomin"]     → "future metro boomin"
+          ["Metro Boomin", "Future"]     → "future metro boomin"
+          ["Future & Metro Boomin"]      → "future metro boomin"
+          ["Future", "Metro Boomin & X"] → "future metro boomin x"
+        """
+        parts: set[str] = set()
+        for artist in artists:
+            # Split on common multi-artist separators found in tags
+            for part in re.split(r"[,&/]+|\s+(?:feat\.?|ft\.?)\s+", artist, flags=re.IGNORECASE):
+                norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", part.lower())).strip()
+                if norm:
+                    parts.add(norm)
+        return " ".join(sorted(parts))
 
     # ── Path sanitization ─────────────────────────────────────────────────
 

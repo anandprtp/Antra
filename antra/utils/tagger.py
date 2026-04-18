@@ -65,6 +65,12 @@ class FileTagger:
         track: TrackMetadata,
     ) -> bool:
         """Tag file at file_path with all available metadata. Returns True on success."""
+        # MusicBrainz fallback enrichment
+        from antra.core.musicbrainz_fetcher import enrich_metadata
+        if not track.genres and track.isrc:
+            logger.debug(f"[Tagger] Genres missing for {track.title}, querying MusicBrainz...")
+            enrich_metadata(track)
+
         ext = os.path.splitext(file_path)[1].lower()
         try:
             if ext == ".flac":
@@ -101,8 +107,9 @@ class FileTagger:
         album_artist_str = ", ".join(track.album_artists) if track.album_artists else track.primary_artist
         audio["albumartist"] = [album_artist_str]
         audio["album"] = track.album
-        if track.release_year:
-            audio["date"] = str(track.release_year)
+        date_str = track.release_date or (str(track.release_year) if track.release_year else None)
+        if date_str:
+            audio["date"] = date_str
         if track.track_number:
             tn = str(track.track_number)
             if track.total_tracks:
@@ -114,8 +121,14 @@ class FileTagger:
             audio["genre"] = track.genres
         if track.isrc:
             audio["isrc"] = track.isrc
+        if track.upc:
+            audio["barcode"] = track.upc
+        if track.iswc:
+            audio["iswc"] = track.iswc
+        if track.audio_traits:
+            audio["audio_traits"] = track.audio_traits
         if track.spotify_id:
-            audio["spotify_id"] = track.spotify_id 
+            audio["spotify_id"] = track.spotify_id
 
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
@@ -144,8 +157,9 @@ class FileTagger:
         audio.add(TPE2(encoding=3, text=album_artist_str))
         audio.add(TALB(encoding=3, text=track.album))
 
-        if track.release_year:
-            audio.add(TDRC(encoding=3, text=str(track.release_year)))
+        date_str = track.release_date or (str(track.release_year) if track.release_year else None)
+        if date_str:
+            audio.add(TDRC(encoding=3, text=date_str))
         if track.track_number:
             tn = str(track.track_number)
             if track.total_tracks:
@@ -157,6 +171,12 @@ class FileTagger:
             audio.add(TCON(encoding=3, text=", ".join(track.genres)))
         if track.isrc:
             audio.add(TSRC(encoding=3, text=track.isrc))
+        if track.upc:
+            audio.add(TXXX(encoding=3, desc="BARCODE", text=track.upc))
+        if track.iswc:
+            audio.add(TXXX(encoding=3, desc="ISWC", text=track.iswc))
+        if track.audio_traits:
+            audio.add(TXXX(encoding=3, desc="AUDIO_TRAITS", text=", ".join(track.audio_traits)))
         if track.spotify_id:
             audio.add(TXXX(encoding=3, desc="SPOTIFYID", text=track.spotify_id))
 
@@ -188,8 +208,9 @@ class FileTagger:
         audio["aART"] = [album_artist_str]
         audio["\xa9alb"] = [track.album]
 
-        if track.release_year:
-            audio["\xa9day"] = [str(track.release_year)]
+        date_str = track.release_date or (str(track.release_year) if track.release_year else None)
+        if date_str:
+            audio["\xa9day"] = [date_str]
         if track.track_number:
             audio["trkn"] = [(track.track_number, track.total_tracks or 0)]
         if track.disc_number:

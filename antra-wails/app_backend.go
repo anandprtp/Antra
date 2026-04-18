@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -27,11 +29,17 @@ type Config struct {
 	SourcesEnabled        []string `json:"sources_enabled,omitempty"`
 	FirstRunComplete      bool     `json:"first_run_complete"`
 	OutputFormat          string   `json:"output_format,omitempty"`
+	LibraryMode           string   `json:"library_mode,omitempty"`
+	PreferExplicit        *bool    `json:"prefer_explicit,omitempty"`
+	FolderStructure       string   `json:"folder_structure,omitempty"`
+	FilenameFormat        string   `json:"filename_format,omitempty"`
 }
 
 type HistoryItem struct {
 	Date       string         `json:"date"`
 	URL        string         `json:"url"`
+	Title      string         `json:"title,omitempty"`
+	ArtworkUrl string         `json:"artwork_url,omitempty"`
 	Total      int            `json:"total"`
 	Downloaded int            `json:"downloaded"`
 	Failed     int            `json:"failed"`
@@ -647,4 +655,170 @@ func uniqueCleanPaths(paths []string) []string {
 		result = append(result, clean)
 	}
 	return result
+}
+
+// ── Source health check ───────────────────────────────────────────────────────
+
+type EndpointStatus struct {
+	URL       string `json:"url"`
+	Alive     bool   `json:"alive"`
+	LatencyMs int64  `json:"latency_ms"`
+}
+
+type SourceHealthResult struct {
+	Source    string           `json:"source"`
+	Total     int              `json:"total"`
+	Live      int              `json:"live"`
+	Endpoints []EndpointStatus `json:"endpoints"`
+}
+
+// CheckSourceHealth probes all known endpoints for a given source ("hifi", "amazon",
+// "dab") in parallel and returns a JSON-encoded SourceHealthResult.
+//
+// Health check URLs mirror the adapters' own liveness checks:
+// GetSlskdWebUIInfo returns the slskd web UI URL, username, and generated password
+// from the managed instance's state.json. Returns an empty JSON object if slskd
+// has not been bootstrapped yet (no state file).
+func (a *App) GetSlskdWebUIInfo() string {
+	statePath := getSlskdStatePath()
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		return "{}"
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return "{}"
+	}
+	baseURL, _ := state["base_url"].(string)
+	webPassword, _ := state["web_password"].(string)
+	if baseURL == "" || webPassword == "" {
+		return "{}"
+	}
+	result, _ := json.Marshal(map[string]string{
+		"url":      baseURL,
+		"username": "slskd",
+		"password": webPassword,
+	})
+	return string(result)
+}
+
+func getSlskdStatePath() string {
+	switch runtime.GOOS {
+	case "windows":
+		local := os.Getenv("LOCALAPPDATA")
+		return filepath.Join(local, "antra", "slskd", "runtime", "state.json")
+	default:
+		home := os.Getenv("HOME")
+		return filepath.Join(home, ".cache", "antra", "slskd", "runtime", "state.json")
+	}
+}
+
+//   - HiFi:   GET {ep}/search/?s=test  → 200
+//   - Amazon: GET {mirror}/           → 200 or 404 (server reachable)
+//   - DAB:    GET {ep}/search?q=test  → 200
+func (a *App) CheckSourceHealth(source string) string {
+	var endpoints []string
+	switch source {
+	case "hifi":
+		endpoints = []string{
+			"https://api.monochrome.tf",
+			"https://arran.monochrome.tf",
+			"https://triton.squid.wtf",
+			"https://tidal.squid.wtf",
+			"https://tidal.qqdl.site",
+			"https://vogel.qqdl.site",
+			"https://wolf.qqdl.site",
+			"https://maus.qqdl.site",
+			"https://music.binimum.org",
+			"https://tidal.notabot.dev",
+			"https://hifi.lunar.gg",
+			"https://api.hifi.786.moe",
+			"https://hifi.geeked.wtf",
+			"https://katze.qqdl.site",
+			"https://hund.qqdl.site",
+			"https://tidal.kinoplus.online",
+			"https://hifi.samidy.com",
+			"https://hifi-one.spotisaver.net",
+			"https://hifi-two.spotisaver.net",
+		}
+	case "amazon":
+		endpoints = []string{
+			"https://amzn.afkarxyz.qzz.io",
+			"https://amzn.vov.li",
+			"https://amzn.rnb.su",
+			"https://amazon.squid.wtf",
+		}
+	case "dab":
+		endpoints = []string{
+			"https://dabmusic.xyz/api",
+		}
+	default:
+		res := SourceHealthResult{Source: source, Total: 0, Live: 0, Endpoints: []EndpointStatus{}}
+		b, _ := json.Marshal(res)
+		return string(b)
+	}
+
+	type probeResult struct {
+		alive     bool
+		latencyMs int64
+	}
+
+	results := make([]probeResult, len(endpoints))
+	client := &http.Client{Timeout: 7 * time.Second}
+
+	var wg sync.WaitGroup
+	for i, ep := range endpoints {
+		wg.Add(1)
+		go func(idx int, base string) {
+			defer wg.Done()
+			var checkURL string
+			switch source {
+			case "hifi":
+				checkURL = base + "/search/?s=test"
+			case "amazon":
+				checkURL = base + "/"
+			case "dab":
+				checkURL = base + "/search?q=test"
+			default:
+				checkURL = base
+			}
+			start := time.Now()
+			resp, err := client.Get(checkURL)
+			elapsed := time.Since(start).Milliseconds()
+			alive := false
+			if err == nil {
+				resp.Body.Close()
+				switch source {
+				case "amazon":
+					alive = resp.StatusCode == 200 || resp.StatusCode == 404
+				default:
+					alive = resp.StatusCode == 200
+				}
+			}
+			results[idx] = probeResult{alive: alive, latencyMs: elapsed}
+		}(i, ep)
+	}
+	wg.Wait()
+
+	statuses := make([]EndpointStatus, len(endpoints))
+	live := 0
+	for i, ep := range endpoints {
+		statuses[i] = EndpointStatus{
+			URL:       ep,
+			Alive:     results[i].alive,
+			LatencyMs: results[i].latencyMs,
+		}
+		if results[i].alive {
+			live++
+		}
+	}
+
+	res := SourceHealthResult{
+		Source:    source,
+		Total:     len(endpoints),
+		Live:      live,
+		Endpoints: statuses,
+	}
+	b, _ := json.Marshal(res)
+	return string(b)
 }

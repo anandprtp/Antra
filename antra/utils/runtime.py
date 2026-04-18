@@ -66,6 +66,31 @@ def get_ffprobe_exe() -> Optional[str]:
     return None
 
 
+def get_clean_subprocess_env() -> dict:
+    """Return os.environ copy with the PyInstaller _MEIPASS dir stripped from
+    LD_LIBRARY_PATH (and LD_PRELOAD) on Linux.
+
+    PyInstaller extracts bundled .so files into /tmp/_MEI*/ and adds that
+    directory to LD_LIBRARY_PATH.  When ffmpeg/ffprobe is spawned as a child
+    process it inherits this variable, causing system libraries (e.g.
+    libcurl.so.4) to load the bundled libssl.so.3 instead of the system one —
+    a version mismatch that crashes ffmpeg on Fedora 43 and similar distros.
+    """
+    env = os.environ.copy()
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass and sys.platform.startswith("linux"):
+        for var in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+            val = env.get(var, "")
+            if not val:
+                continue
+            cleaned = os.pathsep.join(p for p in val.split(os.pathsep) if p != meipass)
+            if cleaned:
+                env[var] = cleaned
+            else:
+                env.pop(var, None)
+    return env
+
+
 def ensure_runtime_environment() -> None:
     exe = get_ffmpeg_exe()
     if not exe:

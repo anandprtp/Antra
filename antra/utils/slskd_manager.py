@@ -63,8 +63,23 @@ class SlskdBootstrapManager:
                 if self._locate_slskd_exe() is not None:
                     logger.warning("[Soulseek] slskd reachable but API key missing. Forcing kill to recover.")
                     self._kill_managed_slskd()
+                    time.sleep(1.5)
+                elif username and password:
+                    # External slskd is running but we have no managed binary or API
+                    # key for it.  Since the user provided Soulseek credentials, replace
+                    # it with a Antra-managed instance so we can control authentication.
+                    logger.info(
+                        "[Soulseek] External slskd at %s detected; replacing with managed instance.",
+                        base_url,
+                    )
+                    self._kill_managed_slskd()
+                    time.sleep(1.5)
                 else:
-                    logger.info("[Soulseek] External slskd detected at %s without a managed API key — skipping bootstrap to avoid disrupting it.", base_url)
+                    logger.info(
+                        "[Soulseek] External slskd detected at %s without a managed API key — "
+                        "skipping bootstrap to avoid disrupting it.",
+                        base_url,
+                    )
                     return None
 
         exe = self._locate_slskd_exe()
@@ -85,6 +100,13 @@ class SlskdBootstrapManager:
             password=password,
         )
 
+        # Kill any surviving slskd that may still be holding the port before
+        # starting our managed instance with the fresh config.
+        if self._is_reachable(base_url):
+            logger.debug("[Soulseek] Killing leftover slskd process before restart.")
+            self._kill_managed_slskd()
+            time.sleep(1.5)
+
         self._start_process(exe)
         if not self._wait_until_reachable(base_url, timeout_seconds, api_key=api_key):
             logger.warning("[Soulseek] Managed slskd did not become reachable in time.")
@@ -92,6 +114,11 @@ class SlskdBootstrapManager:
         state = self._read_state()
         state["base_url"] = base_url
         self._write_state(state)
+        web_password = self._get_or_create_web_password()
+        logger.info(
+            "[Soulseek] slskd web UI available at %s — login: username=slskd  password=%s",
+            base_url, web_password,
+        )
         return {"base_url": base_url, "api_key": api_key}
 
     def _resolve_root_dir(self) -> Path:
@@ -170,6 +197,10 @@ class SlskdBootstrapManager:
         if exe is None:
             logger.warning("[Soulseek] slskd executable not found after extraction.")
             return None
+        # zipfile.extractall() does not restore Unix permissions from the zip
+        # metadata, so the binary lands as non-executable on macOS/Linux.
+        if platform.system() != "Windows":
+            os.chmod(exe, 0o755)
         return exe
 
     def _resolve_base_url(self, requested_base_url: str) -> str:
@@ -324,6 +355,9 @@ class SlskdBootstrapManager:
         incomplete_dir = (self._runtime_dir / "incomplete").resolve().as_posix()
         data_dir = (self._runtime_dir / "data").resolve().as_posix()
 
+        # Generate a stable web UI password stored in state so the user can log in
+        web_password = self._get_or_create_web_password()
+
         config_content = "\n".join(
             [
                 f"instance_name: {json.dumps('Antra Managed slskd')}",
@@ -340,6 +374,8 @@ class SlskdBootstrapManager:
                 "    disabled: true",
                 "  authentication:",
                 "    disabled: false",
+                "    username: slskd",
+                f"    password: {json.dumps(web_password)}",
                 "    api_keys:",
                 "      antra:",
                 f"        key: {json.dumps(api_key)}",
@@ -349,4 +385,26 @@ class SlskdBootstrapManager:
 
         config_file = self._runtime_dir / "slskd.yml"
         config_file.write_text(config_content, encoding="utf-8")
+
+    def _get_or_create_web_password(self) -> str:
+        state = self._read_state()
+        pwd = state.get("web_password")
+        if not pwd:
+            pwd = secrets.token_urlsafe(12)
+            state["web_password"] = pwd
+            self._write_state(state)
+        return str(pwd)
+
+    def get_web_ui_info(self) -> Optional[dict[str, str]]:
+        """Return {url, username, password} for the slskd web UI, or None if not running."""
+        state = self._read_state()
+        base_url = state.get("base_url")
+        web_password = state.get("web_password")
+        if not base_url:
+            return None
+        return {
+            "url": str(base_url),
+            "username": "slskd",
+            "password": str(web_password) if web_password else "",
+        }
 

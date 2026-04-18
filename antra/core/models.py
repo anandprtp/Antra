@@ -30,21 +30,29 @@ class TrackMetadata:
     artists: list[str]
     album: str
     playlist_name: Optional[str] = None
+    playlist_owner: Optional[str] = None
+    playlist_description: Optional[str] = None
     playlist_position: Optional[int] = None
     release_year: Optional[int] = None
     release_date: Optional[str] = None
     track_number: Optional[int] = None
     disc_number: Optional[int] = None
     total_tracks: Optional[int] = None
+    total_discs: Optional[int] = None
     duration_ms: Optional[int] = None
     isrc: Optional[str] = None
     spotify_id: Optional[str] = None
     album_id: Optional[str] = None
     spotify_url: Optional[str] = None
     amazon_asin: Optional[str] = None  # Track ASIN when sourced from Amazon Music URL
+    upc: Optional[str] = None
+    iswc: Optional[str] = None
+    audio_traits: list[str] = field(default_factory=list)
     genres: list[str] = field(default_factory=list)
     album_artists: list[str] = field(default_factory=list)  # Album-level artists (e.g. ["PARTYNEXTDOOR", "Drake"] for joint albums)
     artwork_url: Optional[str] = None  # Highest res from Spotify
+    playlist_artwork_url: Optional[str] = None  # Playlist-level cover (distinct from track album art)
+    is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
     lyrics: Optional[str] = None
     synced_lyrics: Optional[str] = None  # LRC format
 
@@ -79,6 +87,7 @@ class SearchResult:
     artwork_url: Optional[str] = None
     bit_depth: Optional[int] = None
     sample_rate_hz: Optional[int] = None
+    is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
 
     @property
     def quality_label(self) -> str:

@@ -106,7 +106,10 @@ class OdesliEnricher:
           1. Odesli (if Spotify ID or ISRC available) — exact cross-platform match,
              rate-limited but authoritative. Prevents wrong ASINs from text search.
           2. Songwhip — slug-based, returns streaming-specific ASINs.
-          3. Amazon product scraper — fuzzy title search, last resort for amazonMusic.
+          3. iTunes Search → Odesli(Apple Music URL) — broad coverage, low rate limit.
+             Bypasses Spotify rate-limit issue on unauthenticated paths since we look
+             up via Apple Music URL instead. Works even when Songwhip has no index entry.
+          4. Amazon product scraper — fuzzy title search, last resort for amazonMusic.
         """
         cache_key = getattr(track, "spotify_id", None) or getattr(track, "isrc", None)
 
@@ -117,8 +120,6 @@ class OdesliEnricher:
         result: dict[str, str] = {}
 
         # 1. Odesli — exact match via Spotify ID or ISRC (highest accuracy).
-        #    Run first when we have a reliable identifier so scraper results
-        #    don't shadow authoritative IDs with wrong ASINs.
         if getattr(track, "spotify_id", None) or getattr(track, "isrc", None):
             od = self._try_odesli(track)
             for k, v in od.items():
@@ -129,7 +130,16 @@ class OdesliEnricher:
         for k, v in sw.items():
             result.setdefault(k, v)
 
-        # 3. Amazon product scraper — fuzzy fallback, only if amazonMusic still absent.
+        # 3. iTunes Search → Odesli(Apple Music URL) — catches tracks that Odesli
+        #    rate-limited on the Spotify path and that Songwhip doesn't have indexed.
+        #    iTunes Search API has no rate limit; the Apple Music URL goes through a
+        #    separate Odesli path that is less likely to be exhausted.
+        if "amazonMusic" not in result:
+            itunes_ids = self._try_itunes_odesli(track)
+            for k, v in itunes_ids.items():
+                result.setdefault(k, v)
+
+        # 4. Amazon product scraper — fuzzy fallback, only if amazonMusic still absent.
         if "amazonMusic" not in result:
             amazon_asin = self._search_amazon(track)
             if amazon_asin:
@@ -158,7 +168,15 @@ class OdesliEnricher:
         if not title:
             return None
 
-        query = f"{title} {artist}".strip()
+        # Strip parenthetical collaboration credits so "YouUgly (with Westside Gunn)"
+        # searches as "YouUgly JID" — Amazon catalog titles rarely include these.
+        title_clean = re.sub(
+            r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip()
+        query = f"{title_clean} {artist}".strip()
         try:
             resp = self._session.get(
                 _AMAZON_SEARCH,
@@ -181,12 +199,16 @@ class OdesliEnricher:
         )
 
         title_lower = title.lower()
+        title_clean_lower = title_clean.lower()
         artist_lower = artist.lower()
 
         for asin, product_title in pairs:
             pt_lower = product_title.strip().lower()
-            # Accept if product title contains our track title (case-insensitive)
-            if title_lower in pt_lower or pt_lower in title_lower:
+            # Accept if product title contains our track title (case-insensitive).
+            # Also match against the collaboration-stripped title so "YouUgly" matches
+            # a product titled "YouUgly (with Westside Gunn)" and vice-versa.
+            if (title_lower in pt_lower or pt_lower in title_lower
+                    or title_clean_lower in pt_lower or pt_lower in title_clean_lower):
                 logger.debug(f"[Amazon Search] Matched '{product_title.strip()}' → {asin}")
                 return asin
 
@@ -199,6 +221,87 @@ class OdesliEnricher:
         return None
 
     # ── Songwhip ──────────────────────────────────────────────────────────────
+
+    def _try_itunes_odesli(self, track) -> dict[str, str]:
+        """
+        Resolve via iTunes Search API → Odesli(Apple Music URL).
+
+        iTunes Search has no auth and no rate limit. We use it to get an Apple Music
+        track ID, then feed that URL to Odesli, which is less rate-limited on the
+        Apple Music path than on the Spotify path (different quota bucket).
+
+        Useful when: unauthenticated Spotify path has no ISRCs, Odesli 429'd on
+        the Spotify URL, and Songwhip has no index entry for the track.
+        """
+        title = getattr(track, "title", "") or ""
+        artists = getattr(track, "artists", []) or []
+        artist = artists[0] if artists else ""
+        if not title:
+            return {}
+
+        # Strip collaboration credits for better iTunes match
+        _COLLAB_RE = re.compile(
+            r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+            re.IGNORECASE,
+        )
+        title_clean = _COLLAB_RE.sub("", title).strip()
+
+        try:
+            r = self._session.get(
+                "https://itunes.apple.com/search",
+                params={"term": f"{title_clean} {artist}", "media": "music",
+                        "entity": "song", "limit": 3},
+                timeout=8,
+            )
+            if not r.ok:
+                return {}
+            results = r.json().get("results", [])
+        except Exception as e:
+            logger.debug(f"[iTunes] Search failed for '{title}': {e}")
+            return {}
+
+        apple_track_id: Optional[str] = None
+        for item in results:
+            track_url = item.get("trackViewUrl", "")
+            m = re.search(r"[?&]i=(\d+)", track_url)
+            if not m:
+                continue
+            # Verify title similarity before accepting
+            itunes_title = item.get("trackName", "").lower()
+            title_clean_lower = title_clean.lower()
+            if title_clean_lower in itunes_title or itunes_title in title_clean_lower:
+                apple_track_id = m.group(1)
+                break
+        # Looser fallback: accept first result
+        if not apple_track_id and results:
+            track_url = results[0].get("trackViewUrl", "")
+            m = re.search(r"[?&]i=(\d+)", track_url)
+            if m:
+                apple_track_id = m.group(1)
+
+        if not apple_track_id:
+            logger.debug(f"[iTunes] No track ID found for '{title}'")
+            return {}
+
+        apple_url = f"https://music.apple.com/us/album/-/id?i={apple_track_id}"
+        logger.debug(f"[iTunes] Found Apple Music track {apple_track_id} for '{title}' — querying Odesli")
+
+        try:
+            r2 = self._session.get(
+                _ODESLI_API,
+                params={"url": apple_url, "platform": "appleMusic", "type": "song"},
+                timeout=8,
+            )
+            if r2.status_code == 429:
+                logger.debug(f"[iTunes→Odesli] Rate limited for '{title}'")
+                return {}
+            if not r2.ok:
+                logger.debug(f"[iTunes→Odesli] HTTP {r2.status_code} for '{title}'")
+                return {}
+            return self._extract_odesli(r2.json(), title)
+        except Exception as e:
+            logger.debug(f"[iTunes→Odesli] Request failed for '{title}': {e}")
+            return {}
 
     def _try_songwhip(self, track) -> dict[str, str]:
         """
@@ -214,7 +317,16 @@ class OdesliEnricher:
         title_slug = _to_slug(title)
         title_slug_clean = re.sub(r"-feat-.*$|-ft-.*$|-featuring-.*$", "", title_slug)
 
-        for t_slug in dict.fromkeys([title_slug_clean, title_slug]):
+        # Also try with parenthetical collaboration credits stripped:
+        # "YouUgly (with Westside Gunn)" → "YouUgly", "Glory (feat. Bas)" → "Glory"
+        _COLLAB_RE = re.compile(
+            r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+            re.IGNORECASE,
+        )
+        title_no_collab = _COLLAB_RE.sub("", title).strip()
+        title_slug_no_collab = _to_slug(title_no_collab) if title_no_collab != title else title_slug
+
+        for t_slug in dict.fromkeys([title_slug_no_collab, title_slug_clean, title_slug]):
             url = f"{_SONGWHIP_API}/{artist_slug}/{t_slug}"
             try:
                 resp = self._session.get(url, timeout=8)

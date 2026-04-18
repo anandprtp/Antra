@@ -8,6 +8,8 @@ export function AnalyzeAudio(arg1:string):Promise<Record<string, any>>;
 
 export function CancelDownload():Promise<void>;
 
+export function CheckSourceHealth(arg1:string):Promise<string>;
+
 export function ClearHistory():Promise<void>;
 
 export function GetArtistDiscography(arg1:string):Promise<string>;
@@ -15,6 +17,8 @@ export function GetArtistDiscography(arg1:string):Promise<string>;
 export function GetConfig():Promise<main.Config>;
 
 export function GetHistory():Promise<Array<main.HistoryItem>>;
+
+export function GetSlskdWebUIInfo():Promise<string>;
 
 export function GetSpotifyPlaylists():Promise<string>;
 

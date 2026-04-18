@@ -47,7 +47,7 @@ class ISRCEnricher:
         r.raise_for_status()
         return r.json().get("accessToken")
 
-    def enrich_tracks(self, tracks: list[TrackMetadata], max_workers=10):
+    def enrich_tracks(self, tracks: list[TrackMetadata], max_workers=2):
         if not self.token:
             self.token = self._get_anonymous_token()
 
@@ -60,7 +60,7 @@ class ISRCEnricher:
         BATCH_SIZE = 50
         batches = [ids[i:i + BATCH_SIZE] for i in range(0, len(ids), BATCH_SIZE)]
 
-        logger.info(f"[ISRCEnricher] Enriching {len(ids)} tracks using {len(batches)} batches across {max_workers} parallel workers...")
+        logger.info(f"[ISRCEnricher] Enriching {len(ids)} tracks using {len(batches)} batches...")
 
         def fetch_batch(batch_ids, attempt=1):
             headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
@@ -78,7 +78,12 @@ class ISRCEnricher:
                         return fetch_batch(batch_ids, attempt + 1)
                     return []
                 if r.status_code == 429:
-                    logger.warning("[ISRCEnricher] Rate limited (429). Skipping batch (MusicBrainz fallback will catch this).")
+                    if attempt <= 3:
+                        wait = 2 ** attempt  # 2s, 4s, 8s
+                        logger.warning(f"[ISRCEnricher] Rate limited (429), attempt {attempt}/3. Retrying in {wait}s...")
+                        time.sleep(wait)
+                        return fetch_batch(batch_ids, attempt + 1)
+                    logger.warning("[ISRCEnricher] Rate limited (429) after 3 retries. Skipping batch.")
                     return []
                 r.raise_for_status()
                 return r.json().get("tracks", [])
@@ -86,28 +91,44 @@ class ISRCEnricher:
                 logger.warning(f"[ISRCEnricher] Batch error: {e}")
                 return []
 
+        def _apply_results(resp_tracks):
+            nonlocal enriched_count
+            for t in resp_tracks:
+                if not t or not t.get("id"):
+                    continue
+                track_obj = id_to_track.get(t["id"])
+                if not track_obj:
+                    continue
+                isrc = t.get("external_ids", {}).get("isrc")
+                if isrc:
+                    track_obj.isrc = isrc
+                    enriched_count += 1
+                if t.get("album", {}).get("release_date"):
+                    rel = t["album"]["release_date"]
+                    track_obj.release_date = rel
+                    track_obj.release_year = int(rel[:4]) if len(rel) >= 4 else None
+                if t.get("track_number"):
+                    track_obj.track_number = t["track_number"]
+                # Spotify v1 /tracks includes disc_number — fill it in
+                # when missing so _stamp_disc_totals() can compute total_discs
+                # correctly for multi-disc albums (e.g. anonymous Spotify path
+                # or Amazon Music tracks whose spotify_id was resolved).
+                if track_obj.disc_number is None and t.get("disc_number"):
+                    track_obj.disc_number = t["disc_number"]
+
         enriched_count = 0
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(fetch_batch, batch): batch for batch in batches}
-            for future in as_completed(futures):
-                try:
-                    resp_tracks = future.result()
-                    for t in resp_tracks:
-                        if not t or not t.get("id"): continue
-                        tid = t.get("id")
-                        track_obj = id_to_track.get(tid)
-                        if track_obj:
-                            isrc = t.get("external_ids", {}).get("isrc")
-                            if isrc:
-                                track_obj.isrc = isrc
-                                enriched_count += 1
-                            if t.get("album", {}).get("release_date"):
-                                rel = t["album"]["release_date"]
-                                track_obj.release_date = rel
-                                track_obj.release_year = int(rel[:4]) if len(rel) >= 4 else None
-                            if t.get("track_number"):
-                                track_obj.track_number = t["track_number"]
-                except Exception as e:
-                    logger.warning(f"[ISRCEnricher] Future error: {e}")
+
+        # For a single batch use direct sequential call to avoid any parallel overhead.
+        # For multiple batches use a small pool (max 2) to keep concurrent load minimal.
+        if len(batches) == 1:
+            _apply_results(fetch_batch(batches[0]))
+        else:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as executor:
+                futures = {executor.submit(fetch_batch, batch): batch for batch in batches}
+                for future in as_completed(futures):
+                    try:
+                        _apply_results(future.result())
+                    except Exception as e:
+                        logger.warning(f"[ISRCEnricher] Future error: {e}")
 
         logger.info(f"[ISRCEnricher] ISRC coverage achieved: {enriched_count}/{len(ids)}")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass
@@ -51,10 +52,19 @@ SEARCH_INCOMPLETE_GRACE_PERIOD = 30.0
 DOWNLOAD_POLL_INTERVAL = 1.0  # seconds
 DOWNLOAD_POLL_DEADLINE = 600.0  # seconds (10 minutes max per track)
 QUEUED_STALL_DEADLINE = 180.0  # seconds allowed in queued-like states
+NO_MATCH_REMOVED_CHECK_AFTER = 20.0  # seconds with no match before checking includeRemoved=True
 STATUS_LOG_INTERVAL = 10.0  # seconds
 
 MIN_SIMILARITY = 0.55
 MIN_LOSSY_BITRATE_KBPS = 224
+
+# Strip collaboration credits from track titles before building Soulseek search
+# queries.  Soulseek users typically name files without these suffixes, so
+# "On Time (with John Legend)" → "On Time" matches far more shared files.
+_COLLAB_RE = re.compile(
+    r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -135,7 +145,14 @@ class SoulseekAdapter(BaseSourceAdapter):
             return False
 
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
-        query = f"{track.title} - {track.primary_artist}"
+        clean_title = _COLLAB_RE.sub("", track.title).strip() or track.title
+        stripped_collab = clean_title != track.title
+        if stripped_collab:
+            logger.info(
+                "[Soulseek] Stripped collab credits from search title: %r → %r",
+                track.title, clean_title,
+            )
+        query = f"{clean_title} - {track.primary_artist}"
         cache_key = self._search_cache_key(track)
         cached_results = getattr(self, "_search_cache", {}).get(cache_key)
         if cached_results is not None:
@@ -147,6 +164,20 @@ class SoulseekAdapter(BaseSourceAdapter):
             return None
         logger.debug(f"[Soulseek] Searching: {query}")
 
+        result = self._run_search(track, query, cache_key)
+        if result is not None:
+            return result
+
+        # Fallback: title-only query when collab credits were stripped but the
+        # primary query still found nothing (e.g. file shared as plain "On Time.flac"
+        # with no artist in the name either).  Only runs for tracks that had collab
+        # credits to strip — avoids doubling search time for ordinary failures.
+        if stripped_collab:
+            logger.info("[Soulseek] Primary query found nothing; retrying title-only: %r", clean_title)
+            return self._run_search(track, clean_title, cache_key)
+        return None
+
+    def _run_search(self, track: TrackMetadata, query: str, cache_key: tuple) -> Optional[SearchResult]:
         search_id = str(uuid.uuid4())
         payload = {
             "id": search_id,
@@ -312,10 +343,20 @@ class SoulseekAdapter(BaseSourceAdapter):
             size_str,
         )
 
-        ok = self._transfers.enqueue(  # type: ignore[call-arg]
-            username=username,
-            files=[{"filename": filename, "size": size}],
-        )
+        ok = False
+        for attempt in range(4):
+            try:
+                ok = self._transfers.enqueue(  # type: ignore[call-arg]
+                    username=username,
+                    files=[{"filename": filename, "size": size}],
+                )
+                break
+            except requests.exceptions.HTTPError as e:
+                if getattr(e.response, "status_code", 0) == 429 and attempt < 3:
+                    logger.debug(f"[Soulseek] 429 Too Many Requests on enqueue, retrying in {2.0 * (attempt + 1)}s")
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                raise
         if not ok:
             raise RuntimeError(f"[Soulseek] Failed to enqueue download for {filename}")
 
@@ -323,8 +364,10 @@ class SoulseekAdapter(BaseSourceAdapter):
         download_path: Optional[str] = None
         completed_missing_path: Optional[str] = None
         first_queued_at: Optional[float] = None
+        enqueue_at = time.monotonic()
         last_status_log_at = 0.0
         last_wait_log_at = 0.0
+        checked_removed = False  # only do the includeRemoved=True pass once
 
         while time.monotonic() < deadline:
             try:
@@ -367,11 +410,11 @@ class SoulseekAdapter(BaseSourceAdapter):
                         f"[Soulseek] Download failed for {filename!r}: state={status}"
                     )
                 if state_tokens.intersection({"completed", "succeeded", "success", "finished"}):
-                    path = self._resolve_download_path(dl, filename)
+                    path = self._resolve_download_path(dl, filename, username=username)
                     if path:
                         download_path = path
                         break
-                    completed_missing_path = self._candidate_download_path(dl, filename)
+                    completed_missing_path = self._candidate_download_path(dl, filename, username=username)
                     if completed_missing_path and now - last_wait_log_at >= STATUS_LOG_INTERVAL:
                         logger.info(
                             "[Soulseek] Transfer completed in slskd but file is not on disk yet: %s",
@@ -397,6 +440,38 @@ class SoulseekAdapter(BaseSourceAdapter):
                     )
                     last_wait_log_at = now
 
+                # slskd auto-removes completed transfers from the active list.
+                # If the transfer hasn't appeared after a grace period, do one pass
+                # with includeRemoved=True to catch transfers that completed and
+                # were auto-removed before our first poll (fast peer / tiny file).
+                if not checked_removed and (now - enqueue_at) >= NO_MATCH_REMOVED_CHECK_AFTER:
+                    checked_removed = True
+                    try:
+                        removed_downloads = self._transfers.get_all_downloads(includeRemoved=True)  # type: ignore[call-arg]
+                    except Exception as exc:
+                        logger.debug(f"[Soulseek] get_all_downloads(includeRemoved=True) error: {exc}")
+                        removed_downloads = []
+                    for dl in self._iter_download_entries(removed_downloads):
+                        if str(dl.get("username") or dl.get("user")) != username:
+                            continue
+                        dl_filename = dl.get("filename") or dl.get("file") or ""
+                        if not dl_filename or os.path.basename(dl_filename) != os.path.basename(filename):
+                            continue
+                        _, state_tokens = self._extract_transfer_state(dl)
+                        if state_tokens.intersection({"completed", "succeeded", "success", "finished"}):
+                            logger.info(
+                                "[Soulseek] Transfer for %s was auto-removed from slskd queue after completion; locating file on disk",
+                                os.path.basename(filename),
+                            )
+                            path = self._resolve_download_path(dl, filename, username=username)
+                            if path:
+                                download_path = path
+                                break
+                            completed_missing_path = self._candidate_download_path(dl, filename, username=username)
+                        break
+                    if download_path:
+                        break
+
             if download_path:
                 break
             time.sleep(DOWNLOAD_POLL_INTERVAL)
@@ -415,7 +490,16 @@ class SoulseekAdapter(BaseSourceAdapter):
         os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
 
         if os.path.abspath(download_path) != os.path.abspath(final_path):
-            os.replace(download_path, final_path)
+            for attempt in range(5):
+                try:
+                    shutil.move(download_path, final_path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    logger.debug(f"[Soulseek] File locked, retrying move in 1s (attempt {attempt + 1})")
+                    time.sleep(1.0)
+
             if self._seed_after_download:
                 self._seed_hardlink(download_path, final_path)
             else:
@@ -496,12 +580,12 @@ class SoulseekAdapter(BaseSourceAdapter):
         }
         return status, tokens
 
-    def _resolve_download_path(self, dl: dict[str, Any], fallback_filename: str) -> Optional[str]:
+    def _resolve_download_path(self, dl: dict[str, Any], fallback_filename: str, username: str = "") -> Optional[str]:
         direct_path = dl.get("localPath") or dl.get("path") or dl.get("targetPath")
         if isinstance(direct_path, str) and os.path.isfile(direct_path):
             return direct_path
 
-        for candidate in self._candidate_download_paths(dl, fallback_filename):
+        for candidate in self._candidate_download_paths(dl, fallback_filename, username=username):
             if os.path.isfile(candidate):
                 return candidate
         files_api_match = self._resolve_download_path_via_files_api(dl)
@@ -509,31 +593,45 @@ class SoulseekAdapter(BaseSourceAdapter):
             return files_api_match
         return None
 
-    def _candidate_download_path(self, dl: dict[str, Any], fallback_filename: str) -> Optional[str]:
-        candidates = self._candidate_download_paths(dl, fallback_filename)
+    def _candidate_download_path(self, dl: dict[str, Any], fallback_filename: str, username: str = "") -> Optional[str]:
+        candidates = self._candidate_download_paths(dl, fallback_filename, username=username)
         return candidates[0] if candidates else None
 
-    def _candidate_download_paths(self, dl: dict[str, Any], fallback_filename: str) -> list[str]:
+    def _candidate_download_paths(self, dl: dict[str, Any], fallback_filename: str, username: str = "") -> list[str]:
         downloads_dir = self._get_downloads_dir()
         relative_name = str(dl.get("filename") or dl.get("file") or fallback_filename or "")
+        dl_username = username or str(dl.get("username") or dl.get("user") or "")
         if not downloads_dir or not relative_name:
             return []
 
         normalized_relative = relative_name.lstrip("\\/").replace("\\", os.sep).replace("/", os.sep)
         segments = [segment for segment in normalized_relative.split(os.sep) if segment]
-        variants = [normalized_relative]
+        # Build relative-path variants from most-specific to least-specific.
+        # slskd stores downloads as: {downloads_dir}/{username}/{remote_path_without_drive}
+        # so the username-prefixed variants must come first.
+        rel_variants = [normalized_relative]
         if len(segments) > 1:
-            variants.append(os.path.join(*segments[1:]))
-        variants.append(os.path.basename(normalized_relative))
+            rel_variants.append(os.path.join(*segments[1:]))
+        rel_variants.append(os.path.basename(normalized_relative))
 
         candidates: list[str] = []
         seen: set[str] = set()
-        for variant in variants:
-            candidate = os.path.abspath(os.path.join(downloads_dir, variant))
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            candidates.append(candidate)
+
+        def _add(path: str) -> None:
+            p = os.path.abspath(path)
+            if p not in seen:
+                seen.add(p)
+                candidates.append(p)
+
+        # Username-prefixed variants first (slskd default layout).
+        if dl_username:
+            for variant in rel_variants:
+                _add(os.path.join(downloads_dir, dl_username, variant))
+
+        # Without username prefix (external slskd or flat layout).
+        for variant in rel_variants:
+            _add(os.path.join(downloads_dir, variant))
+
         return candidates
 
     def _get_downloads_dir(self) -> Optional[str]:

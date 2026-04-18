@@ -207,6 +207,58 @@ def emit_progress(progress: BulkDownloadProgress):
     print(json.dumps(data), flush=True)
 
 
+def _infer_playlist_content_type(url: str, tracks) -> str:
+    """Infer a display label (ALBUM, PLAYLIST, SINGLE, TRACK) from the URL and track list."""
+    u = url.lower()
+    if '/playlist/' in u:
+        return 'PLAYLIST'
+    if '/track/' in u:
+        return 'SINGLE'
+    if tracks and getattr(tracks[0], 'playlist_name', None):
+        return 'PLAYLIST'
+    return 'ALBUM'
+
+
+def _playlist_artists_string(tracks) -> str:
+    """Format album-level artist names into a display string (e.g. 'Future & Metro Boomin')."""
+    if not tracks:
+        return ''
+    t = tracks[0]
+    
+    if getattr(t, 'playlist_name', None) and getattr(t, 'playlist_owner', None):
+        res = t.playlist_owner
+        desc = getattr(t, 'playlist_description', None)
+        if desc:
+            res += f" · {desc}"
+        return res
+
+    artists = list(t.album_artists) if t.album_artists else list(t.artists)
+    if not artists:
+        return ''
+    if len(artists) == 1:
+        return artists[0]
+    return ', '.join(artists[:-1]) + ' & ' + artists[-1]
+
+
+def _format_track_release_date(tracks) -> str:
+    """Format the release date of the first track as 'Apr 12 2024' or '2024'."""
+    if not tracks:
+        return ''
+    t = tracks[0]
+    date_str = getattr(t, 'release_date', None) or ''
+    if date_str:
+        try:
+            from datetime import datetime as _dt
+            d = _dt.strptime(str(date_str)[:10], '%Y-%m-%d')
+            months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            return f"{months[d.month - 1]} {d.day} {d.year}"
+        except Exception:
+            pass
+    year = getattr(t, 'release_year', None)
+    return str(year) if year else ''
+
+
 def main():
     _start_time = time.time()
     parser = argparse.ArgumentParser(description="Antra JSON backend")
@@ -270,7 +322,7 @@ def main():
         sys.exit(0)
 
     if args.probe:
-        from antra.utils.runtime import get_ffprobe_exe
+        from antra.utils.runtime import get_ffprobe_exe, get_clean_subprocess_env
         import subprocess
         ffprobe = get_ffprobe_exe()
         if ffprobe:
@@ -278,6 +330,7 @@ def main():
                 [ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_format", "-show_streams", "-select_streams", "a:0", args.probe],
                 capture_output=True, timeout=30,
+                env=get_clean_subprocess_env(),
             )
             if r.returncode == 0:
                 print(r.stdout.decode("utf-8", errors="replace"), flush=True)
@@ -290,7 +343,7 @@ def main():
         sys.exit(0)
 
     if args.spectrogram:
-        from antra.utils.runtime import get_ffmpeg_exe
+        from antra.utils.runtime import get_ffmpeg_exe, get_clean_subprocess_env
         import subprocess, base64 as _b64, tempfile, os as _os
         ffmpeg = get_ffmpeg_exe()
         if not ffmpeg:
@@ -305,6 +358,7 @@ def main():
                  "-lavfi", "showspectrumpic=s=1200x300:mode=combined:legend=0:color=viridis:scale=log:gain=4",
                  "-frames:v", "1", tmp_path],
                 capture_output=True, timeout=120,
+                env=get_clean_subprocess_env(),
             )
             if r.returncode == 0 and _os.path.exists(tmp_path):
                 with open(tmp_path, "rb") as f:
@@ -336,7 +390,14 @@ def main():
             if "download_path" in settings:
                 os.environ["OUTPUT_DIR"] = settings["download_path"]
             if "soulseek_enabled" in settings:
-                os.environ["SLSKD_AUTO_BOOTSTRAP"] = "true" if settings["soulseek_enabled"] else "false"
+                # Also treat sources_enabled: ['soulseek'] as requesting Soulseek even if the
+                # soulseek_enabled flag is false — this happens when the user unchecks the HiFi
+                # source group without explicitly toggling the Soulseek switch (the Soulseek
+                # checkbox appears checked because sourcesAll was true, but soulseek_enabled was
+                # never flipped, leaving it at its false default).
+                sources_has_soulseek = "soulseek" in (settings.get("sources_enabled") or [])
+                soulseek_on = bool(settings["soulseek_enabled"]) or sources_has_soulseek
+                os.environ["SLSKD_AUTO_BOOTSTRAP"] = "true" if soulseek_on else "false"
                 # Desktop app uses dynamic auto-bootstrap. Force clear static env keys to trigger it always.
                 os.environ["SLSKD_BASE_URL"] = ""
                 os.environ["SLSKD_API_KEY"] = ""
@@ -366,6 +427,17 @@ def main():
             else:
                 os.environ["SOURCES_ENABLED"] = ""
 
+            os.environ["LIBRARY_MODE"] = settings.get("library_mode") or "smart_dedup"
+
+            # Always set these env vars explicitly (even to their default values) so
+            # load_dotenv's override=True (which runs at import time) cannot leave a
+            # stale value from a .env file if the config key is absent.
+            os.environ["FOLDER_STRUCTURE"] = settings.get("folder_structure") or "standard"
+            os.environ["FILENAME_FORMAT"] = settings.get("filename_format") or "default"
+
+            if "prefer_explicit" in settings:
+                os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
+
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Failed to load config: {e}"}))
 
@@ -375,6 +447,8 @@ def main():
     from antra.core.config import load_config
     from antra.utils.organizer import LibraryOrganizer
     cfg = load_config()
+
+    print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Folder structure: {cfg.folder_structure}"}))
 
     service = AntraService(cfg)
     options = RuntimeOptions(
@@ -393,7 +467,12 @@ def main():
     # be very slow on a NAS. Reusing one instance across all URLs in this batch
     # means the scan happens exactly once per run, not once per URL.
     try:
-        organizer = LibraryOrganizer(cfg.output_dir)
+        organizer = LibraryOrganizer(
+            cfg.output_dir,
+            full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
+            folder_structure=getattr(cfg, "folder_structure", "standard"),
+            filename_format=getattr(cfg, "filename_format", "default"),
+        )
     except Exception as e:
         print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
         print(json.dumps({"type": "done"}))
@@ -409,6 +488,44 @@ def main():
         try:
             print(json.dumps({"type": "log", "level": "info", "message": f"Syncing playlist to library: {url}"}))
             tracks = service.fetch_playlist_tracks(url, options=options)
+
+            # Emit the full tracklist immediately after metadata is fetched,
+            # before any individual downloads begin.
+            if tracks:
+                # Prefer playlist-level artwork (distinct cover) over track album art
+                _artwork_early = (
+                    getattr(tracks[0], "playlist_artwork_url", None)
+                    or getattr(tracks[0], "artwork_url", None)
+                    or ""
+                )
+                _title_early = (
+                    getattr(tracks[0], "playlist_name", None)
+                    or getattr(tracks[0], "album", None)
+                    or ""
+                )
+                _quality_badge_map = {
+                    'lossless': 'LOSSLESS', 'flac': 'LOSSLESS',
+                    'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
+                }
+                print(json.dumps({
+                    "type": "playlist_loaded",
+                    "title": _title_early,
+                    "artwork_url": _artwork_early,
+                    "content_type": _infer_playlist_content_type(url, tracks),
+                    "artists_string": _playlist_artists_string(tracks),
+                    "release_date": _format_track_release_date(tracks),
+                    "quality_badge": _quality_badge_map.get(cfg.output_format or '', ''),
+                    "track_count": len(tracks),
+                    "tracks": [
+                        {
+                            "artist": t.artist_string,
+                            "title": t.title,
+                            "duration_ms": t.duration_ms or 0,
+                        }
+                        for t in tracks
+                    ],
+                }), flush=True)
+
             results = service.download_tracks(
                 tracks,
                 options=options,
@@ -422,9 +539,24 @@ def main():
                 for r in results
                 if r.file_path and _os.path.exists(r.file_path)
             )
+            _title = ""
+            _artwork_summary = ""
+            if tracks:
+                _title = (
+                    getattr(tracks[0], "playlist_name", None)
+                    or getattr(tracks[0], "album", None)
+                    or ""
+                )
+                _artwork_summary = (
+                    getattr(tracks[0], "playlist_artwork_url", None)
+                    or getattr(tracks[0], "artwork_url", None)
+                    or ""
+                )
             summary = {
                 "type": "playlist_summary",
                 "url": url,
+                "title": _title,
+                "artwork_url": _artwork_summary,
                 "total": len(results),
                 "downloaded": sum(1 for r in results if r.status.name == "COMPLETED"),
                 "failed": sum(1 for r in results if r.status.name == "FAILED"),
@@ -453,6 +585,8 @@ def main():
             summary = {
                 "type": "playlist_summary",
                 "url": url,
+                "title": "",
+                "artwork_url": "",
                 "total": 0,
                 "downloaded": 0,
                 "failed": 0,

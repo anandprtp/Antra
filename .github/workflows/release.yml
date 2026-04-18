@@ -296,7 +296,7 @@ jobs:
             - **Correct Amazon ASINs** — ASINs now sourced directly from Amazon Music URLs; Odesli runs before the amazon.com scraper, preventing wrong track matches ([#10](https://github.com/anandprtp/Antra/issues/10))
             - **Faster Downloads** — Amazon 404 errors no longer trigger 3 retries; skipped instantly ([#10](https://github.com/anandprtp/Antra/issues/10))
             - **Version Label** — app version is now shown in the settings panel
-            - **Community** — join us on [Reddit](https://www.reddit.com/r/antraverse/) · support on [Ko-fi](https://ko-fi.com/antraverse)
+            - **Community** — join us on [Telegram](https://t.me/antraaverse) · support on [Ko-fi](https://ko-fi.com/antraverse)
 
             ## Bug Fixes
 

@@ -14,6 +14,10 @@ export function CancelDownload() {
   return window['go']['main']['App']['CancelDownload']();
 }
 
+export function CheckSourceHealth(arg1) {
+  return window['go']['main']['App']['CheckSourceHealth'](arg1);
+}
+
 export function ClearHistory() {
   return window['go']['main']['App']['ClearHistory']();
 }
@@ -28,6 +32,10 @@ export function GetConfig() {
 
 export function GetHistory() {
   return window['go']['main']['App']['GetHistory']();
+}
+
+export function GetSlskdWebUIInfo() {
+  return window['go']['main']['App']['GetSlskdWebUIInfo']();
 }
 
 export function GetSpotifyPlaylists() {

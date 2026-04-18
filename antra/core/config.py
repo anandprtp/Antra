@@ -140,6 +140,30 @@ class Config:
     # Empty = all enabled. Controlled via the Sources toggle in Settings.
     sources_enabled: str = ""
 
+    # Prefer explicit (non-censored) track versions.  When True, the resolver
+    # penalises results whose title contains "radio edit", "clean version", etc.
+    # (or whose adapter confirms is_explicit=False) and keeps searching for the
+    # explicit version rather than immediately accepting the clean one.
+    prefer_explicit: bool = True
+
+    # Library deduplication mode:
+    #   "smart_dedup"  — skip a track if the same ISRC/ID exists anywhere in the library (default)
+    #   "full_albums"  — only skip if the file exists in the exact target folder; allows the same
+    #                    track to exist in multiple album folders (e.g. studio album + Best Of)
+    library_mode: str = "smart_dedup"
+
+    # Folder structure layout:
+    #   "standard" — Artist / Album (Year) / files  (default, Navidrome/Jellyfin/Plex compatible)
+    #   "flat"     — Album (Year) / files  (no artist wrapper, simpler manual organisation)
+    folder_structure: str = "standard"
+
+    # Filename format for downloaded tracks:
+    #   "default"      — NN - Title  (track-number prefix, current behaviour)
+    #   "title_only"   — Title
+    #   "artist_title" — Artist - Title
+    #   "title_artist" — Title - Artist
+    filename_format: str = "default"
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -197,5 +221,9 @@ def load_config() -> Config:
         soulseek_auto_bootstrap=os.getenv("SLSKD_AUTO_BOOTSTRAP", "true").lower() == "true",
         soulseek_seed_after_download=os.getenv("SOULSEEK_SEED_AFTER_DOWNLOAD", "false").lower() == "true",
         sources_enabled=os.getenv("SOURCES_ENABLED", ""),
+        prefer_explicit=os.getenv("PREFER_EXPLICIT", "true").lower() == "true",
+        library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
+        folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
+        filename_format=os.getenv("FILENAME_FORMAT", "default"),
     )
     return cfg

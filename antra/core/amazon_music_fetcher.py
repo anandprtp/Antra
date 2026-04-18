@@ -134,6 +134,9 @@ class AmazonMusicFetcher:
         # Try JSON-LD first (schema.org MusicAlbum — reliable, Amazon always embeds it)
         tracks = self._parse_jsonld_album(html)
         if tracks:
+            # JSON-LD gives flat position numbers — disc info is not in schema.org.
+            # Supplement with disc headers extracted from the rendered HTML.
+            self._assign_disc_numbers_from_html(html, tracks)
             return tracks
 
         # Fall back to web-component attribute parsing (older page format)
@@ -299,8 +302,16 @@ class AmazonMusicFetcher:
             return tracks
 
         # --- Album: music-horizontal-item ---
+        # Parse disc headers and item positions together to assign disc numbers.
         album, album_img = self._extract_album_metadata(html)
-        for idx, attrs in enumerate(re.findall(r'<music-horizontal-item\b([^>]+)>', html, re.DOTALL), start=1):
+        disc_header_re = re.compile(r'\b(?:Disc|CD)\s+(\d+)\b', re.IGNORECASE)
+        disc_headers = [(m.start(), int(m.group(1))) for m in disc_header_re.finditer(html)]
+
+        item_matches = list(re.finditer(r'<music-horizontal-item\b([^>]+)>', html, re.DOTALL))
+        disc_track_counts: dict[int, int] = {}
+
+        for item_m in item_matches:
+            attrs = item_m.group(1)
             href = _get_dq('primary-href', attrs)
             if 'trackAsin=' not in href:
                 continue
@@ -309,15 +320,26 @@ class AmazonMusicFetcher:
                 continue
             artist = _get_dq('secondary-text', attrs)
             dur_ms = _parse_duration(_get_dq('duration', attrs))
+
+            # Determine disc number from most-recently-preceding disc header
+            disc = 1
+            if disc_headers:
+                for hpos, hnum in disc_headers:
+                    if hpos < item_m.start():
+                        disc = hnum
+            disc_track_counts[disc] = disc_track_counts.get(disc, 0) + 1
+            track_num_in_disc = disc_track_counts[disc]
+
             tracks.append(TrackMetadata(
                 title=title,
                 artists=[artist] if artist else [],
                 album=album or "",
                 duration_ms=dur_ms,
-                track_number=idx if not is_playlist else None,
+                track_number=track_num_in_disc if not is_playlist else None,
+                disc_number=disc if disc_headers and not is_playlist else None,
                 artwork_url=album_img or None,
                 playlist_name=playlist_name,
-                playlist_position=idx if is_playlist else None,
+                playlist_position=len(tracks) + 1 if is_playlist else None,
             ))
 
         return tracks
@@ -398,6 +420,48 @@ class AmazonMusicFetcher:
 
         logger.info(f"[AmazonMusic] JSON-LD: parsed {len(tracks)} tracks for album {album_name!r}")
         return tracks
+
+    def _assign_disc_numbers_from_html(self, html: str, tracks: list[TrackMetadata]) -> None:
+        """Scan the album HTML for disc section headers and stamp disc_number on tracks.
+
+        Amazon album pages render disc separators as text like "Disc 1" / "Disc 2"
+        (or "CD 1" / "CD 2") somewhere before the corresponding <music-horizontal-item>
+        blocks in the SSR HTML.  We locate those headers and the track item elements,
+        both by their byte position in the HTML, then assign each track the disc number
+        of the most-recently-seen header above it.
+
+        The method modifies `tracks` in place and also resets track_number to be
+        1-based within each disc (so disc-2 track 1 stays "1", not "13").
+        If no disc headers are found the list is left unchanged.
+        """
+        disc_header_re = re.compile(r'\b(?:Disc|CD)\s+(\d+)\b', re.IGNORECASE)
+        disc_headers = [(m.start(), int(m.group(1))) for m in disc_header_re.finditer(html)]
+        if not disc_headers:
+            return
+
+        item_positions = [m.start() for m in re.finditer(r'<music-horizontal-item\b', html)]
+        if len(item_positions) != len(tracks):
+            # Can't reliably line up HTML positions with JSON-LD tracks — skip
+            logger.debug(
+                f"[AmazonMusic] Disc detection: {len(item_positions)} HTML items vs "
+                f"{len(tracks)} JSON-LD tracks — skipping disc assignment"
+            )
+            return
+
+        disc_counts: dict[int, int] = {}
+        for i, item_pos in enumerate(item_positions):
+            disc = 1
+            for hpos, hnum in disc_headers:
+                if hpos < item_pos:
+                    disc = hnum
+            disc_counts[disc] = disc_counts.get(disc, 0) + 1
+            tracks[i].disc_number = disc
+            tracks[i].track_number = disc_counts[disc]
+
+        logger.debug(
+            f"[AmazonMusic] Disc assignment: "
+            + ", ".join(f"disc {d}: {c} tracks" for d, c in sorted(disc_counts.items()))
+        )
 
     def _extract_album_metadata(self, html: str) -> tuple[str, Optional[str]]:
         """Extract album name and artwork URL from the page's detail header."""
