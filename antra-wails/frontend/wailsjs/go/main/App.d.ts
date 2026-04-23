@@ -12,6 +12,8 @@ export function CheckSourceHealth(arg1:string):Promise<string>;
 
 export function ClearHistory():Promise<void>;
 
+export function ForgetTrack(arg1:string):Promise<void>;
+
 export function GetArtistDiscography(arg1:string):Promise<string>;
 
 export function GetConfig():Promise<main.Config>;

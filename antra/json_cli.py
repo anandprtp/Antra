@@ -566,6 +566,15 @@ def main():
                 "date": datetime.now().isoformat(),
                 "total_mb": round(_total_bytes / (1024 * 1024), 1),
                 "elapsed_seconds": round(_elapsed),
+                "tracks": [
+                    {
+                        "title": r.track.title,
+                        "artist": r.track.artist_string,
+                        "file_path": r.file_path or "",
+                        "status": r.status.name,
+                    }
+                    for r in results
+                ],
             }
 
             for r in results:
@@ -596,6 +605,7 @@ def main():
                 "date": datetime.now().isoformat(),
                 "total_mb": 0,
                 "elapsed_seconds": round(_elapsed),
+                "tracks": [],
             }
             print(json.dumps(summary), flush=True)
 
