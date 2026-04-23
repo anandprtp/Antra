@@ -103,6 +103,11 @@ If Antra saves you money on streaming subscriptions, consider giving back:
   </a>
 </p>
 
+<p align="center">
+  PayPal: <a href="https://paypal.me/hoshiyaar1501">https://paypal.me/hoshiyaar1501</a><br/>
+  USDT (TRC20): <code>TCzJhbLfeSphfwRAmXTQrPKW3RrniG2H8q</code>
+</p>
+
 ---
 
 ## Soulseek / P2P
