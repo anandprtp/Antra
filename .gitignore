@@ -23,6 +23,7 @@ antra-wails/frontend/dist/
 antra-wails/frontend/node_modules/
 antra-wails/frontend/package.json.md5
 antra-wails/*.exe
+antra-wails/_pyinstaller_work/
 
 # Music library (user data - not part of the repo)
 Music/

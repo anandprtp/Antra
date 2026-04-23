@@ -1,5 +1,5 @@
 export namespace main {
-	
+
 	export class Config {
 	    download_path: string;
 	    soulseek_enabled: boolean;
@@ -13,11 +13,11 @@ export namespace main {
 	    prefer_explicit?: boolean;
 	    folder_structure?: string;
 	    filename_format?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.download_path = source["download_path"];
@@ -34,6 +34,24 @@ export namespace main {
 	        this.filename_format = source["filename_format"];
 	    }
 	}
+	export class HistoryTrack {
+	    title: string;
+	    artist: string;
+	    file_path?: string;
+	    status: string;
+
+	    static createFrom(source: any = {}) {
+	        return new HistoryTrack(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.title = source["title"];
+	        this.artist = source["artist"];
+	        this.file_path = source["file_path"];
+	        this.status = source["status"];
+	    }
+	}
 	export class HistoryItem {
 	    date: string;
 	    url: string;
@@ -45,11 +63,12 @@ export namespace main {
 	    skipped: number;
 	    error?: string;
 	    sources: Record<string, number>;
-	
+	    tracks?: HistoryTrack[];
+
 	    static createFrom(source: any = {}) {
 	        return new HistoryItem(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.date = source["date"];
@@ -62,8 +81,8 @@ export namespace main {
 	        this.skipped = source["skipped"];
 	        this.error = source["error"];
 	        this.sources = source["sources"];
+	        this.tracks = source["tracks"];
 	    }
 	}
 
 }
-

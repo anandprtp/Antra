@@ -35,6 +35,13 @@ type Config struct {
 	FilenameFormat        string   `json:"filename_format,omitempty"`
 }
 
+type HistoryTrack struct {
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	FilePath string `json:"file_path,omitempty"`
+	Status   string `json:"status"`
+}
+
 type HistoryItem struct {
 	Date       string         `json:"date"`
 	URL        string         `json:"url"`
@@ -46,6 +53,7 @@ type HistoryItem struct {
 	Skipped    int            `json:"skipped"`
 	Error      string         `json:"error,omitempty"`
 	Sources    map[string]int `json:"sources"`
+	Tracks     []HistoryTrack `json:"tracks,omitempty"`
 }
 
 func getAppDataDir() string {
@@ -158,6 +166,47 @@ func (a *App) ClearHistory() error {
 	if _, err := os.Stat(path); err == nil {
 		return os.Remove(path)
 	}
+	return nil
+}
+
+// ForgetTrack removes a track's download state and deletes its file so it can be re-downloaded.
+func (a *App) ForgetTrack(filePath string) error {
+	cfg := a.GetConfig()
+	statePath := filepath.Join(cfg.DownloadPath, ".antra_state.json")
+
+	data, err := os.ReadFile(statePath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+
+	if len(data) > 0 {
+		var state map[string]interface{}
+		if err := json.Unmarshal(data, &state); err != nil {
+			return err
+		}
+
+		cleanTarget := filepath.Clean(filePath)
+		for key, val := range state {
+			if strings.HasPrefix(key, "TRACK:") {
+				if valStr, ok := val.(string); ok && filepath.Clean(valStr) == cleanTarget {
+					delete(state, key)
+				}
+			}
+		}
+
+		updated, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(statePath, updated, 0644); err != nil {
+			return err
+		}
+	}
+
+	if _, err := os.Stat(filePath); err == nil {
+		os.Remove(filePath)
+	}
+
 	return nil
 }
 
