@@ -1,5 +1,5 @@
 export namespace main {
-
+	
 	export class Config {
 	    download_path: string;
 	    soulseek_enabled: boolean;
@@ -13,11 +13,11 @@ export namespace main {
 	    prefer_explicit?: boolean;
 	    folder_structure?: string;
 	    filename_format?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.download_path = source["download_path"];
@@ -39,11 +39,11 @@ export namespace main {
 	    artist: string;
 	    file_path?: string;
 	    status: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new HistoryTrack(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.title = source["title"];
@@ -64,11 +64,11 @@ export namespace main {
 	    error?: string;
 	    sources: Record<string, number>;
 	    tracks?: HistoryTrack[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new HistoryItem(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.date = source["date"];
@@ -81,8 +81,27 @@ export namespace main {
 	        this.skipped = source["skipped"];
 	        this.error = source["error"];
 	        this.sources = source["sources"];
-	        this.tracks = source["tracks"];
+	        this.tracks = this.convertValues(source["tracks"], HistoryTrack);
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }
+

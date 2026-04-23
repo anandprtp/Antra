@@ -47,7 +47,6 @@
   let showSettings = false;
   let slskdWebUIInfo: {url: string, username: string, password: string} | null = null;
   let historyItems: any[] = [];
-  let expandedHistoryItems: Set<number> = new Set();
   let forgottenTracks: Set<string> = new Set();
   let inputUrl = '';
   let isDownloading = false;
@@ -870,7 +869,6 @@
       console.error(e);
       historyItems = [];
     }
-    expandedHistoryItems = new Set();
     forgottenTracks = new Set();
     showHistory = true;
   }
@@ -892,15 +890,6 @@
     }
   }
 
-  function toggleHistoryExpand(index: number) {
-    const next = new Set(expandedHistoryItems);
-    if (next.has(index)) {
-      next.delete(index);
-    } else {
-      next.add(index);
-    }
-    expandedHistoryItems = next;
-  }
 
   async function saveSettings() {
     await SaveConfig(config);
@@ -1306,36 +1295,28 @@
               </div>
             {/if}
             {#if item.tracks && item.tracks.length > 0}
-              <div style="margin-top: 8px;">
-                <button
-                  on:click={() => toggleHistoryExpand(i)}
-                  style="font-size: 11px; padding: 2px 8px; border-color: rgba(255,255,255,0.15); color: rgba(255,255,255,0.5); background: transparent;"
-                >{expandedHistoryItems.has(i) ? '▾' : '▸'} {item.tracks.length} tracks</button>
-                {#if expandedHistoryItems.has(i)}
-                  <div style="margin-top: 6px; display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto;">
-                    {#each item.tracks as track, ti}
-                      {#if !forgottenTracks.has(`${i}-${ti}`)}
-                        <div style="display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,0.03);">
-                          <span style="flex: 1; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.75;">{track.title} <span style="opacity:0.5;">— {track.artist}</span></span>
-                          {#if track.status === 'COMPLETED'}
-                            <span style="font-size: 10px; color: #4ade80; background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">✓</span>
-                          {:else if track.status === 'SKIPPED'}
-                            <span style="font-size: 10px; color: #94a3b8; background: rgba(148,163,184,0.08); border: 1px solid rgba(148,163,184,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">skipped</span>
-                          {:else if track.status === 'FAILED'}
-                            <span style="font-size: 10px; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">failed</span>
-                          {/if}
-                          {#if track.file_path && (track.status === 'COMPLETED' || track.status === 'SKIPPED')}
-                            <button
-                              title="Delete from library so this track can be re-downloaded"
-                              on:click={() => forgetTrack(i, ti, track.file_path)}
-                              style="flex-shrink: 0; padding: 1px 7px; font-size: 10px; border-color: rgba(248,113,113,0.3); color: #f87171; background: rgba(248,113,113,0.05);"
-                            >Delete</button>
-                          {/if}
-                        </div>
+              <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto;">
+                {#each item.tracks as track, ti}
+                  {#if !forgottenTracks.has(`${i}-${ti}`)}
+                    <div style="display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; background: rgba(255,255,255,0.03);">
+                      <span style="flex: 1; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.75;">{track.title} <span style="opacity:0.5;">— {track.artist}</span></span>
+                      {#if track.status === 'COMPLETED'}
+                        <span style="font-size: 10px; color: #4ade80; background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">✓</span>
+                      {:else if track.status === 'SKIPPED'}
+                        <span style="font-size: 10px; color: #94a3b8; background: rgba(148,163,184,0.08); border: 1px solid rgba(148,163,184,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">skipped</span>
+                      {:else if track.status === 'FAILED'}
+                        <span style="font-size: 10px; color: #f87171; background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); border-radius: 3px; padding: 1px 5px; flex-shrink:0;">failed</span>
                       {/if}
-                    {/each}
-                  </div>
-                {/if}
+                      {#if track.file_path && (track.status === 'COMPLETED' || track.status === 'SKIPPED')}
+                        <button
+                          title="Delete from library so this track can be re-downloaded"
+                          on:click={() => forgetTrack(i, ti, track.file_path)}
+                          style="flex-shrink: 0; padding: 1px 7px; font-size: 10px; border-color: rgba(248,113,113,0.3); color: #f87171; background: rgba(248,113,113,0.05);"
+                        >Delete</button>
+                      {/if}
+                    </div>
+                  {/if}
+                {/each}
               </div>
             {/if}
           </div>

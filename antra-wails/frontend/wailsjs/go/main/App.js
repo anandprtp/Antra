@@ -22,6 +22,10 @@ export function ClearHistory() {
   return window['go']['main']['App']['ClearHistory']();
 }
 
+export function ForgetTrack(arg1) {
+  return window['go']['main']['App']['ForgetTrack'](arg1);
+}
+
 export function GetArtistDiscography(arg1) {
   return window['go']['main']['App']['GetArtistDiscography'](arg1);
 }
@@ -84,10 +88,6 @@ export function SetSpotifyToken(arg1) {
 
 export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
-}
-
-export function ForgetTrack(arg1) {
-  return window['go']['main']['App']['ForgetTrack'](arg1);
 }
 
 export function WriteFile(arg1, arg2) {
