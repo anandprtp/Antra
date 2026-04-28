@@ -34,14 +34,15 @@
 
 ## What it does
 
-Paste a Spotify, Apple Music, or Amazon Music link (playlist, album, or artist) and Antra finds the best lossless source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
+Paste a Spotify, Apple Music, or Amazon Music link (playlist, album, or artist) and Antra queries all lossless-capable sources in parallel, picks the highest bit-depth result, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
 No premium account. No Python. No setup. One binary.
 
 ```
 Sources:  Community-run APIs (Tidal · Qobuz · Amazon) + Soulseek P2P fallback
-Matching: ISRC-based, exact pressing every time
+Matching: ISRC-based, exact pressing every time — best 24-bit source wins
 Output:   FLAC · auto-tagged · Navidrome · Jellyfin · Plex ready
+Binary:   74 MB self-contained executable
 ```
 
 → **[Full feature guide](FEATURES.md)**

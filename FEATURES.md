@@ -14,16 +14,16 @@
 
 ## Multi-Source Audio Engine
 
-Antra doesn't rely on a single source. It works through a waterfall of community-run servers, always trying the highest-quality lossless format first and falling back gracefully when a source is unavailable or rate-limited.
+Antra doesn't rely on a single source. In lossless mode, it queries **all** lossless-capable sources in parallel and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
 
 ```
-Priority chain (per track):
+Source chain (per track):
 
   Community-run APIs  →  Tidal · Qobuz · Amazon Music  (FLAC, up to 24-bit/192kHz)
   Soulseek P2P        →  anything the community has, including rare and out-of-print releases
 ```
 
-Load is distributed evenly across same-tier sources. When a server is temporarily rate-limited, Antra moves it to the back of the queue and continues from the others with no stalls or dead time.
+When a server is temporarily rate-limited, Antra moves it to the back of the queue and continues from the others with no stalls or dead time. In strict lossless mode, a track is marked failed rather than falling back to a lossy source.
 
 ---
 
@@ -45,7 +45,7 @@ Configurable in Settings: **Prefer explicit versions** (on by default).
 
 ## Hi-Res Awareness
 
-Apple Music's catalog API includes per-track quality hints (`hi-res-lossless`, `lossless`, `atmos`). When a track is known to have a 24-bit master, Antra keeps searching even if a 16-bit lossless result is found, only settling for CD quality if no hi-res source can be located.
+Tidal and Qobuz expose per-track bit depth and sample rate in their search results. When a track has a hi-res master available (e.g. 24-bit/96kHz from Tidal, up to 24-bit/192kHz from Qobuz), Antra keeps searching all lossless-capable sources and selects the highest-resolution result — ranked by bit depth first, then sample rate. CD quality (16-bit/44.1kHz) is only used if no hi-res source can be located.
 
 ---
 
@@ -126,7 +126,7 @@ Search for any artist by Spotify or Apple Music URL. Antra fetches their full di
 
 ## Parallel Download Engine
 
-Antra downloads multiple tracks simultaneously. Playlists and albums that would take minutes sequentially complete in a fraction of the time.
+Antra downloads 2 tracks concurrently by default. Playlists and albums that would take minutes sequentially complete in a fraction of the time.
 
 ```
 Sequential:   track 1 → track 2 → track 3 → ...
@@ -151,7 +151,7 @@ A dedicated log panel (accessible via the 📋 button) shows verbose download ou
 
 ## Source Health Check
 
-Three chips below the URL bar let you check whether the community-run Tidal, Qobuz, and Amazon servers are reachable before you start a download. Clicking a chip runs parallel health probes against all known endpoints and shows a live/total count with per-endpoint status dots. No server URLs are ever displayed.
+Three chips below the URL bar show the live status of the community-run Tidal, Qobuz, and Amazon servers. Each chip displays whether the adapter is **enabled** (green glow, brand-tinted background) or **disabled** (dark red border, dimmed). Clicking a chip opens the adapter's settings section; clicking a disabled chip also toggles it on and saves the config. Parallel health probes show a live/total count with per-endpoint status dots. No server URLs are ever displayed.
 
 ---
 
@@ -196,7 +196,7 @@ For tracks that aren't available through any streaming-adjacent source (rare alb
 | Mode | Output |
 |---|---|
 | **Auto** (default) | Best available. Lossless preferred, MP3 fallback if no lossless source exists. |
-| **Lossless** | FLAC only. Track is marked failed rather than falling back to lossy. |
+| **Lossless** | FLAC only. `.m4a` containers (e.g. Tidal segments) are re-containerized to `.flac`. Track is marked failed rather than falling back to lossy. |
 | **MP3** | Uses dedicated MP3 sources directly. No FLAC download and transcode. |
 
 ---
