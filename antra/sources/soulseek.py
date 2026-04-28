@@ -588,7 +588,7 @@ class SoulseekAdapter(BaseSourceAdapter):
         for candidate in self._candidate_download_paths(dl, fallback_filename, username=username):
             if os.path.isfile(candidate):
                 return candidate
-        files_api_match = self._resolve_download_path_via_files_api(dl)
+        files_api_match = self._resolve_download_path_via_files_api(dl, username=username)
         if files_api_match:
             return files_api_match
         return None
@@ -657,19 +657,41 @@ class SoulseekAdapter(BaseSourceAdapter):
         return self._downloads_dir
 
     @staticmethod
-    def _iter_downloaded_files(directory: Any) -> Iterator[dict[str, Any]]:
+    def _iter_downloaded_files(
+        directory: Any,
+        relative_dir: str = "",
+    ) -> Iterator[tuple[dict[str, Any], str]]:
         if not isinstance(directory, dict):
             return
 
         for file_info in directory.get("files") or []:
             if isinstance(file_info, dict):
-                yield file_info
+                yield file_info, relative_dir
 
         for nested in directory.get("directories") or []:
-            if isinstance(nested, dict):
-                yield from SoulseekAdapter._iter_downloaded_files(nested)
+            if not isinstance(nested, dict):
+                continue
+            nested_name = str(
+                nested.get("name")
+                or os.path.basename(str(nested.get("fullName") or ""))
+                or ""
+            ).strip()
+            next_relative_dir = relative_dir
+            if nested_name:
+                next_relative_dir = (
+                    os.path.join(relative_dir, nested_name)
+                    if relative_dir else nested_name
+                )
+            yield from SoulseekAdapter._iter_downloaded_files(
+                nested,
+                next_relative_dir,
+            )
 
-    def _resolve_download_path_via_files_api(self, dl: dict[str, Any]) -> Optional[str]:
+    def _resolve_download_path_via_files_api(
+        self,
+        dl: dict[str, Any],
+        username: str = "",
+    ) -> Optional[str]:
         downloads_dir = self._get_downloads_dir()
         basename = os.path.basename(str(dl.get("filename") or dl.get("file") or ""))
         expected_size = dl.get("size")
@@ -682,7 +704,7 @@ class SoulseekAdapter(BaseSourceAdapter):
             logger.debug(f"[Soulseek] Failed to inspect slskd downloads dir: {exc}")
             return None
 
-        for file_info in self._iter_downloaded_files(downloads_tree):
+        for file_info, relative_dir in self._iter_downloaded_files(downloads_tree):
             file_name = str(file_info.get("name") or os.path.basename(str(file_info.get("fullName") or "")))
             if file_name != basename:
                 continue
@@ -698,15 +720,67 @@ class SoulseekAdapter(BaseSourceAdapter):
             if wanted_size and actual_size and actual_size != wanted_size:
                 continue
 
-            full_name = str(file_info.get("fullName") or file_info.get("name") or "")
-            if not full_name:
-                continue
-            candidate = os.path.abspath(
-                os.path.join(downloads_dir, full_name.replace("\\", os.sep).replace("/", os.sep))
-            )
-            if os.path.isfile(candidate):
-                return candidate
+            for candidate in self._files_api_candidates(
+                downloads_dir=downloads_dir,
+                file_info=file_info,
+                relative_dir=relative_dir,
+                username=username or str(dl.get("username") or dl.get("user") or ""),
+            ):
+                if os.path.isfile(candidate):
+                    return candidate
         return None
+
+    @staticmethod
+    def _files_api_candidates(
+        downloads_dir: str,
+        file_info: dict[str, Any],
+        relative_dir: str,
+        username: str = "",
+    ) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str) -> None:
+            absolute = os.path.abspath(path)
+            if absolute not in seen:
+                seen.add(absolute)
+                candidates.append(absolute)
+
+        raw_full_name = str(file_info.get("fullName") or "").strip()
+        file_name = str(
+            file_info.get("name")
+            or os.path.basename(raw_full_name)
+            or ""
+        ).strip()
+
+        if raw_full_name:
+            normalized_full_name = raw_full_name.replace("\\", os.sep).replace("/", os.sep)
+            if os.path.isabs(normalized_full_name):
+                _add(normalized_full_name)
+            else:
+                _add(os.path.join(downloads_dir, normalized_full_name))
+                if username:
+                    normalized_username = username.strip("\\/")
+                    full_parts = [
+                        part for part in normalized_full_name.split(os.sep) if part
+                    ]
+                    if not full_parts or full_parts[0] != normalized_username:
+                        _add(os.path.join(downloads_dir, normalized_username, normalized_full_name))
+
+        if file_name:
+            if relative_dir:
+                rel_path = os.path.join(relative_dir, file_name)
+                _add(os.path.join(downloads_dir, rel_path))
+                if username:
+                    normalized_username = username.strip("\\/")
+                    rel_parts = [part for part in rel_path.split(os.sep) if part]
+                    if not rel_parts or rel_parts[0] != normalized_username:
+                        _add(os.path.join(downloads_dir, normalized_username, rel_path))
+            _add(os.path.join(downloads_dir, file_name))
+            if username:
+                _add(os.path.join(downloads_dir, username.strip("\\/"), file_name))
+
+        return candidates
 
     def _seed_hardlink(self, original_download_path: str, library_path: str) -> None:
         """

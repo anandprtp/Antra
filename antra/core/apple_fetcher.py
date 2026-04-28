@@ -213,7 +213,7 @@ class AppleFetcher:
                                 # instead of the canonical album name from the track attribute.
                                 if cat_album_name:
                                     meta.album = cat_album_name
-                                if cat_release_raw and not meta.release_date:
+                                if cat_release_raw:
                                     meta.release_date = cat_release_raw
                                     try:
                                         meta.release_year = int(cat_release_raw[:4])

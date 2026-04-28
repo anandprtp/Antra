@@ -28,6 +28,11 @@ _SP_TOTP_VERSION = 61
 _GQL_ALBUM_HASH   = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
 _GQL_TRACK_HASH   = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
 
+_DISCOGRAPHY_CLEAN_RE = re.compile(
+    r"\b(clean|edited|radio edit|censored)\b",
+    re.IGNORECASE,
+)
+
 
 class SpotifyResourceError(RuntimeError):
     """Raised when a Spotify resource cannot be fetched with the available token."""
@@ -1581,6 +1586,7 @@ class SpotifyClient:
         albums: list[dict] = []
         offset = 0
         limit = 50
+        explicit_cache: dict[str, int] = {}
         while True:
             resp = self.sp.artist_albums(
                 artist_id,
@@ -1610,12 +1616,16 @@ class SpotifyClient:
             offset += limit
             _time.sleep(0.05)
 
-        logger.info(f"Discography fetched for {artist_name}: {len(albums)} releases")
+        deduped_albums = self._dedupe_discography_albums(albums, explicit_cache)
+        logger.info(
+            f"Discography fetched for {artist_name}: {len(deduped_albums)} releases "
+            f"({len(albums) - len(deduped_albums)} duplicates collapsed)"
+        )
         return {
             "artist_id": artist_id,
             "artist_name": artist_name,
             "artwork_url": artwork_url,
-            "albums": albums,
+            "albums": deduped_albums,
         }
 
     def _fetch_artist_discography_info_itunes(self, url_or_id: str) -> dict:
@@ -1684,10 +1694,86 @@ class SpotifyClient:
                 "artist_id": artist_id,
                 "artist_name": artist_name,
                 "artwork_url": artwork_url,
-                "albums": albums,
+                "albums": self._dedupe_discography_albums(albums),
             }
         except Exception as e:
             raise RuntimeError(f"[Spotify] iTunes fallback failed: {e}")
+
+    @staticmethod
+    def _discography_release_key(album: dict) -> tuple[str, str, int, int]:
+        raw_name = str(album.get("name") or "").lower()
+        normalized_name = re.sub(r"\s+", " ", raw_name).strip()
+        return (
+            normalized_name,
+            str(album.get("type") or "album"),
+            int(album.get("year") or 0),
+            int(album.get("track_count") or 0),
+        )
+
+    def _discography_release_explicit_score(
+        self,
+        album_id: str,
+        cache: dict[str, int],
+    ) -> int:
+        cached = cache.get(album_id)
+        if cached is not None:
+            return cached
+        score = 0
+        try:
+            album = self.sp.album(album_id, market=self._market or "US")
+            tracks = ((album.get("tracks") or {}).get("items") or [])
+            explicit_count = sum(1 for track in tracks if track.get("explicit") is True)
+            clean_count = sum(1 for track in tracks if track.get("explicit") is False)
+            if explicit_count > 0:
+                score = 2
+            elif clean_count > 0:
+                score = 0
+            else:
+                score = 1
+        except Exception as e:
+            logger.debug(f"[Spotify] Could not inspect album explicitness for {album_id}: {e}")
+            score = 1
+        cache[album_id] = score
+        return score
+
+    def _discography_release_sort_key(
+        self,
+        album: dict,
+        explicit_cache: Optional[dict[str, int]] = None,
+    ) -> tuple[int, int, int, str]:
+        name = str(album.get("name") or "")
+        album_id = str(album.get("id") or "")
+        if explicit_cache is not None and album_id:
+            explicit_score = self._discography_release_explicit_score(album_id, explicit_cache)
+        else:
+            explicit_score = 0 if _DISCOGRAPHY_CLEAN_RE.search(name) else 1
+        return (
+            explicit_score,
+            1 if album.get("artwork_url") else 0,
+            int(album.get("track_count") or 0),
+            album_id,
+        )
+
+    def _dedupe_discography_albums(
+        self,
+        albums: list[dict],
+        explicit_cache: Optional[dict[str, int]] = None,
+    ) -> list[dict]:
+        grouped: dict[tuple[str, str, int, int], list[dict]] = {}
+        for album in albums:
+            grouped.setdefault(self._discography_release_key(album), []).append(album)
+
+        deduped: list[dict] = []
+        for group in grouped.values():
+            if len(group) == 1:
+                deduped.append(group[0])
+                continue
+            best = max(
+                group,
+                key=lambda album: self._discography_release_sort_key(album, explicit_cache),
+            )
+            deduped.append(best)
+        return deduped
 
     def _fetch_artist_top(self, url_or_id: str) -> list[TrackMetadata]:
         artist_id = _strip_id(url_or_id, "artist")
@@ -1753,9 +1839,9 @@ class SpotifyClient:
         """Fetch album details (genres, full artwork URL) for a track."""
         if not track.album_id:
             return self.enrich_public_track_metadata(track)
-        clients = [self.sp]
+        clients = [client for client in [self.sp, self._oauth_sp] if client is not None]
         if self._oauth_sp and self._oauth_sp is not self.sp:
-            clients.append(self._oauth_sp)
+            clients = [client for client in clients if client is not None]
 
         last_error = None
         for client in clients:
@@ -1774,6 +1860,11 @@ class SpotifyClient:
                     track.artwork_url = images[0]["url"]
 
                 track.total_tracks = album.get("total_tracks")
+                release_date = album.get("release_date") or ""
+                if release_date and not track.release_date:
+                    track.release_date = release_date
+                if release_date[:4].isdigit() and not track.release_year:
+                    track.release_year = int(release_date[:4])
                 return track
             except Exception as e:
                 last_error = e
@@ -1805,7 +1896,7 @@ class SpotifyClient:
         if self._oauth_sp and self._oauth_sp is not self.sp:
             clients.append(self._oauth_sp)
         if not clients:
-            return tracks
+            return [self.enrich_public_track_metadata(track) for track in tracks]
 
         chunk_size = 20
         for start in range(0, len(unique_ids), chunk_size):
@@ -1839,6 +1930,8 @@ class SpotifyClient:
             images = album.get("images", [])
             artwork = images[0]["url"] if images else None
             total_tracks = album.get("total_tracks")
+            release_date = album.get("release_date") or ""
+            release_year = int(release_date[:4]) if release_date[:4].isdigit() else None
             for i in indices:
                 if genres:
                     tracks[i].genres = genres
@@ -1846,24 +1939,42 @@ class SpotifyClient:
                     tracks[i].artwork_url = artwork
                 if total_tracks:
                     tracks[i].total_tracks = total_tracks
+                if release_date and not tracks[i].release_date:
+                    tracks[i].release_date = release_date
+                if release_year and not tracks[i].release_year:
+                    tracks[i].release_year = release_year
 
-        # Fall back for any tracks whose album wasn't fetched
+        # Fall back only when critical metadata is still missing.
+        # Do not trigger per-track public lookups just because genres are empty:
+        # many Spotify albums/artists simply don't return genre data, and doing a
+        # track-by-track fallback here turns playlist startup into hundreds of
+        # extra network requests.
         for i, track in enumerate(tracks):
             if track.album_id and track.album_id not in album_data:
+                tracks[i] = self.enrich_public_track_metadata(track)
+            elif (
+                not track.release_year
+                or not track.release_date
+                or not track.artwork_url
+                or not track.album
+                or track.album == "Unknown Album"
+            ):
                 tracks[i] = self.enrich_public_track_metadata(track)
 
         return tracks
 
     def enrich_public_track_metadata(self, track: TrackMetadata) -> TrackMetadata:
-        """Best-effort artwork fallback using Spotify's public track page."""
+        """Best-effort public metadata fallback for artwork, year, and genres."""
         if not track.spotify_id:
-            return track
+            return self._enrich_track_metadata_via_itunes(track)
 
         try:
             public_data = self._fetch_public_track_page_data(track.spotify_id)
             artwork_url = public_data.get("artwork_url")
             album = public_data.get("album")
             artists = public_data.get("artists") or []
+            release_date = public_data.get("release_date")
+            release_year = public_data.get("release_year")
 
             if not track.artwork_url and artwork_url:
                 track.artwork_url = artwork_url
@@ -1871,9 +1982,13 @@ class SpotifyClient:
                 track.album = album
             if not track.artists and artists:
                 track.artists = artists
+            if release_date and not track.release_date:
+                track.release_date = release_date
+            if release_year and not track.release_year:
+                track.release_year = release_year
         except Exception as e:
             logger.debug(f"Public track artwork fallback failed for {track.spotify_id}: {e}")
-        return track
+        return self._enrich_track_metadata_via_itunes(track)
 
     def _fetch_public_track_page(self, track_id: str) -> Optional[TrackMetadata]:
         public_data = self._fetch_public_track_page_data(track_id)
@@ -1888,6 +2003,8 @@ class SpotifyClient:
             duration_ms=public_data.get("duration_ms"),
             spotify_id=track_id,
             artwork_url=public_data.get("artwork_url"),
+            release_date=public_data.get("release_date"),
+            release_year=public_data.get("release_year"),
         )
 
     def _fetch_public_track_page_data(self, track_id: str) -> dict:
@@ -1906,6 +2023,8 @@ class SpotifyClient:
         duration_ms = self._extract_public_track_duration_ms(html)
         parsed_description = self._parse_public_track_description(description)
         album = parsed_description.get("album") or "Unknown Album"
+        release_date = None
+        release_year = None
 
         try:
             data = self._extract_next_data(html)
@@ -1925,6 +2044,19 @@ class SpotifyClient:
                 first = image[0]
                 if isinstance(first, dict) and first.get("url"):
                     artwork_url = first["url"]
+            raw_release_date = (
+                entity.get("releaseDate")
+                or entity.get("release_date")
+                or entity.get("date")
+                or entity.get("album", {}).get("releaseDate")
+                or entity.get("album", {}).get("release_date")
+            )
+            if isinstance(raw_release_date, dict):
+                raw_release_date = raw_release_date.get("isoString") or raw_release_date.get("year")
+            if raw_release_date:
+                release_date = str(raw_release_date)[:10]
+                if release_date[:4].isdigit():
+                    release_year = int(release_date[:4])
         except Exception:
             pass
 
@@ -1935,7 +2067,44 @@ class SpotifyClient:
             "album": album or "Unknown Album",
             "artwork_url": artwork_url,
             "duration_ms": duration_ms,
+            "release_date": release_date,
+            "release_year": release_year,
         }
+
+    def _enrich_track_metadata_via_itunes(self, track: TrackMetadata) -> TrackMetadata:
+        """Fill any remaining missing year/genre/artwork fields from iTunes Search."""
+        query_parts = [track.primary_artist if track.artists else "", track.title]
+        query = " ".join(part for part in query_parts if part).strip()
+        if not query:
+            return track
+
+        try:
+            fallback = self._search_track_itunes(query)
+        except Exception as e:
+            logger.debug(f"[iTunes] Metadata fallback failed for '{query}': {e}")
+            return track
+        if not fallback:
+            return track
+
+        if (not track.album or track.album == "Unknown Album") and fallback.album:
+            track.album = fallback.album
+        if not track.artists and fallback.artists:
+            track.artists = fallback.artists
+        if not track.artwork_url and fallback.artwork_url:
+            track.artwork_url = fallback.artwork_url
+        if not track.release_date and fallback.release_date:
+            track.release_date = fallback.release_date
+        if not track.release_year and fallback.release_year:
+            track.release_year = fallback.release_year
+        if not track.genres and fallback.genres:
+            track.genres = fallback.genres
+        if not track.total_tracks and fallback.total_tracks:
+            track.total_tracks = fallback.total_tracks
+        if not track.track_number and fallback.track_number:
+            track.track_number = fallback.track_number
+        if not track.disc_number and fallback.disc_number:
+            track.disc_number = fallback.disc_number
+        return track
 
     @staticmethod
     def _extract_meta_content(html: str, property_name: str) -> Optional[str]:

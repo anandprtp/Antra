@@ -1,10 +1,14 @@
+import base64
+import json
 import logging
 import os
+import random
 import re
 import struct
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 import requests
@@ -14,6 +18,202 @@ from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.sources.odesli import OdesliEnricher
 
 logger = logging.getLogger(__name__)
+
+
+class _DirectAmazonClient:
+    """
+    Direct Amazon Music DMLS/Widevine client — no proxy server needed.
+    Ports core logic from API-Mirrors/amazon_api/amazon_server.py.
+    Credentials JSON schema: {cookie, authorization, csrf_token, csrf_rnd,
+    csrf_ts, customer_id, device_id, session_id, wvd_path}
+    """
+
+    _DMLS_URL = "https://music.amazon.com/NA/api/dmls/"
+    _INVALID_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))')
+
+    def __init__(self, creds_json: str):
+        self._creds: Optional[dict] = None
+        if creds_json.strip():
+            try:
+                self._creds = json.loads(creds_json)
+            except Exception:
+                logger.warning("[Amazon-Direct] Invalid credentials JSON — ignoring")
+
+    def is_configured(self) -> bool:
+        if not self._creds:
+            return False
+        # customer_id and device_id are optional — not all Amazon sessions expose them
+        # and they are not required for DMLS API calls.
+        required = ("cookie", "authorization", "csrf_token", "wvd_path")
+        return all(self._creds.get(k) for k in required)
+
+    def _safe_json_loads(self, text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            fixed = self._INVALID_ESCAPE_RE.sub(lambda m: "\\\\" + m.group(0), text)
+            return json.loads(fixed)
+
+    def _build_headers(self) -> dict:
+        c = self._creds
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "Origin": "https://music.amazon.com",
+            "Referer": "https://music.amazon.com/",
+            "Cookie": c["cookie"],
+            "content-type": "application/json",
+            "Content-Encoding": "amz-1.0",
+            "csrf-token": c["csrf_token"],
+            "csrf-rnd": c["csrf_rnd"],
+            "csrf-ts": c["csrf_ts"],
+            "Authorization": c["authorization"],
+        }
+
+    def _get_manifest(self, asin: str) -> dict:
+        headers = self._build_headers()
+        headers["X-Amz-Target"] = (
+            "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getDashManifestsV2"
+        )
+        c = self._creds
+        # customer_id and device_id may be empty if not captured during login.
+        # Use safe fallback values — Amazon accepts these for manifest requests.
+        customer_id = c.get("customer_id") or ""
+        device_id = c.get("device_id") or "antra-web-player"
+        payload = {
+            "deviceToken": {"deviceTypeId": "A16ZV8BU3SN1N3", "deviceId": device_id},
+            "appMetadata": {"https": "true"},
+            "clientMetadata": {
+                "clientId": "WebCP",
+                "clientRequestId": f"{random.randint(10**8, 10**9-1):09x}-3d00-11f1-8fb8-0b4e12d5b57b",
+            },
+            "contentIdList": [{"identifier": asin, "identifierType": "ASIN"}],
+            "musicDashVersionList": ["SIREN_KATANA_NO_CLEAR_LEAD"],
+            "contentProtectionList": ["TRACK_PSSH"],
+            "tryAsinSubstitution": True,
+            "customerInfo": {"marketplaceId": "ATVPDKIKX0DER", "territoryId": "US"},
+            "appInfo": {"musicAgent": "Maestro/1.0 WebCP/1.0.10034.0 (7dbf-196c-WebC-2b70-7689c)"},
+        }
+        # Only include customerId if we have it — omitting it avoids 400 errors
+        # when the field is an empty string.
+        if customer_id:
+            payload["customerId"] = customer_id
+        r = requests.post(self._DMLS_URL, headers=headers, json=payload, timeout=20)
+        if r.status_code == 401:
+            raise RuntimeError(
+                "[Amazon-Direct] Authorization expired (401) — re-extract credentials from music.amazon.com"
+            )
+        if r.status_code != 200:
+            raise RuntimeError(f"[Amazon-Direct] Manifest request failed: {r.status_code}")
+        return self._safe_json_loads(r.text)
+
+    def _parse_manifest(self, data: dict) -> tuple[str, str]:
+        try:
+            manifest_xml = data["contentResponseList"][0]["manifest"]
+        except (KeyError, IndexError) as e:
+            raise RuntimeError(f"[Amazon-Direct] Unexpected manifest structure: {e}")
+
+        root = ET.fromstring(manifest_xml)
+        ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011", "cenc": "urn:mpeg:cenc:2013"}
+        best_pssh = best_url = None
+        best_score = -1
+
+        for adaptation_set in root.findall(".//mpd:AdaptationSet", ns):
+            priority = int(adaptation_set.get("selectionPriority", 0))
+            for rep in adaptation_set.findall("mpd:Representation", ns):
+                if "flac" not in rep.get("codecs", ""):
+                    continue
+                bd_prop = rep.find('.//mpd:SupplementalProperty[@schemeIdUri="amz-music:bitDepth"]', ns)
+                bit_depth = int(bd_prop.get("value", 16)) if bd_prop is not None else 16
+                score = priority * 100 + bit_depth
+                if score > best_score:
+                    best_score = score
+                    pssh_el = adaptation_set.find(".//cenc:pssh", ns)
+                    best_pssh = pssh_el.text.strip() if pssh_el is not None else None
+                    base_url_el = rep.find("mpd:BaseURL", ns)
+                    best_url = base_url_el.text.strip() if base_url_el is not None else None
+
+        if not best_pssh or not best_url:
+            raise RuntimeError("[Amazon-Direct] No FLAC stream found in manifest")
+        return best_url, best_pssh
+
+    def _get_license_key(self, pssh_b64: str) -> str:
+        try:
+            from pywidevine.cdm import Cdm
+            from pywidevine.device import Device
+            from pywidevine.pssh import PSSH
+        except ImportError:
+            raise RuntimeError(
+                "[Amazon-Direct] pywidevine not installed — run: pip install pywidevine==1.8.0 construct==2.8.8"
+            )
+
+        c = self._creds
+        wvd_path = c.get("wvd_path", "")
+        if not wvd_path:
+            raise RuntimeError("[Amazon-Direct] No wvd_path in credentials JSON")
+
+        device = Device.load(wvd_path)
+        cdm = Cdm.from_device(device)
+        session_id = cdm.open()
+        try:
+            pssh = PSSH(pssh_b64)
+            challenge = cdm.get_license_challenge(session_id, pssh)
+            b64_challenge = base64.b64encode(challenge).decode()
+
+            bearer = c["authorization"].removeprefix("Bearer ")
+            customer_id = c.get("customer_id") or ""
+            device_id = c.get("device_id") or "antra-web-player"
+            session_id_str = c.get("session_id") or ""
+            payload = {
+                "DrmType": "WIDEVINE",
+                "licenseChallenge": b64_challenge,
+                "deviceToken": {"deviceTypeId": "A16ZV8BU3SN1N3", "deviceId": device_id},
+                "appInfo": {"musicAgent": "Maestro/1.0 WebCP/1.0.10034.0 (7dbf-196c-WebC-2b70-7689c)"},
+                "Authorization": c["authorization"],
+            }
+            if customer_id:
+                payload["customerId"] = customer_id
+            headers = self._build_headers()
+            headers["X-Amz-Target"] = (
+                "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getLicenseForPlaybackV2"
+            )
+            headers["x-amzn-authentication"] = json.dumps({
+                "interface": "ClientAuthenticationInterface.v1_0.ClientTokenElement",
+                "accessToken": f"Bearer {bearer}",
+            })
+            headers["x-amzn-device-model"] = "WEBPLAYER"
+            headers["x-amzn-device-family"] = "WebPlayer"
+            headers["x-amzn-device-id"] = device_id
+            headers["x-amzn-session-id"] = session_id_str
+            headers["x-amzn-device-language"] = "en_US"
+            headers["x-amzn-application-version"] = "1.0.10034.0"
+            headers["x-amzn-os-version"] = "1.0"
+
+            r = requests.post(self._DMLS_URL, json=payload, headers=headers, timeout=20)
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"[Amazon-Direct] License request failed: {r.status_code} {r.text[:200]}"
+                )
+            rj = r.json()
+            if "license" not in rj:
+                raise RuntimeError(f"[Amazon-Direct] No license in response: {list(rj.keys())}")
+
+            license_bytes = base64.b64decode(rj["license"])
+            cdm.parse_license(session_id, license_bytes)
+            keys = cdm.get_keys(session_id)
+        finally:
+            cdm.close(session_id)
+
+        content_keys = [k for k in keys if k.type == "CONTENT"]
+        if not content_keys:
+            raise RuntimeError("[Amazon-Direct] No CONTENT keys in license response")
+        return content_keys[0].key.hex()
+
+    def process_track(self, asin: str) -> dict:
+        """Returns {"streamUrl": str, "decryptionKey": str}."""
+        data = self._get_manifest(asin)
+        stream_url, pssh_b64 = self._parse_manifest(data)
+        key_hex = self._get_license_key(pssh_b64)
+        return {"streamUrl": stream_url, "decryptionKey": key_hex}
 
 # On Windows, prevent subprocess from flashing a console window
 _SUBPROCESS_FLAGS = {}
@@ -29,18 +229,29 @@ class AmazonAdapter(BaseSourceAdapter):
 
     name = "amazon"
 
-    def __init__(self, mirrors: list[str], api_key: Optional[str] = None):
+    def __init__(
+        self,
+        mirrors: list[str],
+        api_key: Optional[str] = None,
+        direct_creds_json: str = "",
+    ):
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         })
         self._odesli = OdesliEnricher(api_key=api_key)
-        self.priority = 1 # Highest priority
-        
+        self.priority = 2  # Shared free-lossless tier with Apple/HiFi/DAB
+
         # Mirror management
         self._mirrors = [m.rstrip("/") for m in mirrors if m]
         self._current_mirror: Optional[str] = None
         self._mirror_failures: dict[str, int] = {}
+
+        # Direct auth client (user's own Amazon Music account — preferred over mirrors)
+        self._direct = _DirectAmazonClient(direct_creds_json) if direct_creds_json.strip() else None
+        if self._direct and self._direct.is_configured():
+            logger.info("[Amazon-Direct] Direct credentials loaded — will use DMLS API directly")
+
 
     def _get_working_mirror(self, force_rotate: bool = False) -> str:
         """
@@ -80,17 +291,23 @@ class AmazonAdapter(BaseSourceAdapter):
         raise RuntimeError("[Amazon] No mirrors configured.")
 
     def is_available(self) -> bool:
-        """Check if any community API is reachable and ffmpeg is installed."""
+        """Check if ffmpeg is installed and at least one download path is ready."""
         try:
             from antra.utils.runtime import get_ffmpeg_exe
             ffmpeg = get_ffmpeg_exe() or "ffmpeg"
             subprocess.run([ffmpeg, "-version"], capture_output=True, check=True, **_SUBPROCESS_FLAGS)
-            
-            # Check if at least one mirror is reachable
-            self._get_working_mirror()
-            return True
         except Exception:
             return False
+
+        if self._direct and self._direct.is_configured():
+            return True
+        if self._mirrors:
+            try:
+                self._get_working_mirror()
+                return True
+            except Exception:
+                return False
+        return False
 
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         """
@@ -112,9 +329,7 @@ class AmazonAdapter(BaseSourceAdapter):
 
         # Amazon's community proxy serves Ultra HD (24-bit lossless) streams.
         # Explicitly marking bit_depth=24 so the resolver quality-tier comparison
-        # correctly ranks this as tier-4 (Hi-Res), equal to HiFi's best quality.
-        # Amazon has priority=1 vs HiFi's priority=2, so it wins the tiebreaker
-        # and is preferred when both sources offer the same tier.
+        # correctly ranks this as tier-4 (Hi-Res), equal to Apple/HiFi.
         return SearchResult(
             source="amazon",
             title=track.title,
@@ -134,23 +349,44 @@ class AmazonAdapter(BaseSourceAdapter):
     def download(self, result: SearchResult, output_path: str) -> str:
         """
         Download and decrypt a track using its Amazon ASIN.
-        Rotates through mirrors on failure.
+        Tries direct auth first (if configured), then rotates through mirrors.
         """
         asin = result.stream_id
         if not asin:
             raise ValueError("[Amazon] Missing ASIN in search result")
 
+        # Try direct DMLS API first — avoids proxy latency and rate-limit exposure
+        if self._direct and self._direct.is_configured():
+            try:
+                logger.info(f"[Amazon-Direct] Fetching stream via DMLS API for ASIN {asin}...")
+                data = self._direct.process_track(asin)
+                return self._process_download(data["streamUrl"], data.get("decryptionKey"), output_path)
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"[Amazon-Direct] Direct auth failed: {err}")
+                if "401" in err or "expired" in err.lower():
+                    raise RuntimeError(
+                        f"[Amazon-Direct] Credentials expired — re-extract from music.amazon.com: {err}"
+                    )
+                if not self._mirrors:
+                    raise
+                logger.info("[Amazon-Direct] Falling back to mirror pool...")
+
+        if not self._mirrors:
+            raise RuntimeError("[Amazon] No direct credentials and no mirrors configured")
+
         max_attempts = len(self._mirrors)
         last_error = None
+        saw_rate_limit = False
 
         for attempt in range(max_attempts):
             mirror = self._get_working_mirror(force_rotate=(attempt > 0))
             api_url = f"{mirror}/api/track/{asin}"
-            
+
             try:
                 logger.debug(f"[Amazon] Fetching stream info (attempt {attempt+1}/{max_attempts}) from {mirror}...")
                 resp = self._session.get(api_url, timeout=20)
-                
+
                 if resp.status_code == 200:
                     data = resp.json()
                     download_url = data.get("streamUrl")
@@ -162,13 +398,25 @@ class AmazonAdapter(BaseSourceAdapter):
                     return self._process_download(download_url, decryption_key, output_path)
 
                 if resp.status_code == 429:
-                    # Rate-limited — raise immediately so the engine skips to
-                    # the next source (HiFi / Soulseek) without any sleep.
+                    saw_rate_limit = True
                     raise RateLimitedError(f"[Amazon] Rate limited (429) on {mirror}")
+
+                # 403/503 means mirror is blocking/refreshing — permanently remove it
+                if resp.status_code in (403, 503):
+                    logger.debug(f"[Amazon] Mirror returned {resp.status_code} — removing from pool for session")
+                    self._mirror_failures[mirror] = 99
+                    self._current_mirror = None
+                    last_error = f"API error {resp.status_code}"
+                    continue
 
                 logger.debug(f"[Amazon] Mirror {mirror} returned {resp.status_code}")
                 last_error = f"API error {resp.status_code}"
 
+            except RateLimitedError as e:
+                logger.debug(f"[Amazon] Mirror {mirror} rate limited: {e}")
+                last_error = str(e)
+                self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+                continue
             except Exception as e:
                 logger.debug(f"[Amazon] Mirror {mirror} failed: {e}")
                 last_error = str(e)
@@ -176,6 +424,8 @@ class AmazonAdapter(BaseSourceAdapter):
             # Non-429 failure — mark mirror and rotate.
             self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
 
+        if saw_rate_limit:
+            raise RateLimitedError(last_error or "[Amazon] Rate limited")
         raise RuntimeError(f"[Amazon] All mirrors failed. Last error: {last_error}")
 
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
@@ -517,7 +767,7 @@ class AmazonAdapter(BaseSourceAdapter):
 def _diagnose():
     """Run with: python -m antra.sources.amazon"""
     logging.basicConfig(level=logging.DEBUG)
-    mirrors = ["https://amzn.afkarxyz.qzz.io"]
+    mirrors = ["https://amazon.spotbye.qzz.io"]
     adapter = AmazonAdapter(mirrors=mirrors)
     if not adapter.is_available():
         print("Amazon adapter not available (check ffmpeg and internet).")

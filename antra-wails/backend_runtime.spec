@@ -58,6 +58,14 @@ for package in ("imageio_ffmpeg", "certifi", "lyricsgenius", "spotipy"):
     except Exception:
         pass
 
+# Explicitly exclude playwright's driver directory (node.exe + JS bundle = ~97 MB).
+# We replaced the playwright session API with raw websockets CDP calls, so node.exe
+# is never executed. The playwright Python package itself is still imported only for
+# `playwright install chromium` (run as a subprocess), so we keep the Python code
+# but strip the 97 MB data payload.
+datas = [(src, dst) for src, dst in datas
+         if "playwright" not in src.replace("\\", "/").lower()]
+
 # ── Analysis ─────────────────────────────────────────────────────────────────
 # NOTE: collect_data_files("imageio_ffmpeg") already collects the ffmpeg binary
 # into datas (as imageio_ffmpeg/binaries/ffmpeg-*.exe). Do NOT also add it to
@@ -81,6 +89,13 @@ a = Analysis(
         "IPython", "jupyter", "notebook",
         # Matplotlib / numpy / scipy — not used
         "matplotlib", "numpy", "scipy", "pandas",
+        # playwright.async_api and playwright.sync_api are NOT imported at runtime
+        # (we use raw websockets CDP). Only playwright._impl is needed for the
+        # `playwright install chromium` subprocess call path, but even that is
+        # optional. Excluding the whole package drops node.exe (~86 MB) from the build.
+        # The `playwright install chromium` subprocess call works because it invokes
+        # the system Python's playwright, not the bundled one.
+        "playwright",
     ],
     noarchive=False,
     optimize=1,  # compile .pyc with basic optimisations (strips docstrings)

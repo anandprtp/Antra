@@ -24,25 +24,29 @@ SPOTIFY_SCOPES = " ".join([
 import time
 import requests
 
-WEB_PLAYER_TOKEN_URL = (
-    "https://open.spotify.com/get_access_token"
-    "?reason=transport&productType=web_player"
+# Spotify web-player TOTP credentials.
+# Using /api/token + TOTP instead of /get_access_token because the latter
+# is Cloudflare IP-blocked for all scripted clients (403 "URL Blocked"),
+# even with Chrome TLS impersonation. The /api/token endpoint is not blocked
+# and returns isAnonymous=False when the sp_dc cookie is included.
+_SP_TOTP_SECRET  = (
+    "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4D"
+    "QOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 )
+_SP_TOTP_VERSION = 61
+
+WEB_PLAYER_TOKEN_URL = "https://open.spotify.com/api/token"
 
 WEB_PLAYER_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) "
-        "Gecko/20100101 Firefox/149.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
-    "Accept-Language": "en",
-    "app-platform": "WebPlayer",
-    "spotify-app-version": "1.2.87.374.g244b9de7",
-    "Origin": "https://open.spotify.com",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin":  "https://open.spotify.com",
     "Referer": "https://open.spotify.com/",
-    "sec-fetch-dest": "empty",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-site": "same-site",
 }
 
 class SpotifyWebPlayerAuth:
@@ -72,66 +76,73 @@ class SpotifyWebPlayerAuth:
         return self._refresh_token()
 
     def _refresh_token(self) -> str:
-        """Exchange sp_dc cookie for web player access token using multi-strategy fallback."""
-        # NEW: Check if manual token exists and is still valid first!
+        """Exchange sp_dc cookie for web player access token using TOTP mechanism."""
+        # Return manual token if still valid
         if self._access_token and time.time() < self._token_expiry - 10:
             return self._access_token
 
         if not self._sp_dc:
             if self._access_token:
-                return self._access_token # Return manual token even if "expired" as last resort
+                return self._access_token  # Return manual token even if "expired" as last resort
             raise ValueError("[Spotify] No sp_dc cookie or manual token provided for authentication")
 
-        urls = [
-            WEB_PLAYER_TOKEN_URL,
-            "https://open.spotify.com/get_access_token"
-        ]
-        
-        last_status = None
-        for url in urls:
-            try:
-                # Strictly mimic a browser-navigation/fetch
-                r = self._session.get(
-                    url,
-                    cookies={"sp_dc": self._sp_dc},
-                    timeout=15,
-                    allow_redirects=False
-                )
-                
-                if r.status_code == 200:
-                    try:
-                        data = r.json()
-                    except Exception:
-                        continue
-
-                    if data.get("isAnonymous", True):
-                        continue # Cookie rejected, try next strategy
-                        
-                    self._access_token = data["accessToken"]
-                    expiry_ms = data.get("accessTokenExpirationTimestampMs", 0)
-                    self._token_expiry = (
-                        expiry_ms / 1000 if expiry_ms else time.time() + 3600
-                    )
-                    logger.info(f"[Spotify] Web player token refreshed via {url}")
-                    return self._access_token
-                
-                last_status = f"{r.status_code} {r.reason}"
-            except Exception as e:
-                last_status = f"Network Error: {e}"
-                continue
-
-        # If both strategies fail, raise a detailed error
-        msg = f"[Spotify] Web player auth failed ({last_status}). "
-        if "403" in str(last_status):
-            msg += (
-                "Your network or IP is currently blocked by Spotify's anti-bot system. "
-                "WORKAROUND: Grab a fresh 'accessToken' from your browser's Network tab and run: "
-                "'antra spotify set-token <token>'"
+        try:
+            import pyotp
+        except ImportError:
+            raise RuntimeError(
+                "[Spotify] pyotp is required for authentication. Run: pip install pyotp"
             )
-        else:
-            msg += "Please ensure your sp_dc cookie is valid and not expired."
-            
-        raise RuntimeError(msg)
+
+        totp = pyotp.TOTP(_SP_TOTP_SECRET)
+        code = totp.now()
+        try:
+            r = self._session.get(
+                WEB_PLAYER_TOKEN_URL,
+                params={
+                    "reason":      "init",
+                    "productType": "web-player",
+                    "totp":        code,
+                    "totpVer":     str(_SP_TOTP_VERSION),
+                    "totpServer":  code,
+                },
+                cookies={"sp_dc": self._sp_dc},
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"[Spotify] Token request failed: {e}")
+
+        if r.status_code == 200:
+            try:
+                data = r.json()
+            except Exception:
+                raise RuntimeError("[Spotify] Could not parse token response")
+
+            if data.get("isAnonymous", True):
+                raise RuntimeError(
+                    "[Spotify] sp_dc cookie produced an anonymous token — "
+                    "it may be expired. Refresh it from your browser."
+                )
+
+            self._access_token = data["accessToken"]
+            expiry_ms = data.get("accessTokenExpirationTimestampMs", 0)
+            self._token_expiry = (
+                expiry_ms / 1000 if expiry_ms else time.time() + 3600
+            )
+            logger.info("[Spotify] Web player token refreshed via TOTP")
+            return self._access_token
+
+        if r.status_code == 401:
+            raise RuntimeError(
+                "[Spotify] sp_dc cookie is invalid or expired. "
+                "Refresh it from your browser (DevTools → Application → "
+                "Cookies → open.spotify.com → sp_dc)."
+            )
+
+        raise RuntimeError(
+            f"[Spotify] Token request failed with status {r.status_code}. "
+            "Please ensure your sp_dc cookie is valid and not expired."
+        )
 
     def get_headers(self) -> dict:
         """Return request headers with valid Bearer token."""

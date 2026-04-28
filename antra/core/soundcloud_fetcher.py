@@ -161,6 +161,43 @@ class SoundCloudFetcher:
 
         return all_tracks
 
+    def _fetch_tracks_by_ids(self, track_ids: list[int | str]) -> list[dict]:
+        """Hydrate track stub objects via the /tracks endpoint in chunks."""
+        client_id = self._get_client_id()
+        results: list[dict] = []
+        chunk_size = 50
+
+        for start in range(0, len(track_ids), chunk_size):
+            chunk = [str(track_id) for track_id in track_ids[start:start + chunk_size] if track_id]
+            if not chunk:
+                continue
+            try:
+                resp = self._session.get(
+                    f"{_SC_API}/tracks",
+                    params={
+                        "ids": ",".join(chunk),
+                        "client_id": client_id,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning(f"[SoundCloud] Track hydration request failed: {e}")
+                continue
+
+            if not resp.ok:
+                logger.warning(f"[SoundCloud] Track hydration returned {resp.status_code}")
+                continue
+
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+
+            if isinstance(data, list):
+                results.extend(item for item in data if isinstance(item, dict))
+
+        return results
+
     # ── Parsing ───────────────────────────────────────────────────────────────
 
     def _fetch_playlist_tracks(self, playlist_data: dict) -> list[TrackMetadata]:
@@ -171,22 +208,82 @@ class SoundCloudFetcher:
         """
         tracks_uri = playlist_data.get("tracks_uri", "")
         inline_tracks = playlist_data.get("tracks", [])
+        total = playlist_data.get("track_count", 0) or 0
+        playlist_name = playlist_data.get("title") or ""
+        playlist_user = playlist_data.get("user") or {}
+        playlist_owner = (
+            playlist_user.get("username")
+            or playlist_user.get("full_name")
+            or ""
+        )
+        playlist_artwork = (
+            playlist_data.get("artwork_url")
+            or playlist_data.get("avatar_url")
+            or ""
+        )
+        if playlist_artwork:
+            playlist_artwork = playlist_artwork.replace("-large.", "-t500x500.")
 
-        # If the playlist response already contains all tracks (small playlists)
-        total = playlist_data.get("track_count", 0)
-        if inline_tracks and len(inline_tracks) >= total:
-            raw_tracks = inline_tracks
+        inline_full_tracks = [
+            track for track in inline_tracks
+            if isinstance(track, dict) and track.get("title")
+        ]
+
+        # Only trust inline tracks if they are fully populated. SoundCloud often
+        # returns the full item count but most entries are stubs with only an id.
+        if inline_full_tracks and total > 0 and len(inline_full_tracks) >= total:
+            raw_tracks = inline_full_tracks
         elif tracks_uri:
-            # Merge the inline partial data with paginated full data
+            # Fetch the full playlist via pagination when inline data is partial.
             raw_tracks = self._fetch_paginated_tracks(tracks_uri)
             if not raw_tracks:
-                # Fallback to whatever inline tracks we have
-                raw_tracks = inline_tracks
+                raw_tracks = inline_full_tracks
         else:
-            raw_tracks = inline_tracks
+            raw_tracks = inline_full_tracks
+
+        if total > 0 and len(raw_tracks) < total:
+            existing_ids = {
+                str(track.get("id"))
+                for track in raw_tracks
+                if isinstance(track, dict) and track.get("id")
+            }
+            missing_ids = [
+                track.get("id")
+                for track in inline_tracks
+                if isinstance(track, dict)
+                and track.get("id")
+                and str(track.get("id")) not in existing_ids
+            ]
+            if missing_ids:
+                hydrated = self._fetch_tracks_by_ids(missing_ids)
+                if hydrated:
+                    hydrated_by_id = {
+                        str(track.get("id")): track
+                        for track in hydrated
+                        if isinstance(track, dict) and track.get("id")
+                    }
+                    merged_tracks: list[dict] = []
+                    seen_ids: set[str] = set()
+                    for track in inline_tracks:
+                        if not isinstance(track, dict):
+                            continue
+                        track_id = str(track.get("id") or "")
+                        full_track = hydrated_by_id.get(track_id) or track
+                        if not track_id or track_id in seen_ids:
+                            continue
+                        seen_ids.add(track_id)
+                        merged_tracks.append(full_track)
+                    for track in raw_tracks:
+                        if not isinstance(track, dict):
+                            continue
+                        track_id = str(track.get("id") or "")
+                        if track_id and track_id not in seen_ids:
+                            seen_ids.add(track_id)
+                            merged_tracks.append(track)
+                    raw_tracks = merged_tracks or raw_tracks
 
         result: list[TrackMetadata] = []
-        for t in raw_tracks:
+        for index, t in enumerate(raw_tracks, start=1):
             if not isinstance(t, dict):
                 continue
             # SoundCloud may return stub objects (only id present) for
@@ -194,7 +291,12 @@ class SoundCloudFetcher:
             if not t.get("title"):
                 continue
             try:
-                result.append(self._parse_track(t))
+                track = self._parse_track(t)
+                track.playlist_name = playlist_name or None
+                track.playlist_owner = playlist_owner or None
+                track.playlist_artwork_url = playlist_artwork or None
+                track.playlist_position = index
+                result.append(track)
             except Exception as e:
                 logger.debug(f"[SoundCloud] Skipping track due to parse error: {e}")
         return result

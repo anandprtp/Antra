@@ -48,7 +48,7 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     output_format: str = "source"
-    max_workers: int = 3
+    max_workers: int = 2
 
 
 class DownloadEngine:
@@ -143,7 +143,7 @@ class DownloadEngine:
         return self.transcoder.needs_conversion(file_path, output_format)
 
     def _requires_lossless_output(self) -> bool:
-        return self.cfg.output_format in {"flac", "lossless"}
+        return self.cfg.output_format in {"flac", "lossless", "alac"}
 
     @staticmethod
     def _probe_duration_seconds(file_path: str) -> float | None:
@@ -291,24 +291,49 @@ class DownloadEngine:
     ) -> DownloadResult:
         """Full pipeline for a single track."""
 
-        # 1. Resume check
+        # 1. Resume check — only skip if the existing file meets the current output format.
         existing = self.organizer.is_already_downloaded(track)
         if existing:
-            existing = self.organizer.ensure_playlist_copy(track, existing)
-            logger.info(f"  [SKIP]  Skipping (already downloaded): {track.title}")
-            self._emit(
-                EngineEventType.TRACK_SKIPPED,
-                track=track,
-                track_index=track_index,
-                track_total=track_total,
-                file_path=existing,
-                message="Track already exists on disk.",
-            )
-            return DownloadResult(
-                track=track,
-                status=DownloadStatus.SKIPPED,
-                file_path=existing,
-            )
+            # In lossless-only mode, don't accept a previously-downloaded lossy file.
+            # Re-download it as lossless instead.
+            if self._requires_lossless_output():
+                ext = os.path.splitext(existing)[1].lower()
+                lossy_extensions = {".mp3", ".aac", ".m4a"}
+                # .m4a could be ALAC (lossless) — check the actual codec
+                if ext in lossy_extensions:
+                    is_lossy_file = True
+                    if ext == ".m4a":
+                        try:
+                            from mutagen import File as _MF
+                            _audio = _MF(existing)
+                            _codec = str(getattr(getattr(_audio, "info", None), "codec", "") or "").lower()
+                            # alac codec = lossless; mp4a = AAC = lossy
+                            is_lossy_file = "alac" not in _codec
+                        except Exception:
+                            pass  # can't probe → assume lossy, re-download
+                    if is_lossy_file:
+                        logger.info(
+                            f"  [REDOWNLOAD]  '{track.title}' exists as lossy {ext} "
+                            f"but lossless mode is active — re-downloading as lossless."
+                        )
+                        existing = None  # fall through to download
+
+            if existing:
+                existing = self.organizer.ensure_playlist_copy(track, existing)
+                logger.info(f"  [SKIP]  Skipping (already downloaded): {track.title}")
+                self._emit(
+                    EngineEventType.TRACK_SKIPPED,
+                    track=track,
+                    track_index=track_index,
+                    track_total=track_total,
+                    file_path=existing,
+                    message="Track already exists on disk.",
+                )
+                return DownloadResult(
+                    track=track,
+                    status=DownloadStatus.SKIPPED,
+                    file_path=existing,
+                )
 
         # 2. Fetch lyrics once (before download, non-blocking)
         self._fetch_lyrics_if_needed(track)

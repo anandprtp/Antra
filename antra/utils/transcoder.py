@@ -17,7 +17,8 @@ OUTPUT_FORMAT_EXTENSION = {
     "source": None,
     "lossless": None,
     "mp3": ".mp3",
-    "aac": ".aac",
+    "aac": ".m4a",   # AAC in M4A container
+    "alac": ".m4a",  # ALAC in M4A container
     "m4a": ".m4a",
     "flac": ".flac",
 }
@@ -39,14 +40,31 @@ class AudioTranscoder:
     def needs_conversion(self, file_path: str, target_format: str) -> bool:
         if target_format == "source":
             return False
-        if target_format in {"lossless", "flac"}:
+        if target_format == "lossless":
+            # "Lossless" means keep native lossless containers — but convert
+            # .m4a (ALAC/FLAC-in-M4A from Tidal) to .flac for uniformity,
+            # since users in lossless mode expect .flac files.
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".m4a":
+                return True   # re-container M4A → FLAC
+            return False
+        if target_format == "flac":
             # Never upscale lossy → lossless container (fake FLAC, no quality gain).
-            # Applies whether the user chose "lossless" mode or explicit "flac" format.
             if self._is_lossy(file_path):
                 return False
             ext = os.path.splitext(file_path)[1].lower()
             # .m4a can be ALAC (lossless) but we still convert to .flac for uniformity
             return ext not in {".flac"}
+
+        if target_format == "alac":
+            if self._is_lossy(file_path):
+                return False  # Don't fake-ALAC a lossy source
+            ext = os.path.splitext(file_path)[1].lower()
+            return ext == ".flac"  # Only transcode from FLAC; .m4a already ALAC
+
+        if target_format == "aac":
+            ext = os.path.splitext(file_path)[1].lower()
+            return ext not in {".m4a", ".aac"}  # Skip if already in an AAC container
 
         ext = os.path.splitext(file_path)[1].lower()
         target_ext = OUTPUT_FORMAT_EXTENSION[target_format]
@@ -55,10 +73,6 @@ class AudioTranscoder:
     def convert(self, file_path: str, target_format: str) -> str:
         if target_format == "source":
             return file_path
-        if target_format == "lossless":
-            target_format = "flac"
-            if not self.needs_conversion(file_path, "lossless"):
-                return file_path
         if not self.needs_conversion(file_path, target_format):
             return file_path
         from antra.utils.runtime import get_ffmpeg_exe, get_clean_subprocess_env
@@ -101,28 +115,34 @@ class AudioTranscoder:
 
     @staticmethod
     def _plan(target_format: str) -> ConversionPlan:
+        if target_format in ("lossless", "flac"):
+            return ConversionPlan(
+                target_format="flac",
+                extension=".flac",
+                codec_args=["-c:a", "flac"],
+            )
         if target_format == "mp3":
             return ConversionPlan(
                 target_format=target_format,
                 extension=".mp3",
                 codec_args=["-c:a", "libmp3lame", "-b:a", "320k"],
             )
+        if target_format == "alac":
+            return ConversionPlan(
+                target_format=target_format,
+                extension=".m4a",
+                codec_args=["-c:a", "alac"],
+            )
         if target_format == "aac":
             return ConversionPlan(
                 target_format=target_format,
-                extension=".aac",
-                codec_args=["-c:a", "aac", "-b:a", "256k"],
+                extension=".m4a",
+                codec_args=["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"],
             )
         if target_format == "m4a":
             return ConversionPlan(
                 target_format=target_format,
                 extension=".m4a",
                 codec_args=["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
-            )
-        if target_format == "flac":
-            return ConversionPlan(
-                target_format=target_format,
-                extension=".flac",
-                codec_args=["-c:a", "flac"],
             )
         raise ValueError(f"Unsupported output format: {target_format}")

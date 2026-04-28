@@ -193,6 +193,16 @@ Spotify is always available for metadata and URL resolution — no login needed.
 
 ---
 
+## TIDAL Premium OAuth Integration
+
+For users with a premium TIDAL account, Antra offers a native device-code OAuth flow to securely connect your account without dealing with fragile API keys or manual session tokens. 
+
+- **One-click login**: Click "Login with TIDAL" to generate a secure device code and verification URL.
+- **Auto-save**: Approve the login in your browser, and Antra will automatically capture, validate, and store your session tokens.
+- **Robust token handling**: Say goodbye to `SyntaxError`s from manually pasting JSON blobs. Antra sanitises all inputs and correctly manages the token lifecycle.
+
+---
+
 ## Soulseek / P2P Integration
 
 For tracks that aren't available through any streaming-adjacent source (rare albums, limited pressings, out-of-print releases), Antra integrates with the Soulseek P2P network.
@@ -200,6 +210,85 @@ For tracks that aren't available through any streaming-adjacent source (rare alb
 **Zero setup.** Antra downloads, configures, and manages the backend automatically. Just provide your Soulseek credentials once on first run.
 
 > The Soulseek network runs on sharing. If you use it, please share back and leave the client running when you can.
+
+---
+
+## Spotify Podcast Downloads
+
+Antra can download any Spotify podcast episode or entire show directly using your own Spotify account cookie — no external server, no third-party proxy.
+
+### Account requirement
+
+A **free Spotify account is sufficient**. Podcast audio is not gated behind Spotify Premium. The 320 kbps OGG Vorbis format is available to all logged-in users. You only need to be signed in to Spotify in a browser to get the required cookie.
+
+> The only exception is **subscriber-only episodes** — episodes paywalled by the podcast creator (separate from Spotify Premium). Those will fail with "no audio files available."
+
+### Supported URLs
+
+| URL type | Example |
+|---|---|
+| Single episode | `https://open.spotify.com/episode/4rOoJ6Egrf8K2IrywzwOMk` |
+| Full show (all episodes) | `https://open.spotify.com/show/0ofXAdFIQQRsCYj9754UFx` |
+
+Paste either URL into the main input bar and click Download — the same as any music URL.
+
+### Setup: getting your sp_dc cookie
+
+1. Open **[open.spotify.com](https://open.spotify.com)** in any browser while logged in to your Spotify account
+2. Open **DevTools** → **F12** (Chrome/Edge) or **Cmd+Option+I** (macOS)
+3. Go to **Application** tab → **Cookies** → `https://open.spotify.com`
+4. Find the cookie named **`sp_dc`** — copy its value (starts with `AQ…`)
+5. In Antra, open **Settings → Spotify Podcasts** and paste the value into the **sp_dc cookie** field
+6. The indicator turns green: **● Cookie configured — podcast downloads enabled**
+
+The cookie is valid for approximately **one year**. If downloads start failing with an auth error, repeat the steps above to refresh it.
+
+### Output and tagging
+
+Episodes are saved inside your configured Music folder:
+
+```
+~/Music/
+└── Podcasts/
+    └── Show Name/
+        ├── 2024-03-15 - Episode Title.ogg
+        ├── 2024-03-22 - Another Episode.ogg
+        └── ...
+```
+
+Files are tagged automatically:
+
+| Tag | Value |
+|---|---|
+| Title | Episode title |
+| Artist | Show name |
+| Album | Show name |
+| Date | Publication date (YYYY-MM-DD) |
+| Track number | Episode number (where available) |
+| Comment/Description | Episode description (first 500 chars) |
+| Artwork | Episode or show cover image |
+
+### Audio quality
+
+Antra always picks the highest quality format the episode offers:
+
+| Format | Codec | Bitrate | Extension |
+|---|---|---|---|
+| OGG_VORBIS_320 | Ogg Vorbis | 320 kbps | `.ogg` |
+| OGG_VORBIS_160 | Ogg Vorbis | 160 kbps | `.ogg` |
+| MP4_128 | AAC | 128 kbps | `.m4a` |
+| OGG_VORBIS_96 | Ogg Vorbis | 96 kbps | `.ogg` |
+
+Most modern Spotify podcasts are available at 320 kbps OGG Vorbis. OGG and M4A are widely supported by VLC, foobar2000, Plex, Jellyfin, and all major podcast apps.
+
+### Rate limiting
+
+To protect your Spotify account from being flagged, Antra applies automatic rate limiting:
+
+- **3–7 second random delay** between each episode download
+- **50 episodes per hour** hard cap — Antra pauses and resumes automatically if the limit is reached
+
+For large shows (100+ episodes) this means downloads take time. Leave Antra running in the background — it will complete the queue without any intervention.
 
 ---
 

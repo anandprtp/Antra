@@ -2,6 +2,7 @@
 Reusable application service for CLI and future desktop frontends.
 """
 import logging
+import json
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
@@ -26,11 +27,14 @@ from antra.utils.organizer import LibraryOrganizer
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PREFERENCE_CHOICES = ("auto", "hifi", "amazon", "dab", "soulseek", "jiosaavn")
-OUTPUT_FORMAT_CHOICES = ("source", "flac", "m4a", "aac", "mp3")
+SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "dab", "qobuz", "soulseek", "jiosaavn")
+OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
 SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
-LEGACY_SOURCE_PREFERENCE_ALIASES = {}
+LEGACY_SOURCE_PREFERENCE_ALIASES = {
+    "tidal": "hifi",
+    "anandtidal": "hifi",
+}
 LEGACY_OUTPUT_FORMAT_ALIASES = {"flac-16": "flac", "flac-24": "flac"}
 
 
@@ -64,6 +68,37 @@ def _split_config_urls(value: str) -> list[str]:
     return parts
 
 
+def _parse_enabled_sources(value) -> set[str]:
+    if not value:
+        return set()
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        return set()
+    return {str(item).strip().lower() for item in raw_items if str(item).strip()}
+
+
+def _merge_amazon_direct_creds_json(raw_json: str, wvd_path: str) -> str:
+    raw_json = (raw_json or "").strip()
+    if not raw_json:
+        return ""
+    if not (wvd_path or "").strip():
+        return raw_json
+    try:
+        payload = json.loads(raw_json)
+    except Exception:
+        return raw_json
+    if not isinstance(payload, dict):
+        return raw_json
+    payload["wvd_path"] = (wvd_path or "").strip()
+    try:
+        return json.dumps(payload)
+    except Exception:
+        return raw_json
+
+
 def normalize_source_preference(value: Optional[str]) -> str:
     normalized = LEGACY_SOURCE_PREFERENCE_ALIASES.get(value or "", value or "")
     if normalized in SOURCE_PREFERENCE_CHOICES or normalized in SPECIAL_SOURCE_PREFERENCE_CHOICES:
@@ -82,6 +117,7 @@ def describe_source_preference(value: Optional[str]) -> str:
     normalized = normalize_source_preference(value)
     labels = {
         "auto": "auto",
+        "apple": "apple",
         "priority-2": "hifi / dab -> soulseek -> jiosaavn",
         "priority-3": "jiosaavn",
         "priority-4": "jiosaavn",
@@ -143,11 +179,11 @@ class AntraService:
         if not normalized or normalized == "auto":
             return adapters
         if normalized == "soulseek":
-            preferred_order = ["soulseek", "hifi", "jiosaavn"]
+            preferred_order = ["soulseek", "apple", "hifi", "jiosaavn"]
             by_name = {adapter.name: adapter for adapter in adapters}
             return [by_name[name] for name in preferred_order if name in by_name]
         if normalized == "priority-2":
-            allowed = {"hifi", "amazon", "soulseek", "jiosaavn"}
+            allowed = {"hifi", "amazon", "apple", "dab", "soulseek", "jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         if normalized == "priority-3":
             allowed = {"jiosaavn"}
@@ -164,42 +200,20 @@ class AntraService:
         pass
 
     def build_adapters(self, cfg: Config) -> list:
-        """Build and return all configured source adapters."""
+        """Build the active download chain for the app."""
         adapters: list = []
+        enabled_sources = _parse_enabled_sources(getattr(cfg, "sources_enabled", ""))
 
-        # Amazon Music (free FLAC via community proxy — highest priority, no account needed)
-        if cfg.amazon_enabled and cfg.amazon_mirrors:
-            try:
-                from antra.sources.amazon import AmazonAdapter
-                amazon = AmazonAdapter(
-                    mirrors=cfg.amazon_mirrors,
-                    api_key=cfg.odesli_api_key or None,
-                )
-                if amazon.is_available():
-                    adapters.append(amazon)
-                    logger.info("[OK] Amazon adapter enabled (free FLAC via community proxy)")
-            except Exception as e:
-                logger.warning(f"Amazon adapter failed to initialize: {e}")
+        def source_group_enabled(name: str) -> bool:
+            return not enabled_sources or name in enabled_sources
 
-        # HiFi (free FLAC via community Tidal proxy — no account needed)
+        manifest = None
         try:
-            from antra.sources.hifi import HifiAdapter
-            hifi = HifiAdapter()
-            if hifi.is_available():
-                adapters.append(hifi)
-                logger.info("[OK] HiFi adapter enabled (free FLAC via Tidal proxy)")
-        except Exception as e:
-            logger.warning(f"HiFi adapter failed to initialize: {e}")
+            from antra.core.endpoint_manifest import load_endpoint_manifest
 
-        # Dab Music (free FLAC via Qobuz API wrapper)
-        try:
-            from antra.sources.dab import DabAdapter
-            dab = DabAdapter()
-            if dab.is_available():
-                adapters.append(dab)
-                logger.info("[OK] Dab adapter enabled (free FLAC via Qobuz proxy)")
+            manifest = load_endpoint_manifest()
         except Exception as e:
-            logger.warning(f"Dab adapter failed to initialize: {e}")
+            logger.debug(f"[Sources] Endpoint manifest unavailable: {e}")
 
         # Soulseek via slskd
         soulseek_base_url = (getattr(cfg, "soulseek_base_url", "") or "").strip()
@@ -229,7 +243,7 @@ class AntraService:
                 except Exception as e:
                     logger.warning(f"Managed slskd bootstrap failed: {e}")
 
-        if soulseek_base_url:
+        if source_group_enabled("soulseek") and soulseek_base_url:
             try:
                 from antra.sources.soulseek import SoulseekAdapter
 
@@ -248,16 +262,61 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Soulseek adapter failed to initialize: {e}")
 
-        # Qobuz (user credentials — lossless FLAC)
-        if cfg.qobuz_email and cfg.qobuz_password and "@example.com" not in cfg.qobuz_email:
+        # Tidal Premium (session/token-backed preferred; email/password kept as legacy fallback)
+        tidal_session_ready = bool(
+            getattr(cfg, "tidal_enabled", False)
+            and (
+                (getattr(cfg, "tidal_auth_mode", "session_json") == "session_json" and (getattr(cfg, "tidal_session_json", "") or "").strip())
+                or (
+                    getattr(cfg, "tidal_auth_mode", "session_json") != "session_json"
+                    and (getattr(cfg, "tidal_access_token", "") or "").strip()
+                    and (getattr(cfg, "tidal_refresh_token", "") or "").strip()
+                )
+            )
+        )
+        if source_group_enabled("tidal") and (tidal_session_ready or (cfg.tidal_email and cfg.tidal_password)):
+            try:
+                from antra.sources.tidal import TidalAdapter
+
+                adapter = TidalAdapter(
+                    email=cfg.tidal_email,
+                    password=cfg.tidal_password,
+                    mirrors=[],
+                    enabled=getattr(cfg, "tidal_enabled", False),
+                    auth_mode=getattr(cfg, "tidal_auth_mode", "session_json"),
+                    session_json=getattr(cfg, "tidal_session_json", ""),
+                    access_token=getattr(cfg, "tidal_access_token", ""),
+                    refresh_token=getattr(cfg, "tidal_refresh_token", ""),
+                    session_id=getattr(cfg, "tidal_session_id", ""),
+                    token_type=getattr(cfg, "tidal_token_type", "Bearer"),
+                )
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] Tidal adapter enabled")
+            except Exception as e:
+                logger.warning(f"Tidal adapter failed to initialize: {e}")
+
+        # Qobuz Premium / Studio
+        qobuz_ready = bool(
+            getattr(cfg, "qobuz_enabled", False)
+            and (
+                (
+                    (getattr(cfg, "qobuz_email", "") or "").strip()
+                    and (getattr(cfg, "qobuz_password", "") or "").strip()
+                )
+                or (getattr(cfg, "qobuz_user_auth_token", "") or "").strip()
+            )
+        )
+        if source_group_enabled("qobuz") and qobuz_ready:
             try:
                 from antra.sources.qobuz import QobuzAdapter
 
                 adapter = QobuzAdapter(
-                    email=cfg.qobuz_email,
-                    password=cfg.qobuz_password,
-                    app_id=cfg.qobuz_app_id,
-                    app_secret=cfg.qobuz_app_secret,
+                    email=getattr(cfg, "qobuz_email", ""),
+                    password=getattr(cfg, "qobuz_password", ""),
+                    app_id=getattr(cfg, "qobuz_app_id", ""),
+                    app_secret=getattr(cfg, "qobuz_app_secret", ""),
+                    user_auth_token=getattr(cfg, "qobuz_user_auth_token", ""),
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -265,75 +324,66 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Qobuz adapter failed to initialize: {e}")
 
-        # Tidal
-        if cfg.tidal_email and cfg.tidal_password:
+        apple_direct_ready = bool(
+            (getattr(cfg, "apple_authorization_token", "") or "").strip()
+            and (getattr(cfg, "apple_music_user_token", "") or "").strip()
+            and (getattr(cfg, "apple_wvd_path", "") or "").strip()
+        )
+        apple_mirrors = list(getattr(cfg, "apple_mirrors", None) or [])
+        if not apple_mirrors and manifest is not None:
+            apple_mirrors = list(getattr(manifest, "apple", []) or [])
+        if source_group_enabled("apple") and getattr(cfg, "apple_enabled", False):
             try:
-                from antra.sources.tidal import TidalAdapter
+                from antra.sources.apple import AppleAdapter
 
-                adapter = TidalAdapter(email=cfg.tidal_email, password=cfg.tidal_password)
+                adapter = AppleAdapter(
+                    mirrors=apple_mirrors,
+                    api_key=getattr(cfg, "odesli_api_key", "") or None,
+                    authorization_token=getattr(cfg, "apple_authorization_token", ""),
+                    music_user_token=getattr(cfg, "apple_music_user_token", ""),
+                    storefront=getattr(cfg, "apple_storefront", "us"),
+                    wvd_path=getattr(cfg, "apple_wvd_path", ""),
+                )
                 if adapter.is_available():
                     adapters.append(adapter)
-                    logger.info("[OK] Tidal adapter enabled")
+                    mode = "direct account" if apple_direct_ready else "mirror pool"
+                    logger.info(f"[OK] Apple adapter enabled ({mode})")
             except Exception as e:
-                logger.warning(f"Tidal adapter failed to initialize: {e}")
+                logger.warning(f"Apple adapter failed to initialize: {e}")
 
-        # NetEase Cloud Music (no credentials — 320kbps MP3, excellent Chinese catalog)
-        try:
-            from antra.sources.netease import NetEaseAdapter
-            netease = NetEaseAdapter()
-            if netease.is_available():
-                adapters.append(netease)
-                logger.info("[OK] NetEase adapter enabled (320kbps MP3, Chinese catalog)")
-        except Exception as e:
-            logger.warning(f"NetEase adapter failed to initialize: {e}")
-
-        # JioSaavn (no credentials needed — good MP3 320kbps fallback)
-        if cfg.jiosaavn_enabled:
+        amazon_direct_creds_json = _merge_amazon_direct_creds_json(
+            getattr(cfg, "amazon_direct_creds_json", ""),
+            getattr(cfg, "amazon_wvd_path", ""),
+        )
+        amazon_direct_ready = bool(amazon_direct_creds_json.strip())
+        amazon_mirrors = list(getattr(cfg, "amazon_mirrors", None) or [])
+        if not amazon_mirrors and manifest is not None:
+            amazon_mirrors = list(getattr(manifest, "amazon", []) or [])
+        if source_group_enabled("amazon") and getattr(cfg, "amazon_enabled", False):
             try:
-                from antra.sources.jiosaavn import JioSaavnAdapter
+                from antra.sources.amazon import AmazonAdapter
 
-                adapter = JioSaavnAdapter(quality=cfg.jiosaavn_quality)
+                adapter = AmazonAdapter(
+                    mirrors=amazon_mirrors,
+                    api_key=getattr(cfg, "odesli_api_key", "") or None,
+                    direct_creds_json=amazon_direct_creds_json,
+                )
                 if adapter.is_available():
                     adapters.append(adapter)
-                    logger.info(f"[OK] JioSaavn adapter enabled ({cfg.jiosaavn_quality}kbps)")
+                    mode = "direct account" if amazon_direct_ready else "mirror pool"
+                    logger.info(f"[OK] Amazon adapter enabled ({mode})")
             except Exception as e:
-                logger.warning(f"JioSaavn adapter failed to initialize: {e}")
+                logger.warning(f"Amazon adapter failed to initialize: {e}")
 
-
-        # Filter by user-selected source groups ("hifi", "soulseek").
-        # "hifi" covers Amazon + HiFi + JioSaavn (all non-P2P free sources).
-        # "soulseek" covers the Soulseek/slskd adapter.
-        # Empty = all enabled.
-        sources_enabled_raw = (getattr(cfg, "sources_enabled", "") or "").strip()
-        if sources_enabled_raw:
-            enabled_groups = {s.strip().lower() for s in sources_enabled_raw.split(",") if s.strip()}
-            _HIFI_NAMES = {"amazon", "hifi", "jiosaavn", "netease", "qobuz", "tidal", "dab", "yams"}
-            _SOULSEEK_NAMES = {"soulseek"}
-            def _in_enabled_group(adapter) -> bool:
-                name = adapter.name.lower()
-                if name in _SOULSEEK_NAMES:
-                    return "soulseek" in enabled_groups
-                return "hifi" in enabled_groups
-            adapters = [a for a in adapters if _in_enabled_group(a)]
-            if adapters:
-                logger.info(f"[Sources] Active after group filter: {', '.join(a.name for a in adapters)}")
-            elif "soulseek" in enabled_groups and "hifi" not in enabled_groups:
-                logger.warning(
-                    "[Sources] Soulseek-only mode: no adapters available. "
-                    "Ensure your Soulseek username and password are set in Settings and slskd is reachable."
-                )
-
-        source_preference = getattr(cfg, "source_preference", None)
-        filtered = self._filter_adapters_by_source_preference(adapters, source_preference)
-        if source_preference and source_preference != "auto":
-            logger.info(f"[OK] Source preference selected: {describe_source_preference(source_preference)}")
-            if not filtered and adapters:
-                logger.warning(
-                    "Selected source preference has no available adapters right now; "
-                    "falling back to auto source chain."
-                )
-                return adapters
-        return filtered
+        by_name = {adapter.name: adapter for adapter in adapters}
+        ordered = [by_name[name] for name in ("tidal", "apple", "amazon", "soulseek", "qobuz") if name in by_name]
+        if ordered:
+            logger.info(f"[Sources] Active download chain: {', '.join(adapter.name for adapter in ordered)}")
+        else:
+            logger.warning(
+                "[Sources] No download adapters available. Enable Apple, Amazon, TIDAL, Qobuz, or Soulseek in Settings."
+            )
+        return ordered
 
     @staticmethod
     def _enrich_isrcs(tracks: list[TrackMetadata]) -> None:
@@ -362,10 +412,14 @@ class AntraService:
     def _stamp_disc_totals(tracks: list[TrackMetadata]) -> list[TrackMetadata]:
         """Compute total_discs per album and stamp it on each track.
 
-        Groups tracks by album_id (or album+artist as fallback), finds the max
-        disc_number in each group, and writes it back to every track in that group.
-        This lets the organizer use Plex-compatible disc-prefixed filenames (101, 201)
-        without needing per-track album-level context at write time.
+        Groups tracks by album_id (or album+artist as fallback), normalizes any
+        anomalous disc numbering into a clean 1..N sequence, then stamps the
+        total disc count back onto every track in the group.
+
+        Some upstream sources occasionally emit broken disc numbers like 29/39
+        for a normal 2-disc release. Normalizing here keeps the default file
+        naming stable across Spotify, Apple Music, Amazon, and any future source:
+        disc 1 -> 101/102..., disc 2 -> 201/202..., etc.
         """
         from collections import defaultdict
         album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
@@ -374,10 +428,25 @@ class AntraService:
             album_groups[key].append(track)
 
         for group in album_groups.values():
-            disc_numbers = [t.disc_number for t in group if t.disc_number is not None]
+            disc_numbers = [t.disc_number for t in group if t.disc_number is not None and t.disc_number > 0]
             if not disc_numbers:
                 continue
-            total = max(disc_numbers)
+
+            unique_discs = sorted(set(disc_numbers))
+            expected = list(range(1, len(unique_discs) + 1))
+            if unique_discs != expected:
+                remap = {disc: index for index, disc in enumerate(unique_discs, start=1)}
+                logger.debug(
+                    "[Service] Normalizing disc numbers for album group %s: %s -> %s",
+                    group[0].album if group else "unknown",
+                    unique_discs,
+                    expected,
+                )
+                for track in group:
+                    if track.disc_number in remap:
+                        track.disc_number = remap[track.disc_number]
+
+            total = len(unique_discs)
             for track in group:
                 track.total_discs = total
 
@@ -387,6 +456,7 @@ class AntraService:
         self,
         playlist: str,
         options: Optional[RuntimeOptions] = None,
+        enrich_override: Optional[bool] = None,
     ) -> list[TrackMetadata]:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
@@ -402,7 +472,8 @@ class AntraService:
         # Handle Amazon Music URLs
         elif "music.amazon." in playlist:
             tracks = self._fetch_amazon_music_tracks(playlist, cfg)
-            if getattr(cfg, "enrich_album_data", False):
+            enrich_album_data = getattr(cfg, "enrich_album_data", False) if enrich_override is None else enrich_override
+            if enrich_album_data:
                 try:
                     spotify = self._make_spotify_client(cfg)
                     logger.info("Enriching Amazon tracks with Spotify metadata...")
@@ -417,7 +488,7 @@ class AntraService:
             #   2. Direct Spotify public-page scraping (no 3rd-party dependency)
             spotify = self._make_spotify_client(cfg)
             try:
-                tracks = self._fetch_tracks_with_client(spotify, playlist, cfg)
+                tracks = self._fetch_tracks_with_client(spotify, playlist, cfg, enrich_override=enrich_override)
             except SpotifyResourceError as e:
                 logger.debug(
                     f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
@@ -431,6 +502,34 @@ class AntraService:
                     tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
                 else:
                     raise
+
+        return self._stamp_disc_totals(tracks)
+
+    def enrich_tracks_for_download(
+        self,
+        tracks: list[TrackMetadata],
+        playlist: str,
+        options: Optional[RuntimeOptions] = None,
+    ) -> list[TrackMetadata]:
+        cfg = self.build_runtime_config(options)
+        self.validate_config(cfg)
+        if not getattr(cfg, "enrich_album_data", False) or not tracks:
+            return self._stamp_disc_totals(tracks)
+
+        try:
+            if "music.amazon." in playlist:
+                spotify = self._make_spotify_client(cfg)
+                logger.info("Enriching Amazon tracks with Spotify metadata...")
+                tracks = spotify.batch_enrich_album_data(tracks)
+            elif not (
+                "music.apple.com" in playlist
+                or "soundcloud.com" in playlist
+            ):
+                spotify = self._make_spotify_client(cfg)
+                logger.info("Enriching tracks with album metadata...")
+                tracks = spotify.batch_enrich_album_data(tracks)
+        except Exception as e:
+            logger.debug(f"[Service] Deferred track enrichment failed: {e}")
 
         return self._stamp_disc_totals(tracks)
 
@@ -569,13 +668,15 @@ class AntraService:
         spotify: SpotifyClient,
         playlist: str | SpotifyPlaylistSummary,
         cfg: Config,
+        enrich_override: Optional[bool] = None,
     ) -> list[TrackMetadata]:
         if isinstance(playlist, SpotifyPlaylistSummary):
             tracks = spotify.get_library_selection_tracks(playlist)
         else:
             tracks = spotify.get_playlist_tracks(playlist)
 
-        if cfg.enrich_album_data:
+        enrich_album_data = cfg.enrich_album_data if enrich_override is None else enrich_override
+        if enrich_album_data:
             logger.info("Enriching tracks with album metadata...")
             tracks = spotify.batch_enrich_album_data(tracks)
 
@@ -808,6 +909,7 @@ class AntraService:
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
             output_format=cfg.output_format,
+            max_workers=2,
         )
 
         return DownloadEngine(

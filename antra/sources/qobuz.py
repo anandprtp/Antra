@@ -160,7 +160,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 "track/search",
                 params={"query": track.isrc, "limit": 5},
             )
-            items = resp.json().get("tracks", {}).get("items", [])
+            items = (resp.json().get("tracks") or {}).get("items", [])
             for item in items:
                 if item.get("isrc", "").upper() == (track.isrc or "").upper():
                     return self._item_to_result(item, track, isrc_match=True)
@@ -175,7 +175,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 "track/search",
                 params={"query": query, "limit": 10},
             )
-            items = resp.json().get("tracks", {}).get("items", [])
+            items = (resp.json().get("tracks") or {}).get("items", [])
         except Exception as e:
             logger.warning(f"[Qobuz] Text search failed for '{query}': {e}")
             return None
@@ -184,7 +184,7 @@ class QobuzAdapter(BaseSourceAdapter):
         best_score = 0.0
 
         for item in items:
-            performer = item.get("performer", {}).get("name", "")
+            performer = (item.get("performer") or {}).get("name", "")
             title = item.get("title", "")
             duration = item.get("duration")
 
@@ -213,17 +213,40 @@ class QobuzAdapter(BaseSourceAdapter):
 
     def _item_to_result(self, item: dict, track: TrackMetadata, isrc_match: bool = False) -> Optional[SearchResult]:
         try:
-            performer = item.get("performer", {}).get("name", item.get("album", {}).get("artist", {}).get("name", ""))
+            performer = (
+                (item.get("performer") or {}).get("name")
+                or (item.get("album") or {}).get("artist", {}).get("name", "")
+                or ""
+            )
             duration_s = item.get("duration")
+            album = item.get("album") or {}
+            bit_depth = (
+                item.get("maximum_bit_depth")
+                or album.get("maximum_bit_depth")
+                or 16
+            )
+            sample_rate = (
+                item.get("maximum_sampling_rate")
+                or album.get("maximum_sampling_rate")
+                or 44100
+            )
+            # Qobuz returns sample rate in kHz (e.g. 96.0) — convert to Hz
+            if isinstance(sample_rate, float) and sample_rate < 1000:
+                sample_rate = int(sample_rate * 1000)
+            else:
+                sample_rate = int(sample_rate)
+            bit_depth = int(bit_depth)
             return SearchResult(
                 source=self.name,
                 title=item.get("title", ""),
                 artists=[performer],
-                album=item.get("album", {}).get("title"),
+                album=album.get("title"),
                 duration_ms=int(duration_s * 1000) if duration_s else None,
                 audio_format=AudioFormat.FLAC,
                 quality_kbps=None,
                 is_lossless=True,
+                bit_depth=bit_depth,
+                sample_rate_hz=sample_rate,
                 download_url=None,
                 stream_id=str(item["id"]),
                 similarity_score=1.0 if isrc_match else 0.0,

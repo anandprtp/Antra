@@ -18,6 +18,8 @@ var audioExtensions = map[string]bool{
 	".flac": true,
 	".mp3":  true,
 	".m4a":  true,
+	".aac":  true,
+	".alac": true,
 	".wav":  true,
 	".aiff": true,
 	".aif":  true,
@@ -130,7 +132,7 @@ func (a *App) PickAnalyzerFiles() []string {
 	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 		Title: "Select Audio Files",
 		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.wav;*.aiff;*.aif;*.ogg"},
+			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.aac;*.alac;*.wav;*.aiff;*.aif;*.ogg"},
 		},
 	})
 	if err != nil || len(files) == 0 {

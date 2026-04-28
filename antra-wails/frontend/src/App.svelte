@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, CancelDownload, GetHistory, AddHistory, ClearHistory } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo } from '../wailsjs/go/main/App.js';
+  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
 
@@ -13,42 +13,149 @@
     soulseek_seed_after_download: false,
     sources_enabled: [],
     first_run_complete: false,
+    apple_enabled: true,
+    apple_authorization_token: '',
+    apple_music_user_token: '',
+    apple_storefront: 'us',
+    apple_wvd_path: '',
+    amazon_enabled: false,
+    amazon_direct_creds_json: '',
+    amazon_wvd_path: '',
+    qobuz_enabled: false,
+    qobuz_email: '',
+    qobuz_password: '',
+    qobuz_app_id: '285473059',
+    qobuz_app_secret: '',
+    qobuz_user_auth_token: '',
     output_format: 'lossless',
+    max_retries: 3,
     library_mode: 'smart_dedup',
     prefer_explicit: true,
     folder_structure: 'standard',
-    filename_format: 'default'
+    filename_format: 'default',
+    spotify_sp_dc: '',
+    tidal_enabled: false,
+    tidal_auth_mode: 'session_json',
+    tidal_session_json: '',
+    tidal_access_token: '',
+    tidal_refresh_token: '',
+    tidal_session_id: '',
+    tidal_token_type: 'Bearer',
+    tidal_country_code: '',
   };
+  let tidalValidationStatus: { ok: boolean; message: string; display_name?: string; country_code?: string } | null = null;
+  let tidalValidationLoading = false;
 
-  // Derived: true if a source group is enabled (or sources_enabled is empty = all on)
-  $: sourcesAll = !config.sources_enabled || config.sources_enabled.length === 0;
-  $: hifiEnabled = sourcesAll || config.sources_enabled.includes('hifi');
-  $: soulseekSourceEnabled = sourcesAll || config.sources_enabled.includes('soulseek');
+  // ── TIDAL OAuth login state ─────────────────────────────────────────────────
+  interface TidalOAuthState {
+    phase: 'idle' | 'starting' | 'waiting_browser' | 'success' | 'error';
+    url?: string;
+    code?: string;
+    message?: string;
+    displayName?: string;
+    countryCode?: string;
+    sessionJson?: string;
+  }
+  let tidalOAuth: TidalOAuthState = { phase: 'idle' };
 
-  function toggleSourceGroup(group: string, checked: boolean) {
-    // sources_enabled = [] means "all on" — materialize explicit list before mutating,
-    // otherwise filtering an empty array always returns [] (no change).
-    let current = (config.sources_enabled && config.sources_enabled.length > 0)
-      ? [...config.sources_enabled]
-      : ['hifi', 'soulseek'];
-    if (checked) {
-      if (!current.includes(group)) current.push(group);
-    } else {
-      current = current.filter(g => g !== group);
-    }
-    // If both are selected, normalize back to empty (= all)
-    const both = current.includes('hifi') && current.includes('soulseek');
-    config.sources_enabled = both ? [] : current;
+  interface BrowserLoginState {
+    phase: 'idle' | 'starting' | 'waiting_for_user' | 'capturing' | 'success' | 'error';
+    message?: string;
+    detail?: string;
+  }
+  let appleLogin: BrowserLoginState = { phase: 'idle' };
+  let amazonLogin: BrowserLoginState = { phase: 'idle' };
+
+  interface FailedTrackPayload {
+    title: string;
+    artists: string[];
+    album: string;
+    playlist_name?: string;
+    playlist_owner?: string;
+    playlist_description?: string;
+    playlist_position?: number;
+    release_year?: number;
+    release_date?: string;
+    track_number?: number;
+    disc_number?: number;
+    total_tracks?: number;
+    total_discs?: number;
+    duration_ms?: number;
+    isrc?: string;
+    spotify_id?: string;
+    album_id?: string;
+    spotify_url?: string;
+    amazon_asin?: string;
+    upc?: string;
+    iswc?: string;
+    audio_traits?: string[];
+    genres?: string[];
+    album_artists?: string[];
+    artwork_url?: string;
+    playlist_artwork_url?: string;
+    is_explicit?: boolean;
+    lyrics?: string;
+    synced_lyrics?: string;
   }
 
   let isLoading = true;
   let setupMode = false;
   let showHistory = false;
   let showSettings = false;
+  let settingsScrollTarget: string | null = null; // id of settings section to scroll to on open
+  let showDownloadedMusic = false;
   let slskdWebUIInfo: {url: string, username: string, password: string} | null = null;
   let historyItems: any[] = [];
   let inputUrl = '';
   let isDownloading = false;
+
+  interface LibraryReleaseSummary {
+    kind: string;
+    relative_path: string;
+    title: string;
+    artist?: string;
+    year?: string;
+    track_count: number;
+    artwork_url?: string;
+  }
+
+  interface LibraryReleaseTrack {
+    title: string;
+    artist?: string;
+    album?: string;
+    file_name: string;
+    file_path: string;
+    disc_number?: number;
+    track_number?: number;
+    duration_seconds?: number;
+    codec?: string;
+    audio_url: string;
+  }
+
+  interface LibraryReleaseDetail extends LibraryReleaseSummary {
+    tracks: LibraryReleaseTrack[];
+  }
+
+  let downloadedLibrary: { albums: LibraryReleaseSummary[]; playlists: LibraryReleaseSummary[]; error?: string } = {
+    albums: [],
+    playlists: []
+  };
+  let downloadedLibraryLoading = false;
+  let downloadedLibraryError = '';
+  let downloadedSelectedRelease: LibraryReleaseDetail | null = null;
+  let downloadedSelectedReleaseLoading = false;
+  let downloadedSelectedPath = '';
+  let downloadedView: 'albums' | 'playlists' = 'albums';
+  let audioEl: HTMLAudioElement;
+  let playerQueue: LibraryReleaseTrack[] = [];
+  let playerTrackIndex = -1;
+  let playerCurrentTime = 0;
+  let playerDuration = 0;
+  let playerSeeking = false;
+  let playerVolume = 1;
+  let playerError = '';
+  let playerReleaseTitle = '';
+  $: currentPlayerTrack = playerTrackIndex >= 0 ? playerQueue[playerTrackIndex] : null;
 
   // ── Source health check ─────────────────────────────────────────────────────
   interface EndpointStatus { url: string; alive: boolean; latency_ms: number; }
@@ -59,9 +166,17 @@
   let showHealthPopover = false;
 
   const healthSources = [
-    { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', border: '#1DB9DE', text: '#1DB9DE' },
-    { key: 'amazon', label: 'Amazon',  abbr: 'a', bg: '#1a1200', border: '#FF9900', text: '#FF9900' },
-    { key: 'dab',    label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', border: '#7B5EA7', text: '#7B5EA7' },
+    { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', bgEnabled: 'rgba(29,185,222,0.14)',  border: '#1DB9DE', text: '#1DB9DE' },
+    { key: 'apple',  label: 'Apple',   abbr: '',  bg: '#230a10', bgEnabled: 'rgba(252,60,68,0.14)',   border: '#fc3c44', text: '#fc3c44' },
+    { key: 'amazon', label: 'Amazon',  abbr: 'a', bg: '#1a1200', bgEnabled: 'rgba(255,153,0,0.14)',   border: '#FF9900', text: '#FF9900' },
+    { key: 'dab',    label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', bgEnabled: 'rgba(123,94,167,0.18)',  border: '#7B5EA7', text: '#7B5EA7' },
+  ];
+  const formatOptions = [
+    { value: 'auto',     name: 'Auto',     label: 'Best available — lossless preferred, MP3 fallback' },
+    { value: 'lossless', name: 'Lossless', label: 'FLAC only — skip if unavailable' },
+    { value: 'alac',     name: 'ALAC',     label: 'Apple Lossless .m4a — iPhone / Apple Music compatible' },
+    { value: 'aac',      name: 'AAC',      label: '~320kbps AAC — uses JioSaavn directly' },
+    { value: 'mp3',      name: 'MP3',      label: '~320kbps MP3 — uses JioSaavn / NetEase directly' },
   ];
 
   async function checkHealth(src: string) {
@@ -74,6 +189,52 @@
       healthCache = { ...healthCache };
     } catch (e) { console.error(e); }
     finally { healthLoading = false; }
+  }
+
+  // Map health chip key → settings section id and config enabled key
+  const chipSettingsMap: Record<string, { sectionId: string; enableKey: string }> = {
+    hifi:   { sectionId: 'settings-tidal',  enableKey: 'tidal_enabled'  },
+    apple:  { sectionId: 'settings-apple',  enableKey: 'apple_enabled'  },
+    amazon: { sectionId: 'settings-amazon', enableKey: 'amazon_enabled' },
+    dab:    { sectionId: 'settings-qobuz',  enableKey: 'qobuz_enabled'  },
+  };
+
+  // Explicit reactive enabled states — Svelte tracks these directly.
+  // Using $: ensures they update whenever config changes (e.g. after GetConfig() in onMount).
+  $: chipEnabled = {
+    hifi:   !!config.tidal_enabled,
+    apple:  !!config.apple_enabled,
+    amazon: !!config.amazon_enabled,
+    dab:    !!config.qobuz_enabled,
+  };
+
+  function isChipEnabled(key: string): boolean {
+    return !!chipEnabled[key];
+  }
+
+  async function openSettingsAt(sectionId: string) {
+    settingsScrollTarget = sectionId;
+    showSettings = true;
+    try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; }
+    // Wait for the modal DOM to render, then scroll the target section into view
+    setTimeout(() => {
+      const el = document.getElementById(sectionId);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      settingsScrollTarget = null;
+    }, 80);
+  }
+
+  function handleChipClick(src: string) {
+    // Always open settings at the adapter's section — whether enabled or not.
+    // Disabled: enables the adapter, saves config, then opens settings.
+    // Enabled: opens settings directly (so user can manage credentials).
+    const m = chipSettingsMap[src];
+    if (!m) return;
+    if (!isChipEnabled(src)) {
+      (config as any)[m.enableKey] = true;
+      SaveConfig(config).catch(() => {});
+    }
+    openSettingsAt(m.sectionId);
   }
 
   // ── Tracklist scroll state ─────────────────────────────────────────────────
@@ -101,10 +262,59 @@
   let kofiTooltipVisible = false;
   let sponsorToastTimer: ReturnType<typeof setTimeout>;
 
+  interface SupportStatus {
+    enabled: boolean;
+    title: string;
+    message: string;
+    current: number;
+    goal: number;
+    currency: string;
+    link: string;
+  }
+
+  let supportStatus: SupportStatus = {
+    enabled: true,
+    title: 'Support Antra',
+    message: 'Solo-maintained by one developer. Help fund bug fixes, updates, and endpoint costs.',
+    current: 0,
+    goal: 200,
+    currency: 'USD',
+    link: 'https://ko-fi.com/antraverse'
+  };
+  let supportStatusLoading = false;
+  $: supportProgress = supportStatus.goal > 0 ? Math.min(100, Math.max(0, (supportStatus.current / supportStatus.goal) * 100)) : 0;
+
   function dismissSponsorToast() {
     sponsorToastLeaving = true;
     clearTimeout(sponsorToastTimer);
     setTimeout(() => { showSponsorToast = false; sponsorToastLeaving = false; }, 450);
+  }
+
+  function formatSupportAmount(value: number): string {
+    const currency = supportStatus.currency || 'USD';
+    if (currency === 'USD') return `$${Math.round(value)}`;
+    return `${Math.round(value)} ${currency}`;
+  }
+
+  async function loadSupportStatus() {
+    supportStatusLoading = true;
+    try {
+      const raw = await GetSupportStatus();
+      const parsed = JSON.parse(raw || '{}');
+      supportStatus = {
+        enabled: parsed.enabled !== false,
+        title: parsed.title || supportStatus.title,
+        message: parsed.message || supportStatus.message,
+        current: typeof parsed.current === 'number' ? parsed.current : supportStatus.current,
+        goal: typeof parsed.goal === 'number' && parsed.goal > 0 ? parsed.goal : supportStatus.goal,
+        currency: parsed.currency || supportStatus.currency,
+        link: parsed.link || supportStatus.link
+      };
+    } catch (e) {
+      console.error('Failed to load support status', e);
+    } finally {
+      supportStatusLoading = false;
+    }
   }
 
   // Logs terminal
@@ -132,6 +342,8 @@
     error?: string,
     mode: 'status' | 'progress',
     status: 'resolving' | 'downloading' | 'done' | 'failed' | 'skipped',
+    retrying?: boolean,
+    trackData?: FailedTrackPayload,
   }> = {};
 
   function updateActiveTrack(trackName: string, patch: Partial<typeof activeTracks[string]>) {
@@ -157,11 +369,23 @@
       if (!config.output_format) {
         config.output_format = 'lossless';
       }
+      if (!config.max_retries || config.max_retries < 1) {
+        config.max_retries = 3;
+      }
       if (!config.sources_enabled) {
         config.sources_enabled = [];
       }
+      // Retire the old source-group checkbox model in favor of a single
+      // Soulseek toggle plus the separate TIDAL Premium section.
+      if (config.sources_enabled.includes('soulseek')) {
+        config.soulseek_enabled = true;
+      }
+      config.sources_enabled = [];
       if (typeof config.soulseek_seed_after_download !== 'boolean') {
         config.soulseek_seed_after_download = false;
+      }
+      if (!config.qobuz_app_id) {
+        config.qobuz_app_id = '285473059';
       }
       if (!config.library_mode) {
         config.library_mode = 'smart_dedup';
@@ -175,15 +399,132 @@
       if (!config.filename_format) {
         config.filename_format = 'default';
       }
+      if (config.spotify_sp_dc === undefined || config.spotify_sp_dc === null) {
+        config.spotify_sp_dc = '';
+      }
+      if (config.apple_storefront === undefined || config.apple_storefront === null || !config.apple_storefront) {
+        config.apple_storefront = 'us';
+      }
+      if (config.amazon_wvd_path === undefined || config.amazon_wvd_path === null) {
+        config.amazon_wvd_path = '';
+      }
+
     } catch (e) {
       console.error('Failed to load config', e);
       setupMode = true;
     }
 
+    await loadSupportStatus();
     isLoading = false;
 
     // Listen to backend events
     EventsOn("backend-event", handleEvent);
+
+    // Listen to TIDAL OAuth events
+    EventsOn("tidal-oauth-event", (payload: any) => {
+      if (!payload || !payload.type) return;
+      switch (payload.type) {
+        case 'tidal_oauth_status':
+          tidalOAuth = { ...tidalOAuth, phase: 'starting', message: payload.message };
+          break;
+        case 'tidal_oauth_url':
+          tidalOAuth = {
+            phase: 'waiting_browser',
+            url: payload.url,
+            code: payload.code || '',
+            message: 'Open the link below in your browser and log in to TIDAL:',
+          };
+          break;
+        case 'tidal_oauth_success':
+          tidalOAuth = {
+            phase: 'success',
+            displayName: payload.display_name || '',
+            countryCode: payload.country_code || '',
+            sessionJson: payload.session_json || '',
+            message: payload.message || 'Login successful!',
+          };
+          // Auto-populate config fields and re-load config to pick up saved values
+          if (payload.session_json) {
+            config.tidal_enabled = true;
+            config.tidal_auth_mode = 'session_json';
+            config.tidal_session_json = payload.session_json;
+          }
+          // Trigger validation automatically so user sees the green tick
+          tidalValidationStatus = {
+            ok: true,
+            message: payload.message || 'TIDAL session is valid.',
+            display_name: payload.display_name,
+            country_code: payload.country_code,
+          };
+          break;
+        case 'tidal_oauth_error':
+          tidalOAuth = { phase: 'error', message: payload.message || 'OAuth login failed.' };
+          break;
+        case 'tidal_oauth_done':
+          // Process ended — if still in starting/waiting state, mark as error
+          if (tidalOAuth.phase === 'starting' || tidalOAuth.phase === 'waiting_browser') {
+            tidalOAuth = { ...tidalOAuth, phase: 'error', message: tidalOAuth.message || 'OAuth process ended unexpectedly.' };
+          }
+          break;
+      }
+      tidalOAuth = { ...tidalOAuth }; // trigger reactivity
+    });
+
+    EventsOn("apple-login-event", (payload: any) => {
+      if (!payload || !payload.type) return;
+      switch (payload.type) {
+        case 'apple_login_status':
+          appleLogin = { phase: 'starting', message: payload.message || 'Opening Apple Music login...' };
+          break;
+        case 'apple_login_success':
+          appleLogin = { phase: 'success', message: payload.message || 'Apple Music connected.' };
+          config.apple_enabled = true;
+          if (payload.authorization_token) config.apple_authorization_token = payload.authorization_token;
+          if (payload.music_user_token) config.apple_music_user_token = payload.music_user_token;
+          if (payload.storefront) config.apple_storefront = payload.storefront;
+          break;
+        case 'apple_login_error':
+          appleLogin = { phase: 'error', message: payload.message || 'Apple Music login failed.' };
+          break;
+        case 'apple_login_done':
+          if (appleLogin.phase === 'starting') {
+            appleLogin = { phase: 'error', message: appleLogin.message || 'Apple Music login ended unexpectedly.' };
+          }
+          break;
+      }
+    });
+
+    EventsOn("amazon-login-event", (payload: any) => {
+      if (!payload || !payload.type) return;
+      switch (payload.type) {
+        case 'amazon_login_status':
+          if (payload.phase === 'waiting_for_user') {
+            amazonLogin = { phase: 'waiting_for_user', message: payload.message || 'Sign in to Amazon Music in your browser, then click \'I\'m Signed In\' below.' };
+          } else if (payload.phase === 'capturing') {
+            amazonLogin = { phase: 'capturing', message: payload.message || 'Reading your browser session…' };
+          } else {
+            amazonLogin = { phase: 'starting', message: payload.message || 'Opening Amazon Music login…' };
+          }
+          break;
+        case 'amazon_login_success':
+          amazonLogin = {
+            phase: 'success',
+            message: payload.message || 'Amazon Music connected.',
+            detail: payload.has_wvd_path ? '' : 'A Widevine device path is still required for downloads.',
+          };
+          config.amazon_enabled = true;
+          if (payload.direct_creds_json) config.amazon_direct_creds_json = payload.direct_creds_json;
+          break;
+        case 'amazon_login_error':
+          amazonLogin = { phase: 'error', message: payload.message || 'Amazon Music login failed.' };
+          break;
+        case 'amazon_login_done':
+          if (amazonLogin.phase === 'starting' || amazonLogin.phase === 'waiting_for_user' || amazonLogin.phase === 'capturing') {
+            amazonLogin = { phase: 'error', message: amazonLogin.message || 'Amazon Music login ended unexpectedly.' };
+          }
+          break;
+      }
+    });
 
     // Show sponsor toast after UI settles (skip during first-run setup)
     if (!setupMode) {
@@ -327,15 +668,26 @@
           progress: undefined,
           text: 'Resolving best source...',
           status: 'resolving',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
 
       } else if (name === 'track_resolved') {
         clearTrackInterval(trackName);
+        let displaySource = data.source || 'auto';
+        if (displaySource === 'hifi') displaySource = 'Tidal';
+        else if (displaySource === 'apple') displaySource = 'Apple';
+        else if (displaySource === 'amazon') displaySource = 'Amazon';
+        else if (displaySource === 'dab') displaySource = 'Qobuz';
+        else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
+
         updateActiveTrack(trackName, {
           mode: 'status',
           progress: undefined,
-          text: `Accepted via ${data.source || 'auto'}${data.quality_label ? ` • ${data.quality_label}` : ''}`,
+          text: `Accepted via ${displaySource}${data.quality_label ? ` • ${data.quality_label}` : ''}`,
           status: 'resolving',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
 
       } else if (name === 'track_download_attempt') {
@@ -349,16 +701,27 @@
             progress: undefined,
             text: 'Waiting for Soulseek transfer...',
             status: 'downloading',
+            retrying: false,
+            trackData: data.track_data || activeTracks[trackName]?.trackData,
           });
           return;
         }
 
         const attemptSuffix = attempt > 1 ? ` • Retry ${attempt}` : '';
+        let displaySource = source;
+        if (displaySource === 'hifi') displaySource = 'Tidal';
+        else if (displaySource === 'apple') displaySource = 'Apple';
+        else if (displaySource === 'amazon') displaySource = 'Amazon';
+        else if (displaySource === 'dab') displaySource = 'Qobuz';
+        else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
+
         updateActiveTrack(trackName, {
           mode: 'progress',
           progress: 8,
-          text: `Downloading${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`,
+          text: `Downloading from ${displaySource}${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`,
           status: 'downloading',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
 
         const intervalId = setInterval(() => {
@@ -383,6 +746,8 @@
           text: '✓ Added to library',
           error: undefined,
           status: 'done',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
       } else if (name === 'track_failed') {
         addLog('error', `[FAIL] ${trackName} - ${data.error}`);
@@ -390,8 +755,11 @@
         updateActiveTrack(trackName, {
           mode: 'status',
           progress: undefined,
+          text: 'Download failed',
           error: data.error || 'Failed',
           status: 'failed',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
       } else if (name === 'track_skipped') {
         addLog('warning', `[—] Already in library: ${trackName}`);
@@ -399,6 +767,8 @@
           mode: 'status',
           text: 'Already in library',
           status: 'skipped',
+          retrying: false,
+          trackData: data.track_data || activeTracks[trackName]?.trackData,
         });
       } else if (name === 'playlist_started') {
         addLog('info', `Creating playlist structure and syncing tracks: ${data.message}`);
@@ -427,9 +797,57 @@
     error?: string;
   }
 
-  // Artist search mode
-  let searchMode = false;
+  // Tab mode
+  let activeTab: 'url' | 'artist' | 'discover' = 'url';
   let searchQuery = '';
+
+  // Discovery variables
+  let discoveryRegion = 'in';
+  let discoveryGenre = '';
+  let discoveryData: any = null;
+  let discoveryLoading = false;
+  let discoveryGenres: any[] = [];
+  let discoveryGenresLoading = false;
+
+  async function loadDiscoveryGenres() {
+    discoveryGenresLoading = true;
+    try {
+      // @ts-ignore
+      const raw = await window.go.main.App.GetDiscoveryGenres(discoveryRegion);
+      const parsed = JSON.parse(raw);
+      if (parsed.type === 'discovery_genres') {
+        discoveryGenres = parsed.data || [];
+      } else {
+        addLog('error', `Failed to load genres: ${parsed.error || parsed.message}`);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    discoveryGenresLoading = false;
+  }
+
+  async function loadDiscoveryData() {
+    discoveryLoading = true;
+    try {
+      // @ts-ignore
+      const raw = await window.go.main.App.GetDiscoveryData(discoveryRegion, discoveryGenre, discoveryGenres.find(g => g.id === discoveryGenre)?.name || '');
+      const parsed = JSON.parse(raw);
+      if (parsed.type === 'discovery') {
+        discoveryData = parsed.data;
+      } else {
+        addLog('error', `Failed to load discovery: ${parsed.error || parsed.message}`);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    discoveryLoading = false;
+  }
+
+  function handleDiscoveryClick(url: string) {
+    activeTab = 'url';
+    inputUrl = url;
+    // Auto-focus text area or user can click download
+  }
   let searchSource: 'spotify' | 'apple' = 'apple';
   let showArtistSearch = false;
   let artistSearchResults: any[] = [];
@@ -442,6 +860,61 @@
   let discographyArtist: any = null
   let discographySelected: Set<string> = new Set()
   let discographyReqId = 0  // incremented on each new request; stale responses are ignored
+
+  function discographyReleaseKey(album: any) {
+    const name = String(album?.name ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const type = String(album?.type ?? 'album');
+    const year = Number(album?.year ?? 0);
+    const trackCount = Number(album?.track_count ?? 0);
+    return `${type}::${year}::${trackCount}::${name}`;
+  }
+
+  function discographyReleaseScore(album: any) {
+    const name = String(album?.name ?? '');
+    const isCleanNamed = /\b(clean|edited|radio edit|censored)\b/i.test(name);
+    const explicitScore =
+      album?.is_explicit === true ? 2 :
+      album?.is_explicit === false ? 0 :
+      isCleanNamed ? 0 : 1;
+    return [
+      explicitScore,
+      album?.artwork_url ? 1 : 0,
+      Number(album?.track_count ?? 0),
+      String(album?.id ?? ''),
+    ];
+  }
+
+  function isBetterDiscographyRelease(candidate: any, current: any) {
+    const candidateScore = discographyReleaseScore(candidate);
+    const currentScore = discographyReleaseScore(current);
+    for (let i = 0; i < candidateScore.length; i++) {
+      if (candidateScore[i] === currentScore[i]) continue;
+      return candidateScore[i] > currentScore[i];
+    }
+    return false;
+  }
+
+  function dedupeDiscographyAlbums(albums: any[]) {
+    const grouped = new Map<string, any[]>();
+    for (const album of albums || []) {
+      const key = discographyReleaseKey(album);
+      const group = grouped.get(key) ?? [];
+      group.push(album);
+      grouped.set(key, group);
+    }
+
+    const deduped: any[] = [];
+    for (const group of grouped.values()) {
+      let best = group[0];
+      for (const candidate of group.slice(1)) {
+        if (isBetterDiscographyRelease(candidate, best)) {
+          best = candidate;
+        }
+      }
+      deduped.push(best);
+    }
+    return deduped;
+  }
 
   let showAnalyzer = false;
   let analyzerTracks: TrackAnalysis[] = [];
@@ -542,7 +1015,7 @@
         const file = item.getAsFile();
         if (file) {
           const ext = file.name.split('.').pop()?.toLowerCase() || '';
-          if (['flac','mp3','m4a','wav','aiff','aif','ogg'].includes(ext)) {
+          if (['flac','mp3','m4a','aac','alac','wav','aiff','aif','ogg'].includes(ext)) {
             paths.push((file as any).path as string);
           }
         }
@@ -698,6 +1171,175 @@
     if ((e.ctrlKey || e.metaKey) && e.key === 'e') { e.preventDefault(); analyzerExportAll(); }
   }
 
+  function formatPlaybackTime(seconds: number): string {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const whole = Math.floor(seconds);
+    const mins = Math.floor(whole / 60);
+    const secs = whole % 60;
+    return `${mins}:${String(secs).padStart(2, '0')}`;
+  }
+
+  function releaseMetaLine(release: LibraryReleaseSummary | LibraryReleaseDetail): string {
+    const parts = [];
+    if (release.artist && release.artist !== 'Playlist') parts.push(release.artist);
+    if (release.year) parts.push(release.year);
+    parts.push(`${release.track_count} track${release.track_count === 1 ? '' : 's'}`);
+    return parts.join(' · ');
+  }
+
+  async function openDownloadedMusic() {
+    showDownloadedMusic = true;
+    await refreshDownloadedMusicLibrary();
+  }
+
+  async function refreshDownloadedMusicLibrary() {
+    downloadedLibraryLoading = true;
+    downloadedLibraryError = '';
+    try {
+      const raw = await GetDownloadedMusicLibrary();
+      const parsed = JSON.parse(raw || '{}');
+      downloadedLibrary = {
+        albums: Array.isArray(parsed.albums) ? parsed.albums : [],
+        playlists: Array.isArray(parsed.playlists) ? parsed.playlists : [],
+        error: parsed.error
+      };
+      downloadedLibraryError = parsed.error || '';
+
+      const selectedStillExists = [...downloadedLibrary.albums, ...downloadedLibrary.playlists]
+        .some((item: LibraryReleaseSummary) => item.relative_path === downloadedSelectedPath);
+      if (!selectedStillExists) {
+        downloadedSelectedRelease = null;
+        downloadedSelectedPath = '';
+      }
+
+      if (!downloadedSelectedPath) {
+        const first = downloadedView === 'playlists'
+          ? (downloadedLibrary.playlists[0] || downloadedLibrary.albums[0])
+          : (downloadedLibrary.albums[0] || downloadedLibrary.playlists[0]);
+        if (first) {
+          downloadedView = first.kind === 'playlist' ? 'playlists' : 'albums';
+          await openDownloadedRelease(first);
+        }
+      }
+    } catch (e: any) {
+      downloadedLibraryError = String(e);
+      downloadedLibrary = { albums: [], playlists: [] };
+    } finally {
+      downloadedLibraryLoading = false;
+    }
+  }
+
+  async function openDownloadedRelease(release: LibraryReleaseSummary) {
+    downloadedSelectedPath = release.relative_path;
+    downloadedSelectedReleaseLoading = true;
+    try {
+      const raw = await GetDownloadedRelease(release.relative_path);
+      const parsed = JSON.parse(raw || '{}');
+      if (parsed?.error) {
+        downloadedLibraryError = parsed.error;
+        return;
+      }
+      downloadedSelectedRelease = parsed;
+      downloadedView = release.kind === 'playlist' ? 'playlists' : 'albums';
+    } catch (e: any) {
+      downloadedLibraryError = String(e);
+    } finally {
+      downloadedSelectedReleaseLoading = false;
+    }
+  }
+
+  async function playDownloadedTrack(index: number) {
+    if (!downloadedSelectedRelease?.tracks?.length || !audioEl) return;
+    playerQueue = downloadedSelectedRelease.tracks;
+    playerTrackIndex = index;
+    playerReleaseTitle = downloadedSelectedRelease.title;
+    playerError = '';
+    playerCurrentTime = 0;
+    playerDuration = downloadedSelectedRelease.tracks[index]?.duration_seconds || 0;
+    audioEl.src = downloadedSelectedRelease.tracks[index].audio_url;
+    audioEl.load();
+    try {
+      await audioEl.play();
+    } catch (e: any) {
+      playerError = String(e);
+    }
+  }
+
+  async function togglePlayback() {
+    if (!audioEl) return;
+    if (!currentPlayerTrack && downloadedSelectedRelease?.tracks?.length) {
+      await playDownloadedTrack(0);
+      return;
+    }
+    if (audioEl.paused) {
+      try {
+        await audioEl.play();
+        playerError = '';
+      } catch (e: any) {
+        playerError = String(e);
+      }
+    } else {
+      audioEl.pause();
+    }
+  }
+
+  async function playNextTrack() {
+    if (playerTrackIndex < 0 || playerTrackIndex >= playerQueue.length - 1) return;
+    await playQueuedTrack(playerTrackIndex + 1);
+  }
+
+  async function playPreviousTrack() {
+    if (playerTrackIndex <= 0) {
+      if (audioEl) audioEl.currentTime = 0;
+      return;
+    }
+    await playQueuedTrack(playerTrackIndex - 1);
+  }
+
+  async function playQueuedTrack(index: number) {
+    if (!playerQueue.length || index < 0 || index >= playerQueue.length || !audioEl) return;
+    playerTrackIndex = index;
+    playerError = '';
+    playerCurrentTime = 0;
+    playerDuration = playerQueue[index]?.duration_seconds || 0;
+    audioEl.src = playerQueue[index].audio_url;
+    audioEl.load();
+    try {
+      await audioEl.play();
+    } catch (e: any) {
+      playerError = String(e);
+    }
+  }
+
+  function handleAudioTimeUpdate() {
+    if (!audioEl || playerSeeking) return;
+    playerCurrentTime = audioEl.currentTime || 0;
+  }
+
+  function handleAudioLoadedMetadata() {
+    if (!audioEl) return;
+    playerDuration = audioEl.duration || playerDuration;
+  }
+
+  async function handleAudioEnded() {
+    if (playerTrackIndex >= 0 && playerTrackIndex < playerQueue.length - 1) {
+      await playQueuedTrack(playerTrackIndex + 1);
+    }
+  }
+
+  function handleSeekInput(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    playerCurrentTime = Number(target.value);
+  }
+
+  function handleSeekCommit(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const nextTime = Number(target.value);
+    playerSeeking = false;
+    playerCurrentTime = nextTime;
+    if (audioEl) audioEl.currentTime = nextTime;
+  }
+
   async function pickDir() {
     const dir = await PickDirectory();
     if (dir) config.download_path = dir;
@@ -778,7 +1420,10 @@
           addLog('error', `Discography error: ${parsed.error}`);
           showDiscography = false;
         } else {
-          discographyArtist = parsed;
+          discographyArtist = {
+            ...parsed,
+            albums: dedupeDiscographyAlbums(Array.isArray(parsed?.albums) ? parsed.albums : []),
+          };
           if (discographyArtist?.albums) {
             discographySelected = new Set(discographyArtist.albums.map(a => a.url));
           }
@@ -822,7 +1467,7 @@
 
   async function openArtistFromSearch(artist: any) {
     showArtistSearch = false;
-    searchMode = false;
+    activeTab = 'url';
     const reqId = ++discographyReqId;
     discographyLoading = true;
     showDiscography = true;
@@ -836,7 +1481,10 @@
         addLog('error', `Discography error: ${parsed.error}`);
         showDiscography = false;
       } else {
-        discographyArtist = parsed;
+        discographyArtist = {
+          ...parsed,
+          albums: dedupeDiscographyAlbums(Array.isArray(parsed?.albums) ? parsed.albums : []),
+        };
         if (discographyArtist?.albums) {
           discographySelected = new Set(discographyArtist.albums.map((a: any) => a.url));
         }
@@ -879,8 +1527,134 @@
   }
 
   async function saveSettings() {
+    if (!config.max_retries || config.max_retries < 1) {
+      config.max_retries = 3;
+    }
     await SaveConfig(config);
     showSettings = false;
+  }
+
+  async function validateTidalSettings() {
+    tidalValidationLoading = true;
+    tidalValidationStatus = null;
+    try {
+      // Sanitize tidal_session_json: strip all control characters, normalize whitespace,
+      // re-serialize to ensure clean JSON before saving to disk.
+      if (config.tidal_session_json && config.tidal_session_json.trim()) {
+        try {
+          const cleaned = config.tidal_session_json
+            .replace(/[\r\n\t]/g, ' ')          // replace CR/LF/tabs with space
+            .replace(/[\u0000-\u001F\u007F]/g, '') // strip remaining control chars
+            .replace(/\s+/g, ' ')               // collapse runs of spaces
+            .trim();
+          const parsed = JSON.parse(cleaned);
+          config.tidal_session_json = JSON.stringify(parsed); // re-serialize to compact, clean JSON
+        } catch (parseErr) {
+          tidalValidationStatus = { ok: false, message: `Invalid session JSON: ${String(parseErr)}` };
+          tidalValidationLoading = false;
+          return;
+        }
+      }
+      await SaveConfig(config);
+      const raw = await ValidateTidalAuth();
+      tidalValidationStatus = JSON.parse(raw);
+    } catch (e) {
+      tidalValidationStatus = { ok: false, message: String(e) };
+    } finally {
+      tidalValidationLoading = false;
+    }
+  }
+
+  async function startTidalOAuth() {
+    tidalOAuth = { phase: 'starting', message: 'Connecting to TIDAL...' };
+    tidalValidationStatus = null;
+    try {
+      await StartTidalOAuthLogin();
+    } catch (e) {
+      tidalOAuth = { phase: 'error', message: `Failed to start OAuth: ${e}` };
+    }
+  }
+
+  async function startAppleLogin() {
+    appleLogin = { phase: 'starting', message: 'Opening Apple Music login...' };
+    try {
+      await SaveConfig(config);
+      await StartAppleBrowserLogin();
+    } catch (e) {
+      appleLogin = { phase: 'error', message: `Failed to start Apple Music login: ${e}` };
+    }
+  }
+
+  // Parse the Amazon session capture time from the credentials JSON.
+  // csrf_ts is a Unix timestamp (seconds) of when the session was captured.
+  // Amazon Atna tokens typically expire within ~24 hours of capture.
+  function amazonSessionInfo(): { capturedAt: string; expiresNote: string } | null {
+    if (!config.amazon_direct_creds_json) return null;
+    try {
+      const creds = JSON.parse(config.amazon_direct_creds_json);
+      if (!creds.authorization || !creds.csrf_token) return null;
+      const csrfTs = parseInt(creds.csrf_ts || '0', 10);
+      if (!csrfTs) return null;
+      const capturedDate = new Date(csrfTs * 1000);
+      const expiresDate = new Date((csrfTs + 86400) * 1000); // +24h estimate
+      const now = Date.now();
+      const msLeft = expiresDate.getTime() - now;
+      const capturedAt = capturedDate.toLocaleString();
+      let expiresNote: string;
+      if (msLeft <= 0) {
+        expiresNote = 'Session likely expired — re-login recommended.';
+      } else {
+        const hLeft = Math.floor(msLeft / 3600000);
+        const mLeft = Math.floor((msLeft % 3600000) / 60000);
+        expiresNote = hLeft > 0
+          ? `Expires in ~${hLeft}h ${mLeft}m (est.)`
+          : `Expires in ~${mLeft}m (est.)`;
+      }
+      return { capturedAt, expiresNote };
+    } catch {
+      return null;
+    }
+  }
+
+  async function startAmazonLogin() {
+    amazonLogin = { phase: 'starting', message: 'Opening Amazon Music login...' };
+    try {
+      await SaveConfig(config);
+      await StartAmazonBrowserLogin();
+    } catch (e) {
+      amazonLogin = { phase: 'error', message: `Failed to start Amazon Music login: ${e}` };
+    }
+  }
+
+  async function retryFailedTrack(trackName: string) {
+    const state = activeTracks[trackName];
+    if (!state?.trackData || state.retrying || isDownloading) return;
+
+    clearTrackInterval(trackName);
+    isDownloading = true;
+    addLog('info', `[↻] Retrying failed track: ${trackName}`);
+    updateActiveTrack(trackName, {
+      mode: 'status',
+      progress: undefined,
+      text: 'Retrying failed track...',
+      error: undefined,
+      status: 'resolving',
+      retrying: true,
+    });
+
+    try {
+      await RetryTrackDownload(JSON.stringify(state.trackData));
+    } catch (err) {
+      addLog('error', `Retry failed to start for ${trackName}: ${err}`);
+      isDownloading = false;
+      updateActiveTrack(trackName, {
+        mode: 'status',
+        text: state.text || 'Retry failed',
+        error: state.error || 'Retry failed',
+        status: 'failed',
+        retrying: false,
+      });
+    }
   }
 
 </script>
@@ -991,21 +1765,40 @@
           </div>
         </div>
         <div style="display: flex; gap: 8px; align-items: center;">
-          <button on:click={openHistory} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🕒 Library History</button>
-          <button on:click={() => { showAnalyzer = true; }} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">🔬 Analyzer</button>
-          <button on:click={async () => { showSettings = true; try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; } }} style="background: rgba(255,255,255,0.05); padding: 6px 12px; font-size: 13px; border-color: rgba(255,255,255,0.1)">⚙️ Settings</button>
+          <button on:click={openDownloadedMusic} title="Downloaded Music" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🎵</button>
+          <button on:click={openHistory} title="Library History" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🕒</button>
+          <button on:click={() => { showAnalyzer = true; }} title="Audio Analyzer" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🔬</button>
+          <button on:click={async () => { showSettings = true; try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; } }} title="Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">⚙️</button>
           <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
-          <div class="kofi-wrap" on:mouseenter={() => kofiTooltipVisible = true} on:mouseleave={() => kofiTooltipVisible = false}>
-            <button on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+          <div class="kofi-wrap">
+            <button on:click={() => kofiTooltipVisible = !kofiTooltipVisible} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/>
               </svg>
             </button>
-            {#if kofiTooltipVisible}
+            {#if kofiTooltipVisible && supportStatus.enabled}
               <div class="kofi-tooltip">
-                <p class="kofi-tooltip-title">Support Antra</p>
-                <p class="kofi-tooltip-body">Real effort goes into maintaining Antra and keeping it free. If it saves you time, consider supporting continued development.</p>
-                <button class="kofi-tooltip-btn" on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')}>
+                <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">
+                  <p class="kofi-tooltip-title">{supportStatus.title}</p>
+                  <button class="support-close-btn" on:click={() => kofiTooltipVisible = false} title="Close">×</button>
+                </div>
+                <p class="kofi-tooltip-body">{supportStatus.message}</p>
+                <div class="support-progress-wrap">
+                  <div class="support-progress-head">
+                    <span>{formatSupportAmount(supportStatus.current)} raised</span>
+                    <span>Goal {formatSupportAmount(supportStatus.goal)}</span>
+                  </div>
+                  <div class="support-progress-bar">
+                    <div class="support-progress-fill" style={`width:${supportProgress}%`}></div>
+                  </div>
+                  <div class="support-progress-foot">
+                    <span>{Math.round(supportProgress)}%</span>
+                    {#if supportStatusLoading}
+                      <span>Refreshing…</span>
+                    {/if}
+                  </div>
+                </div>
+                <button class="kofi-tooltip-btn" on:click={() => BrowserOpenURL(supportStatus.link)}>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
                   Support on Ko-fi
                 </button>
@@ -1023,18 +1816,23 @@
       <!-- Mode toggle -->
       <div style="margin-top: 16px; display: flex; gap: 6px; margin-bottom: 8px;">
         <button
-          on:click={() => { searchMode = false; searchQuery = ''; }}
-          style="font-size: 12px; padding: 4px 12px; opacity: {searchMode ? 0.45 : 1}; border-color: {searchMode ? 'rgba(255,255,255,0.1)' : 'var(--accent-color)'};">
+          on:click={() => { activeTab = 'url'; searchQuery = ''; }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {activeTab === 'url' ? 1 : 0.45}; border-color: {activeTab === 'url' ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
           🔗 URL
         </button>
         <button
-          on:click={() => { searchMode = true; inputUrl = ''; }}
-          style="font-size: 12px; padding: 4px 12px; opacity: {searchMode ? 1 : 0.45}; border-color: {searchMode ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
+          on:click={() => { activeTab = 'artist'; inputUrl = ''; }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {activeTab === 'artist' ? 1 : 0.45}; border-color: {activeTab === 'artist' ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
           🔍 Search Artist
+        </button>
+        <button
+          on:click={() => { activeTab = 'discover'; inputUrl = ''; if (!discoveryGenres.length) loadDiscoveryGenres(); if (!discoveryData) loadDiscoveryData(); }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {activeTab === 'discover' ? 1 : 0.45}; border-color: {activeTab === 'discover' ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
+          🌟 Discover
         </button>
       </div>
 
-      {#if searchMode}
+      {#if activeTab === 'artist'}
         <!-- Artist search input -->
         <div class="input-bar" style="display: flex; gap: 8px; align-items: center;">
           <input
@@ -1047,6 +1845,7 @@
             {artistSearchLoading ? 'Searching...' : 'Search'}
           </button>
         </div>
+      {:else if activeTab === 'discover'}
       {:else}
         <!-- URL input -->
         <div class="input-bar" style="display: flex; gap: 8px; align-items: flex-start;">
@@ -1068,31 +1867,48 @@
         </div>
       {/if}
 
-      <!-- Source health chips -->
+      <!-- Source health chips + format selector -->
       <div class="source-health-bar">
         {#each healthSources as src}
-          {@const cached = healthCache[src.key]}
-          {@const isDown = cached && cached.live === 0}
+          {@const enabled = !!chipEnabled[src.key]}
           <button
             class="health-chip"
-            style="background:{src.bg}; border-color:{cached ? (isDown ? '#553333' : src.border) : 'rgba(255,255,255,0.1)'};"
-            on:click={() => checkHealth(src.key)}
-            title="{src.label}{cached ? ` — ${cached.live}/${cached.total} live` : ' — click to check'}"
+            class:health-chip-disabled={!enabled}
+            class:health-chip-enabled={enabled}
+            style={enabled
+              ? `background:${src.bgEnabled};`
+              : `background:rgba(0,0,0,0);`}
+            on:click={() => handleChipClick(src.key)}
+            title={!enabled
+              ? `Tap to enable ${src.label} — opens settings`
+              : `${src.label} — click to manage`}
           >
-            {#if src.key === 'hifi'}
-              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1};" />
-            {:else if src.key === 'amazon'}
-              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1}; border-radius: 4px;" />
-            {:else if src.key === 'dab'}
-              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{isDown ? 0.2 : 1};" />
-            {/if}
-            {#if cached}
-              <span class="health-chip-count" style="color:{isDown ? '#f87171' : src.text}">{cached.live}/{cached.total}</span>
+            {#if enabled}
+              <span class="health-chip-on-badge">on</span>
             {:else}
-              <span class="health-chip-idle">?</span>
+              <span class="health-chip-off-badge">off</span>
+            {/if}
+            {#if src.key === 'hifi'}
+              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
+            {:else if src.key === 'apple'}
+              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
+            {:else if src.key === 'amazon'}
+              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1}; border-radius: 4px;" />
+            {:else if src.key === 'dab'}
+              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
             {/if}
           </button>
         {/each}
+        <div class="format-selector">
+          {#each formatOptions as fmt}
+            <button
+              class="format-pill"
+              class:active={config.output_format === fmt.value}
+              title={fmt.label}
+              on:click={async () => { config.output_format = fmt.value; await SaveConfig(config); }}
+            >{fmt.name}</button>
+          {/each}
+        </div>
       </div>
     </div>
 
@@ -1155,8 +1971,22 @@
                   class:track-failed={state.status === 'failed'}
                   class:track-skipped={state.status === 'skipped'}>
                   <div class="track-row-main">
-                    <span class="track-row-name">{trackName}</span>
-                    <span class="track-row-status">{state.error || state.text}</span>
+                    <div class="track-row-head">
+                      <span class="track-row-name">{trackName}</span>
+                      {#if state.status === 'failed'}
+                        <button
+                          class="track-retry-btn"
+                          on:click={() => retryFailedTrack(trackName)}
+                          disabled={isDownloading || !state.trackData || state.retrying}
+                          title={isDownloading ? 'Wait for the current download to finish before retrying a single track.' : 'Retry this failed track only'}
+                        >
+                          {state.retrying ? 'Retrying…' : 'Retry'}
+                        </button>
+                      {/if}
+                    </div>
+                    <div class="track-row-side">
+                      <span class="track-row-status">{state.error || state.text}</span>
+                    </div>
                   </div>
                   {#if state.mode === 'progress'}
                     <div class="progress-bar-bg" style="margin-top:6px;">
@@ -1182,6 +2012,135 @@
       📋 {showLog ? 'Hide Log' : 'Log'}
     </button>
   </main>
+
+  <!-- ── Discover full-screen overlay ──────────────────────────────────────── -->
+  {#if activeTab === 'discover'}
+  <div class="discover-overlay">
+    <!-- Top bar: title + filters + close -->
+    <div class="discover-topbar">
+      <div class="discover-topbar-left">
+        <span class="discover-topbar-title">🌟 Discover</span>
+        <select bind:value={discoveryRegion} on:change={() => { loadDiscoveryGenres(); loadDiscoveryData(); }} class="discover-select">
+          <option value="in">India (IN)</option>
+          <option value="us">United States (US)</option>
+          <option value="gb">United Kingdom (GB)</option>
+          <option value="ca">Canada (CA)</option>
+          <option value="au">Australia (AU)</option>
+          <option value="jp">Japan (JP)</option>
+          <option value="de">Germany (DE)</option>
+          <option value="fr">France (FR)</option>
+          <option value="br">Brazil (BR)</option>
+          <option value="mx">Mexico (MX)</option>
+          <option value="kr">South Korea (KR)</option>
+          <option value="sg">Singapore (SG)</option>
+          <option value="ae">UAE (AE)</option>
+          <option value="sa">Saudi Arabia (SA)</option>
+          <option value="ng">Nigeria (NG)</option>
+          <option value="za">South Africa (ZA)</option>
+          <option value="eg">Egypt (EG)</option>
+          <option value="tr">Turkey (TR)</option>
+          <option value="it">Italy (IT)</option>
+          <option value="es">Spain (ES)</option>
+          <option value="nl">Netherlands (NL)</option>
+          <option value="se">Sweden (SE)</option>
+          <option value="no">Norway (NO)</option>
+          <option value="pl">Poland (PL)</option>
+          <option value="ru">Russia (RU)</option>
+          <option value="id">Indonesia (ID)</option>
+          <option value="ph">Philippines (PH)</option>
+          <option value="th">Thailand (TH)</option>
+          <option value="my">Malaysia (MY)</option>
+          <option value="pk">Pakistan (PK)</option>
+          <option value="nz">New Zealand (NZ)</option>
+          <option value="cn">China (CN)</option>
+          <option value="hk">Hong Kong (HK)</option>
+          <option value="tw">Taiwan (TW)</option>
+        </select>
+        <select bind:value={discoveryGenre} on:change={loadDiscoveryData} class="discover-select discover-select-genre">
+          <option value="">Top Charts (All Genres)</option>
+          {#each discoveryGenres as genre}
+            <option value={genre.id}>{genre.name}</option>
+          {/each}
+        </select>
+        <button on:click={loadDiscoveryData} disabled={discoveryLoading} class="discover-refresh-btn">
+          {discoveryLoading ? '↻' : '↻ Refresh'}
+        </button>
+      </div>
+      <button class="discover-close-btn" on:click={() => { activeTab = 'url'; }} title="Back to main">✕</button>
+    </div>
+
+    <!-- Scrollable content -->
+    <div class="discover-body">
+      {#if discoveryLoading}
+        <div class="discover-loading">
+          <div class="loading-spinner" style="font-size: 28px; margin-bottom: 14px;">↻</div>
+          LOADING CHARTS...
+        </div>
+      {:else if discoveryData}
+        <div class="discover-sections">
+          {#if (discoveryData.top_albums && discoveryData.top_albums.length > 0) || (discoveryData.genre_albums && discoveryData.genre_albums.length > 0)}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <h3 class="discover-section-title">Top Albums</h3>
+                <div class="discover-section-rule"></div>
+              </div>
+              <div class="discover-grid">
+                {#each (discoveryData.top_albums || discoveryData.genre_albums) as item}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card" on:click={() => handleDiscoveryClick(item.url)}>
+                    <div class="discovery-artwork-wrapper">
+                      <img src={item.artwork_url} alt={item.name} class="discovery-artwork" loading="lazy" />
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={item.name}>{item.name}</div>
+                      <div class="discovery-subtitle" title={item.artist_name}>{item.artist_name}</div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if (discoveryData.top_playlists && discoveryData.top_playlists.length > 0) || (discoveryData.genre_playlists && discoveryData.genre_playlists.length > 0)}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <h3 class="discover-section-title">Recommended Playlists</h3>
+                <div class="discover-section-rule"></div>
+              </div>
+              <div class="discover-grid">
+                {#each (discoveryData.top_playlists || discoveryData.genre_playlists) as item}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card" on:click={() => handleDiscoveryClick(item.url)}>
+                    <div class="discovery-artwork-wrapper">
+                      <img src={item.artwork_url} alt={item.name} class="discovery-artwork" loading="lazy" />
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={item.name}>{item.name}</div>
+                      <div class="discovery-subtitle" title={item.curator_name || 'Apple Music'}>{item.curator_name || 'Apple Music'}</div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <div class="discover-empty">
+          <div style="font-size: 36px; margin-bottom: 12px; opacity: 0.3;">🎵</div>
+          <p>No items found for this selection.</p>
+        </div>
+      {/if}
+    </div>
+  </div>
+  {/if}
 
   <!-- Slide-in log panel (outside main so it overlays everything) -->
   {#if showLog}
@@ -1221,14 +2180,185 @@
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
     </div>
     <div class="sponsor-toast-body">
-      <p class="sponsor-toast-title">Support Antra</p>
-      <p class="sponsor-toast-text">Real effort goes into maintaining Antra and keeping it free. If it saves you time, consider supporting continued development.</p>
-      <button class="sponsor-toast-btn" on:click={() => { BrowserOpenURL('https://ko-fi.com/antraverse'); dismissSponsorToast(); }}>
+      <p class="sponsor-toast-title">{supportStatus.title}</p>
+      <p class="sponsor-toast-text">{supportStatus.message}</p>
+      {#if supportStatus.enabled}
+        <div class="support-progress-wrap support-progress-toast">
+          <div class="support-progress-head">
+            <span>{formatSupportAmount(supportStatus.current)} raised</span>
+            <span>{formatSupportAmount(supportStatus.goal)} goal</span>
+          </div>
+          <div class="support-progress-bar">
+            <div class="support-progress-fill" style={`width:${supportProgress}%`}></div>
+          </div>
+        </div>
+      {/if}
+      <button class="sponsor-toast-btn" on:click={() => { BrowserOpenURL(supportStatus.link); dismissSponsorToast(); }}>
         Support on Ko-fi
       </button>
     </div>
     <button class="sponsor-toast-close" on:click={dismissSponsorToast} title="Dismiss">×</button>
   </div>
+{/if}
+
+{#if showDownloadedMusic}
+<div class="modal-overlay" on:click={() => showDownloadedMusic = false}>
+  <div class="modal-content downloaded-modal" on:click|stopPropagation>
+    <div class="downloaded-modal-head">
+      <div>
+        <h3 style="margin:0; color:var(--accent-color);">🎵 Downloaded Music</h3>
+        <p style="margin:4px 0 0; font-size:12px; opacity:0.55;">Browse and play albums or playlists already saved to your library.</p>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button on:click={refreshDownloadedMusicLibrary} style="padding: 6px 10px; font-size: 12px;">Refresh</button>
+        <button on:click={() => showDownloadedMusic = false} style="padding: 6px 10px; font-size: 12px;">Close</button>
+      </div>
+    </div>
+
+    <div class="downloaded-tabs">
+      <button class:active-tab={downloadedView === 'albums'} on:click={() => downloadedView = 'albums'}>Albums</button>
+      <button class:active-tab={downloadedView === 'playlists'} on:click={() => downloadedView = 'playlists'}>Playlists</button>
+    </div>
+
+    <div class="downloaded-layout">
+      <div class="downloaded-library-pane">
+        {#if downloadedLibraryLoading}
+          <div class="downloaded-empty">Scanning your library...</div>
+        {:else if downloadedLibraryError}
+          <div class="downloaded-empty" style="color:#fca5a5;">{downloadedLibraryError}</div>
+        {:else}
+          {@const items = downloadedView === 'albums' ? downloadedLibrary.albums : downloadedLibrary.playlists}
+          {#if items.length === 0}
+            <div class="downloaded-empty">No {downloadedView} found in `{config.download_path}`.</div>
+          {:else}
+            <div class="downloaded-list">
+              {#each items as release (release.relative_path)}
+                <button
+                  class="downloaded-card"
+                  class:selected={downloadedSelectedPath === release.relative_path}
+                  on:click={() => openDownloadedRelease(release)}
+                >
+                  {#if release.artwork_url}
+                    <img src={release.artwork_url} alt="" class="downloaded-card-art" />
+                  {:else}
+                    <div class="downloaded-card-placeholder">♫</div>
+                  {/if}
+                  <div class="downloaded-card-copy">
+                    <div class="downloaded-card-title">{release.title}</div>
+                    <div class="downloaded-card-meta">{releaseMetaLine(release)}</div>
+                  </div>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      </div>
+
+      <div class="downloaded-detail-pane">
+        {#if downloadedSelectedReleaseLoading}
+          <div class="downloaded-empty">Loading release...</div>
+        {:else if downloadedSelectedRelease}
+          <div class="downloaded-release-hero">
+            {#if downloadedSelectedRelease.artwork_url}
+              <img src={downloadedSelectedRelease.artwork_url} alt="" class="downloaded-release-art" />
+            {:else}
+              <div class="downloaded-release-placeholder">♫</div>
+            {/if}
+            <div class="downloaded-release-copy">
+              <div class="downloaded-release-type">{downloadedSelectedRelease.kind === 'playlist' ? 'Playlist' : 'Album'}</div>
+              <h2>{downloadedSelectedRelease.title}</h2>
+              <p>{releaseMetaLine(downloadedSelectedRelease)}</p>
+              <button on:click={() => playDownloadedTrack(0)} disabled={!downloadedSelectedRelease.tracks?.length}>
+                {currentPlayerTrack && playerReleaseTitle === downloadedSelectedRelease.title ? 'Play From Start' : 'Play Release'}
+              </button>
+            </div>
+          </div>
+
+          <div class="downloaded-tracks">
+            {#each downloadedSelectedRelease.tracks as track, index}
+              <button class="downloaded-track-row" class:is-active={currentPlayerTrack?.file_path === track.file_path} on:click={() => playDownloadedTrack(index)}>
+                <div class="downloaded-track-index">
+                  {#if currentPlayerTrack?.file_path === track.file_path}
+                    ▶
+                  {:else if track.disc_number && track.track_number}
+                    {track.disc_number}{String(track.track_number).padStart(2, '0')}
+                  {:else if track.track_number}
+                    {String(track.track_number).padStart(2, '0')}
+                  {:else}
+                    {index + 1}
+                  {/if}
+                </div>
+                <div class="downloaded-track-copy">
+                  <div class="downloaded-track-title">{track.title || track.file_name}</div>
+                  <div class="downloaded-track-meta">
+                    {track.artist || downloadedSelectedRelease.artist || 'Unknown artist'}
+                    {#if track.codec}
+                      <span>· {track.codec}</span>
+                    {/if}
+                  </div>
+                </div>
+                <div class="downloaded-track-duration">{formatPlaybackTime(track.duration_seconds || 0)}</div>
+              </button>
+            {/each}
+          </div>
+        {:else}
+          <div class="downloaded-empty">Pick an album or playlist to start browsing.</div>
+        {/if}
+      </div>
+    </div>
+
+    <div class="downloaded-player">
+      <div class="downloaded-player-copy">
+        <div class="downloaded-player-title">{currentPlayerTrack?.title || 'Nothing playing'}</div>
+        <div class="downloaded-player-meta">
+          {#if currentPlayerTrack}
+            {(currentPlayerTrack.artist || downloadedSelectedRelease?.artist || 'Unknown artist')} · {playerReleaseTitle || downloadedSelectedRelease?.title || 'Release'}
+          {:else}
+            Select a downloaded track to play it here.
+          {/if}
+        </div>
+      </div>
+      <div class="downloaded-player-controls">
+        <button on:click={playPreviousTrack} disabled={!currentPlayerTrack}>⏮</button>
+        <button on:click={togglePlayback} disabled={!currentPlayerTrack && !(downloadedSelectedRelease?.tracks?.length)}>{audioEl && !audioEl.paused ? 'Pause' : 'Play'}</button>
+        <button on:click={playNextTrack} disabled={!currentPlayerTrack || playerTrackIndex >= playerQueue.length - 1}>⏭</button>
+      </div>
+      <div class="downloaded-player-timeline">
+        <span>{formatPlaybackTime(playerCurrentTime)}</span>
+        <input
+          type="range"
+          min="0"
+          max={playerDuration || 0}
+          step="0.1"
+          value={playerCurrentTime}
+          disabled={!currentPlayerTrack}
+          on:mousedown={() => playerSeeking = true}
+          on:mouseup={handleSeekCommit}
+          on:input={handleSeekInput}
+          on:change={handleSeekCommit}
+        />
+        <span>{formatPlaybackTime(playerDuration)}</span>
+      </div>
+      <div class="downloaded-player-volume">
+        <span>Vol</span>
+        <input type="range" min="0" max="1" step="0.01" bind:value={playerVolume} on:input={() => { if (audioEl) audioEl.volume = playerVolume; }} />
+      </div>
+    </div>
+
+    {#if playerError}
+      <div style="margin-top: 10px; color: #fca5a5; font-size: 12px;">Playback error: {playerError}</div>
+    {/if}
+
+    <audio
+      bind:this={audioEl}
+      preload="metadata"
+      on:timeupdate={handleAudioTimeUpdate}
+      on:loadedmetadata={handleAudioLoadedMetadata}
+      on:ended={handleAudioEnded}
+      on:error={() => playerError = 'The file could not be played in the embedded player.'}
+    ></audio>
+  </div>
+</div>
 {/if}
 
 {#if showHistory}
@@ -1302,31 +2432,26 @@
     <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
       <div class="field">
-        <label>Format Preference</label>
-        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="auto" bind:group={config.output_format} />
-            <div>
-              Auto <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Best available — lossless preferred, MP3 fallback)</span>
-            </div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="lossless" bind:group={config.output_format} />
-            <div>Lossless <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(FLAC only — skip if unavailable)</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="mp3" bind:group={config.output_format} />
-            <div>MP3 <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(~320kbps — uses JioSaavn/NetEase directly)</span></div>
-          </label>
-        </div>
-
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-top: 14px;">
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
           <input type="checkbox" bind:checked={config.prefer_explicit} style="margin-top: 2px;" />
           <div>
             <span style="font-weight: 500; font-size: 13px;">Prefer explicit versions</span>
             <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Avoid radio edits and clean versions. When a track is marked explicit, Antra keeps searching if the first result looks censored.</p>
           </div>
         </label>
+
+        <div style="margin-top: 14px;">
+          <label for="maxRetriesModal">Failed track retries</label>
+          <p style="font-size: 11px; color: #555; margin: 4px 0 8px;">Automatic retries for transient failures like truncated downloads before a track is marked failed.</p>
+          <input
+            id="maxRetriesModal"
+            type="number"
+            min="1"
+            max="10"
+            bind:value={config.max_retries}
+            style="width: 96px;"
+          />
+        </div>
       </div>
 
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
@@ -1402,31 +2527,16 @@
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
         <p style="font-size: 13px; font-weight: 600; margin: 0 0 12px;">Sources</p>
 
-        <!-- Hi-Fi / streaming sources toggle -->
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 10px;">
-          <input type="checkbox"
-            checked={hifiEnabled}
-            on:change={(e) => toggleSourceGroup('hifi', e.currentTarget.checked)}
-            style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Hi-Fi (Amazon, HiFi, DAB)</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Free lossless FLAC via community proxies — Amazon, HiFi API, DAB Music. No account required.</p>
-          </div>
-        </label>
-
         <!-- Soulseek toggle -->
         <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
-          <input type="checkbox"
-            checked={soulseekSourceEnabled}
-            on:change={(e) => { toggleSourceGroup('soulseek', e.currentTarget.checked); config.soulseek_enabled = e.currentTarget.checked; }}
-            style="margin-top: 2px;" />
+          <input type="checkbox" bind:checked={config.soulseek_enabled} style="margin-top: 2px;" />
           <div>
             <span style="font-weight: 500;">Soulseek (P2P)</span>
             <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Find rare or hi-res versions not on streaming. Requires account.</p>
           </div>
         </label>
 
-        {#if soulseekSourceEnabled}
+        {#if config.soulseek_enabled}
           <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
             <label for="slskUsernameSettings" style="font-size: 12px; opacity: 0.7;">Soulseek Username</label>
             <input id="slskUsernameSettings" type="text" bind:value={config.soulseek_username} placeholder="Your Soulseek username" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
@@ -1450,12 +2560,383 @@
             {/if}
           </div>
         {/if}
+
+
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p id="settings-tidal" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">TIDAL Premium</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Connect your TIDAL account via OAuth (recommended) or paste a session JSON blob directly.</p>
+
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
+          <input type="checkbox"
+            checked={config.tidal_enabled}
+            on:change={(e) => config.tidal_enabled = e.currentTarget.checked}
+            style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500;">Enable TIDAL Premium</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the TIDAL account configuration block and validation flow.</p>
+          </div>
+        </label>
+
+        {#if config.tidal_enabled}
+          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+
+            <!-- OAuth Login Section -->
+            <div style="margin-bottom: 16px; padding: 12px; background: rgba(29,185,222,0.06); border: 1px solid rgba(29,185,222,0.2); border-radius: 6px;">
+              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px; color: #1DB9DE;">🔐 OAuth Login (Recommended)</p>
+              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open TIDAL's login page in your browser. Antra will capture your session automatically — no manual copy-paste needed.</p>
+
+              {#if tidalOAuth.phase === 'idle' || tidalOAuth.phase === 'error'}
+                <button
+                  on:click={startTidalOAuth}
+                  style="padding: 6px 12px; font-size: 12px; background: rgba(29,185,222,0.15); border-color: rgba(29,185,222,0.4); color: #1DB9DE;"
+                >
+                  Login with TIDAL
+                </button>
+                {#if tidalOAuth.phase === 'error'}
+                  <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {tidalOAuth.message}</p>
+                  <button on:click={() => tidalOAuth = { phase: 'idle' }} style="font-size: 10px; padding: 3px 8px; margin-top: 6px; opacity: 0.6;">Reset</button>
+                {/if}
+
+              {:else if tidalOAuth.phase === 'starting'}
+                <p style="font-size: 11px; color: #94a3b8; margin: 0;">⏳ {tidalOAuth.message || 'Starting...'}</p>
+
+              {:else if tidalOAuth.phase === 'waiting_browser'}
+                <div style="margin-top: 4px;">
+                  <p style="font-size: 11px; color: #facc15; margin: 0 0 8px;">⏳ Waiting for you to approve in your browser...</p>
+                  {#if tidalOAuth.url}
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                      <button
+                        on:click={() => BrowserOpenURL(tidalOAuth.url)}
+                        style="padding: 5px 10px; font-size: 11px; background: rgba(29,185,222,0.2); border-color: rgba(29,185,222,0.4); color: #1DB9DE;"
+                      >
+                        Open TIDAL Login ↗
+                      </button>
+                      <code style="font-size: 11px; background: rgba(255,255,255,0.05); padding: 3px 8px; border-radius: 4px; color: #e2e8f0; word-break: break-all; flex: 1;">{tidalOAuth.url}</code>
+                    </div>
+                    {#if tidalOAuth.code}
+                      <p style="font-size: 11px; color: #94a3b8; margin: 6px 0 0;">Device code: <code style="color: #facc15;">{tidalOAuth.code}</code></p>
+                    {/if}
+                  {/if}
+                  <p style="font-size: 10px; color: #555; margin: 8px 0 0;">After you log in, Antra will automatically save your session. This window will update within seconds.</p>
+                </div>
+
+              {:else if tidalOAuth.phase === 'success'}
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span style="font-size: 14px;">✅</span>
+                  <div>
+                    <p style="font-size: 12px; color: #86efac; margin: 0;">{tidalOAuth.message}</p>
+                    {#if tidalOAuth.displayName}
+                      <p style="font-size: 11px; color: #94a3b8; margin: 3px 0 0;">Account: {tidalOAuth.displayName}{tidalOAuth.countryCode ? ` (${tidalOAuth.countryCode})` : ''}</p>
+                    {/if}
+                  </div>
+                  <button on:click={() => tidalOAuth = { phase: 'idle' }} style="font-size: 10px; padding: 3px 8px; margin-left: auto; opacity: 0.6;">Re-login</button>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Divider -->
+            <p style="font-size: 10px; color: #444; text-align: center; margin: 0 0 12px; letter-spacing: 0.08em;">— OR PASTE SESSION JSON MANUALLY —</p>
+
+            <label for="tidalAuthMode" style="font-size: 12px; opacity: 0.7;">Auth method</label>
+            <select id="tidalAuthMode" bind:value={config.tidal_auth_mode} style="width: 100%; box-sizing: border-box; margin-top: 6px;">
+              <option value="session_json">Session JSON (Recommended)</option>
+              <option value="manual_tokens">Manual tokens</option>
+            </select>
+
+            {#if config.tidal_auth_mode === 'session_json'}
+              <label for="tidalSessionJson" style="font-size: 12px; opacity: 0.7; margin-top: 12px; display: block;">Session JSON</label>
+              <textarea
+                id="tidalSessionJson"
+                bind:value={config.tidal_session_json}
+                on:paste={(e) => {
+                  e.preventDefault();
+                  const raw = e.clipboardData?.getData('text') ?? '';
+                  const cleaned = raw
+                    .replace(/[\r\n\t]/g, ' ')
+                    .replace(/[\u0000-\u001F\u007F]/g, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                  try {
+                    config.tidal_session_json = JSON.stringify(JSON.parse(cleaned));
+                  } catch {
+                    config.tidal_session_json = cleaned;
+                  }
+                }}
+                placeholder='&#123;"token_type":&#123;"data":"Bearer"&#125;,"session_id":&#123;"data":"..."&#125;,"access_token":&#123;"data":"..."&#125;,"refresh_token":&#123;"data":"..."&#125;,"is_pkce":&#123;"data":true&#125;&#125;'
+                style="width: 100%; min-height: 140px; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 11px;"
+              />
+            {:else}
+              <label for="tidalAccessToken" style="font-size: 12px; opacity: 0.7; margin-top: 12px; display: block;">Access token</label>
+              <input id="tidalAccessToken" type="password" bind:value={config.tidal_access_token} placeholder="Bearer access token" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+              <label for="tidalRefreshToken" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Refresh token</label>
+              <input id="tidalRefreshToken" type="password" bind:value={config.tidal_refresh_token} placeholder="Refresh token" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+              <label for="tidalSessionId" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Session ID</label>
+              <input id="tidalSessionId" type="text" bind:value={config.tidal_session_id} placeholder="Optional session id" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+              <div style="display: grid; grid-template-columns: 1fr 120px; gap: 8px; margin-top: 10px;">
+                <div>
+                  <label for="tidalTokenType" style="font-size: 12px; opacity: 0.7; display: block;">Token type</label>
+                  <input id="tidalTokenType" type="text" bind:value={config.tidal_token_type} placeholder="Bearer" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+                </div>
+                <div>
+                  <label for="tidalCountryCode" style="font-size: 12px; opacity: 0.7; display: block;">Country</label>
+                  <input id="tidalCountryCode" type="text" bind:value={config.tidal_country_code} placeholder="US" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+                </div>
+              </div>
+            {/if}
+
+            <div style="display: flex; align-items: center; gap: 10px; margin-top: 14px;">
+              <button on:click={validateTidalSettings} disabled={tidalValidationLoading} style="padding: 6px 10px; font-size: 12px;">
+                {#if tidalValidationLoading}Validating...{:else}Test TIDAL Connection{/if}
+              </button>
+              <span style="font-size: 11px; opacity: 0.65;">This saves Settings first, then checks the imported TIDAL session.</span>
+            </div>
+
+            {#if tidalValidationStatus}
+              <div style={`margin-top: 12px; padding: 10px 12px; border-radius: 6px; border: 1px solid ${tidalValidationStatus.ok ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'}; background: ${tidalValidationStatus.ok ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)'};`}>
+                <p style={`font-size: 12px; margin: 0; color: ${tidalValidationStatus.ok ? '#86efac' : '#fca5a5'};`}>
+                  {tidalValidationStatus.ok ? 'TIDAL connection looks valid.' : 'TIDAL validation failed.'}
+                </p>
+                <p style="font-size: 11px; margin: 6px 0 0; opacity: 0.75;">{tidalValidationStatus.message}</p>
+                {#if tidalValidationStatus.display_name}
+                  <p style="font-size: 11px; margin: 6px 0 0; opacity: 0.75;">Account: {tidalValidationStatus.display_name}{tidalValidationStatus.country_code ? ` (${tidalValidationStatus.country_code})` : ''}</p>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p id="settings-apple" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Apple Music</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Use your own Apple Music subscription for direct lossless downloads. Paste the web player tokens plus your Widevine device file path.</p>
+
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
+          <input
+            type="checkbox"
+            checked={config.apple_enabled}
+            on:change={(e) => config.apple_enabled = e.currentTarget.checked}
+            style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500;">Enable Apple Music</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the direct Apple Music adapter. Songs download with your own subscription instead of shared mirrors.</p>
+          </div>
+        </label>
+
+        {#if config.apple_enabled}
+          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+            <div style="margin-bottom: 16px; padding: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
+              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px;">Browser Session Login (Recommended)</p>
+              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open a browser window, sign in to Apple Music, and let Antra capture the session automatically.</p>
+              {#if appleLogin.phase === 'idle' || appleLogin.phase === 'error'}
+                <button on:click={startAppleLogin} style="padding: 6px 12px; font-size: 12px;">Login with Apple Music</button>
+                {#if appleLogin.phase === 'error'}
+                  <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {appleLogin.message}</p>
+                {/if}
+              {:else if appleLogin.phase === 'starting'}
+                <p style="font-size: 11px; color: #94a3b8; margin: 0;">⏳ {appleLogin.message}</p>
+              {:else if appleLogin.phase === 'success'}
+                <p style="font-size: 11px; color: #86efac; margin: 0;">✅ {appleLogin.message}</p>
+              {/if}
+            </div>
+
+            <label for="appleAuthorizationToken" style="font-size: 12px; opacity: 0.7;">Authorization token</label>
+            <input id="appleAuthorizationToken" type="password" bind:value={config.apple_authorization_token} placeholder="Bearer eyJ..." style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+
+            <label for="appleMusicUserToken" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Music user token</label>
+            <input id="appleMusicUserToken" type="password" bind:value={config.apple_music_user_token} placeholder="Music-User-Token" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+
+            <div style="display: grid; grid-template-columns: 120px 1fr; gap: 8px; margin-top: 10px;">
+              <div>
+                <label for="appleStorefront" style="font-size: 12px; opacity: 0.7; display: block;">Storefront</label>
+                <input id="appleStorefront" type="text" bind:value={config.apple_storefront} placeholder="us" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+              </div>
+              <div>
+                <label for="appleWvdPath" style="font-size: 12px; opacity: 0.7; display: block;">Widevine device path</label>
+                <input id="appleWvdPath" type="text" bind:value={config.apple_wvd_path} placeholder="C:\\path\\to\\android_l3.wvd" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+              </div>
+            </div>
+
+            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">The browser login fills the tokens automatically. You still need a valid <code>.wvd</code> device file path for decryption.</p>
+          </div>
+        {/if}
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p id="settings-amazon" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Amazon Music</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Use your own Amazon Music subscription for direct FLAC downloads. Paste the extracted credentials JSON from your browser session.</p>
+
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
+          <input
+            type="checkbox"
+            checked={config.amazon_enabled}
+            on:change={(e) => config.amazon_enabled = e.currentTarget.checked}
+            style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500;">Enable Amazon Music</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the direct Amazon adapter. The JSON must include your session tokens plus a <code>wvd_path</code>.</p>
+          </div>
+        </label>
+
+        {#if config.amazon_enabled}
+          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+            <div style="margin-bottom: 16px; padding: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
+              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px;">Browser Session Login (Recommended)</p>
+              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open a browser window, sign in to Amazon Music, and let Antra capture the session automatically.</p>
+
+              {#if amazonLogin.phase === 'idle' || amazonLogin.phase === 'error'}
+                {@const sessionInfo = amazonSessionInfo()}
+                {#if sessionInfo && amazonLogin.phase === 'idle'}
+                  <!-- Session already saved — show status instead of login button -->
+                  <div style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.25); border-radius:6px; margin-bottom:10px;">
+                    <span style="font-size:13px; flex-shrink:0;">✅</span>
+                    <div>
+                      <p style="font-size:11px; color:#86efac; margin:0 0 2px; font-weight:600;">Session active</p>
+                      <p style="font-size:10px; color:#555; margin:0;">Captured {sessionInfo.capturedAt} · {sessionInfo.expiresNote}</p>
+                    </div>
+                  </div>
+                  <button on:click={startAmazonLogin} style="padding: 5px 10px; font-size: 11px; opacity:0.7;">↻ Re-login</button>
+                {:else}
+                  {#if !config.amazon_wvd_path}
+                    <div style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; background:rgba(250,204,21,0.08); border:1px solid rgba(250,204,21,0.25); border-radius:6px; margin-bottom:10px;">
+                      <span style="font-size:13px; flex-shrink:0;">⚠️</span>
+                      <p style="font-size:11px; color:#facc15; margin:0; line-height:1.5;">Set your <strong>Widevine device path</strong> below before starting the browser login — it's required for downloads.</p>
+                    </div>
+                  {/if}
+                  <button on:click={startAmazonLogin} style="padding: 6px 12px; font-size: 12px;">Browser Session Login</button>
+                  {#if amazonLogin.phase === 'error'}
+                    <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {amazonLogin.message}</p>
+                  {/if}
+                {/if}
+              {:else if amazonLogin.phase === 'starting'}
+                <div style="display:flex; align-items:center; gap:10px;">
+                  <p style="font-size: 11px; color: #94a3b8; margin: 0; flex:1;">⏳ {amazonLogin.message}</p>
+                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:3px 10px; font-size:11px; opacity:0.6;">Cancel</button>
+                </div>
+              {:else if amazonLogin.phase === 'waiting_for_user'}
+                <p style="font-size: 11px; color: #94a3b8; margin: 0 0 10px;">{amazonLogin.message}</p>
+                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                  <button
+                    on:click={async () => { amazonLogin = { phase: 'capturing', message: 'Reading your browser session…' }; try { await ConfirmAmazonLogin(); } catch(e) { amazonLogin = { phase: 'error', message: String(e) }; } }}
+                    style="padding: 6px 14px; font-size: 12px; background: #16a34a; border-color: #15803d;"
+                  >
+                    ✓ I'm Signed In
+                  </button>
+                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:5px 12px; font-size:11px; opacity:0.6;">Cancel</button>
+                </div>
+              {:else if amazonLogin.phase === 'capturing'}
+                <div style="display:flex; align-items:center; gap:10px;">
+                  <p style="font-size: 11px; color: #94a3b8; margin: 0; flex:1;">⏳ {amazonLogin.message}</p>
+                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:3px 10px; font-size:11px; opacity:0.6;">Cancel</button>
+                </div>
+              {:else if amazonLogin.phase === 'success'}
+                <p style="font-size: 11px; color: #86efac; margin: 0;">✅ {amazonLogin.message}</p>
+                {#if amazonLogin.detail}
+                  <p style="font-size: 11px; color: #facc15; margin: 6px 0 0;">{amazonLogin.detail}</p>
+                {/if}
+              {/if}
+            </div>
+
+            <label for="amazonWvdPath" style="font-size: 12px; opacity: 0.7;">Widevine device path</label>
+            <input
+              id="amazonWvdPath"
+              type="text"
+              bind:value={config.amazon_wvd_path}
+              placeholder="C:\\path\\to\\android_l3.wvd"
+              style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;"
+            />
+
+            <p style="font-size: 10px; color: #444; text-align: center; margin: 12px 0; letter-spacing: 0.08em;">— ADVANCED / FALLBACK JSON —</p>
+
+            <label for="amazonDirectCredsJson" style="font-size: 12px; opacity: 0.7;">Credentials JSON</label>
+            <textarea
+              id="amazonDirectCredsJson"
+              bind:value={config.amazon_direct_creds_json}
+              placeholder={`{"cookie":"...","authorization":"Bearer ...","csrf_token":"...","csrf_rnd":"...","csrf_ts":"...","customer_id":"...","device_id":"...","session_id":"...","wvd_path":"C:\\path\\to\\android_l3.wvd"}`}
+              style="width: 100%; min-height: 140px; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 11px;"
+            />
+            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">The browser login fills the session JSON automatically. Amazon sessions typically last <strong>~24 hours</strong> — re-login when downloads start failing.</p>
+          </div>
+        {/if}
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p id="settings-qobuz" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Qobuz</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Enable direct Qobuz FLAC downloads with your own account. Antra will try TIDAL first, then Qobuz, then Soulseek.</p>
+
+        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
+          <input
+            type="checkbox"
+            checked={config.qobuz_enabled}
+            on:change={(e) => config.qobuz_enabled = e.currentTarget.checked}
+            style="margin-top: 2px;" />
+          <div>
+            <span style="font-weight: 500;">Enable Qobuz</span>
+            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Uses your Qobuz account for direct FLAC downloads. Email/password is the simplest setup.</p>
+          </div>
+        </label>
+
+        {#if config.qobuz_enabled}
+          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
+            <label for="qobuzEmail" style="font-size: 12px; opacity: 0.7;">Qobuz Email</label>
+            <input id="qobuzEmail" type="text" bind:value={config.qobuz_email} placeholder="you@example.com" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+            <label for="qobuzPassword" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Qobuz Password</label>
+            <input id="qobuzPassword" type="password" bind:value={config.qobuz_password} placeholder="Your Qobuz password" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
+
+            <p style="font-size: 10px; color: #444; text-align: center; margin: 12px 0; letter-spacing: 0.08em;">— OPTIONAL ADVANCED FIELDS —</p>
+
+            <label for="qobuzUserAuthToken" style="font-size: 12px; opacity: 0.7;">User auth token</label>
+            <input id="qobuzUserAuthToken" type="password" bind:value={config.qobuz_user_auth_token} placeholder="Optional existing Qobuz user_auth_token" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;">
+              <div>
+                <label for="qobuzAppId" style="font-size: 12px; opacity: 0.7; display: block;">App ID</label>
+                <input id="qobuzAppId" type="text" bind:value={config.qobuz_app_id} placeholder="285473059" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+              </div>
+              <div>
+                <label for="qobuzAppSecret" style="font-size: 12px; opacity: 0.7; display: block;">App Secret</label>
+                <input id="qobuzAppSecret" type="password" bind:value={config.qobuz_app_secret} placeholder="Optional" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
+              </div>
+            </div>
+
+            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">If App ID / App Secret are left alone, Antra will try to refresh Qobuz app credentials automatically when needed.</p>
+          </div>
+        {/if}
+      </div>
+
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Spotify Podcasts</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Paste your Spotify account cookie to enable podcast episode and show downloads. Episodes are saved to <code>Podcasts/Show Name/</code> inside your music folder.</p>
+
+        <label for="spDcInput" style="font-size: 12px; opacity: 0.7;">sp_dc cookie</label>
+        <input
+          id="spDcInput"
+          type="password"
+          bind:value={config.spotify_sp_dc}
+          placeholder="AQ..."
+          style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;"
+        />
+        <p style="font-size: 11px; color: #555; margin: 6px 0 0;">
+          Get it from your browser: open <strong>open.spotify.com</strong> while logged in →
+          DevTools (F12) → Application → Cookies → <code>sp_dc</code>.
+          Valid for ~1 year. Rate-limited to 50 episodes/hour with a 3–7s delay between downloads.
+        </p>
+        {#if config.spotify_sp_dc}
+          <p style="font-size: 11px; color: #00ffcc; margin: 6px 0 0;">● Cookie configured — podcast downloads enabled</p>
+        {:else}
+          <p style="font-size: 11px; color: #555; margin: 6px 0 0;">○ No cookie set — podcast downloads disabled</p>
+        {/if}
       </div>
 
     </div>
 
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.3</p>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.4</p>
     </div>
   </div>
 </div>
@@ -1629,6 +3110,8 @@
       <div style="display:flex; align-items:center; gap:10px;">
         {#if healthPopoverSource === 'hifi'}
           <img src="/icons/tidal.webp" alt="Tidal" style="width:26px; height:26px; object-fit:contain;" />
+        {:else if healthPopoverSource === 'apple'}
+          <img src="/icons/apple-music.png" alt="Apple Music" style="width:26px; height:26px; object-fit:contain;" />
         {:else if healthPopoverSource === 'amazon'}
           <img src="/icons/amazon-music.jpg" alt="Amazon Music" style="width:26px; height:26px; object-fit:contain; border-radius:4px;" />
         {:else if healthPopoverSource === 'dab'}
@@ -1743,7 +3226,7 @@
         >
           <div class="az-drop-icon">🎵</div>
           <p>Drop audio files or a folder here</p>
-          <p class="az-drop-sub">Supports .flac .mp3 .m4a .wav .aiff .ogg</p>
+          <p class="az-drop-sub">Supports .flac .mp3 .m4a .aac .alac .wav .aiff .ogg</p>
           <button class="az-btn-sm az-btn-accent" style="margin-top:12px;" on:click|stopPropagation={analyzerPickFiles}>Browse Files</button>
         </div>
 
@@ -1898,6 +3381,14 @@
     flex-shrink: 0;
   }
 
+  .flex-header {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    flex-shrink: 1 !important;
+  }
+
   /* ── Playlist header ────────────────────────────────────────────────────── */
   .playlist-header {
     display: flex;
@@ -1999,9 +3490,21 @@
 
   .track-row-main {
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .track-row-head {
+    display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 8px;
+  }
+  .track-row-side {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    min-width: 0;
   }
   .track-row-name {
     font-size: 13px;
@@ -2014,12 +3517,28 @@
   .track-row-status {
     font-size: 11px;
     opacity: 0.55;
-    flex-shrink: 0;
-    max-width: 220px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    text-align: right;
+    text-align: left;
+    width: 100%;
+  }
+  .track-retry-btn {
+    padding: 4px 9px;
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
+    background: rgba(248, 113, 113, 0.08);
+    border-color: rgba(248, 113, 113, 0.28);
+    color: #fda4af;
+  }
+  .track-retry-btn:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.16);
+    border-color: rgba(248, 113, 113, 0.45);
+  }
+  .track-retry-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   .progress-bar-bg {
@@ -2602,30 +4121,150 @@
     background: rgba(255, 94, 91, 0.2);
   }
 
-  /* ── Source health bar ───────────────────────────────────────────────────── */
+  .support-close-btn {
+    background: transparent;
+    border: none;
+    color: #7c8a8a;
+    font-size: 16px;
+    padding: 0;
+    line-height: 1;
+    min-width: 16px;
+  }
+  .support-close-btn:hover { color: #cbd5e1; }
+
+  .support-progress-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+  }
+
+  .support-progress-head,
+  .support-progress-foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+
+  .support-progress-bar {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .support-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #FF5E5B, #ff8d62);
+    border-radius: inherit;
+    transition: width 0.25s ease;
+  }
+
+  .support-progress-toast {
+    margin: 6px 0 2px;
+  }
+
+  /* ── Source health bar + format selector ────────────────────────────────── */
   .source-health-bar {
     display: flex;
     gap: 6px;
     margin-top: 8px;
-    flex-wrap: wrap;
+    align-items: center;
   }
+
+  .format-selector {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    margin-left: auto;
+  }
+
+  .format-pill {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.38);
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .format-pill:hover { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.7); }
+  .format-pill.active { background: rgba(0,255,204,0.12); border-color: var(--accent-color); color: var(--accent-color); }
 
   .health-chip {
     display: inline-flex;
+    flex-direction: column;
     align-items: center;
-    gap: 5px;
-    padding: 3px 9px;
-    border-radius: 99px;
-    border: 1px solid;
+    gap: 2px;
+    padding: 5px 10px 4px;
+    border-radius: 10px;
+    border: 1.5px solid rgba(255,255,255,0.1);
     font-size: 11px;
     cursor: pointer;
-    transition: filter 0.15s, opacity 0.15s;
+    transition: box-shadow 0.2s, border-color 0.2s, opacity 0.15s;
     letter-spacing: 0.02em;
     white-space: nowrap;
+    min-width: 48px;
   }
-  .health-chip:hover { filter: brightness(1.25); }
-  .health-chip-count { font-weight: 700; font-size: 10px; }
-  .health-chip-idle { opacity: 0.3; font-size: 10px; }
+  .health-chip:hover { filter: brightness(1.15); }
+
+  /* Enabled chip: solid green border + layered glow */
+  .health-chip-enabled {
+    border-color: #22c55e !important;
+    box-shadow:
+      0 0 0 1px rgba(34,197,94,0.5),
+      0 0 10px rgba(34,197,94,0.35),
+      0 0 22px rgba(34,197,94,0.15);
+  }
+  .health-chip-enabled:hover {
+    box-shadow:
+      0 0 0 1px rgba(34,197,94,0.75),
+      0 0 14px rgba(34,197,94,0.5),
+      0 0 28px rgba(34,197,94,0.25);
+    filter: brightness(1.12);
+  }
+
+  /* Disabled chip: dark red outline, dimmed, transparent bg */
+  .health-chip-disabled {
+    opacity: 0.5;
+    border-color: #7a2020 !important;
+    box-shadow: none;
+  }
+  .health-chip-disabled:hover {
+    opacity: 0.85;
+    filter: none;
+    border-color: #e05555 !important;
+    box-shadow: 0 0 0 1px rgba(220,50,50,0.3);
+  }
+
+  /* "on" / "off" status badges above the icon */
+  .health-chip-on-badge {
+    font-size: 8px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #22c55e;
+    line-height: 1;
+  }
+  .health-chip-off-badge {
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.28);
+    line-height: 1;
+  }
+
+  .health-chip-count { font-weight: 700; font-size: 10px; line-height: 1; }
+  .health-chip-idle { opacity: 0.3; font-size: 10px; line-height: 1; }
   .health-chip-icon { width: 20px; height: 20px; object-fit: contain; flex-shrink: 0; transition: opacity 0.2s; }
 
   /* ── Health popover dot grid ─────────────────────────────────────────────── */
@@ -2746,5 +4385,493 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  /* ── Downloaded music player ─────────────────────────────────────────────── */
+  .downloaded-modal {
+    max-width: 1100px;
+    width: min(1100px, 96vw);
+    max-height: min(88vh, 900px);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .downloaded-modal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    border-bottom: 1px solid rgba(0,255,204,0.16);
+    padding-bottom: 14px;
+  }
+
+  .downloaded-tabs {
+    display: flex;
+    gap: 8px;
+  }
+
+  .downloaded-tabs button {
+    padding: 6px 12px;
+    font-size: 12px;
+    opacity: 0.65;
+  }
+
+  .downloaded-tabs button.active-tab {
+    opacity: 1;
+    border-color: var(--accent-color);
+    background: rgba(0, 255, 204, 0.14);
+  }
+
+  .downloaded-layout {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .downloaded-library-pane,
+  .downloaded-detail-pane {
+    min-height: 0;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.02);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+
+  .downloaded-list {
+    height: 100%;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .downloaded-card {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    text-align: left;
+    border-color: rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.02);
+    color: inherit;
+    padding: 10px;
+  }
+
+  .downloaded-card.selected {
+    border-color: rgba(0,255,204,0.35);
+    background: rgba(0,255,204,0.08);
+  }
+
+  .downloaded-card-art,
+  .downloaded-card-placeholder {
+    width: 54px;
+    height: 54px;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+
+  .downloaded-card-art,
+  .downloaded-release-art {
+    object-fit: cover;
+  }
+
+  .downloaded-card-placeholder,
+  .downloaded-release-placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255,255,255,0.06);
+    color: rgba(255,255,255,0.5);
+  }
+
+  .downloaded-card-copy,
+  .downloaded-release-copy {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .downloaded-card-title,
+  .downloaded-track-title {
+    color: #d7f8f5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .downloaded-card-meta,
+  .downloaded-track-meta,
+  .downloaded-release-copy p,
+  .downloaded-player-meta {
+    font-size: 12px;
+    color: rgba(210, 230, 230, 0.58);
+  }
+
+  .downloaded-detail-pane {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .downloaded-release-hero {
+    display: flex;
+    gap: 16px;
+    padding: 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    background: linear-gradient(180deg, rgba(0,255,204,0.05), rgba(255,255,255,0.01));
+  }
+
+  .downloaded-release-art,
+  .downloaded-release-placeholder {
+    width: 120px;
+    height: 120px;
+    border-radius: 12px;
+    flex-shrink: 0;
+  }
+
+  .downloaded-release-type {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: rgba(0,255,204,0.7);
+  }
+
+  .downloaded-release-copy h2 {
+    margin: 0;
+    color: #e7fffd;
+    font-size: 28px;
+  }
+
+  .downloaded-tracks {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 12px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .downloaded-track-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: 58px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    text-align: left;
+    background: rgba(255,255,255,0.02);
+    border-color: rgba(255,255,255,0.06);
+    color: inherit;
+    padding: 10px 12px;
+  }
+
+  .downloaded-track-row.is-active {
+    background: rgba(0,255,204,0.08);
+    border-color: rgba(0,255,204,0.3);
+  }
+
+  .downloaded-track-index,
+  .downloaded-track-duration {
+    font-size: 12px;
+    color: rgba(0,255,204,0.72);
+  }
+
+  .downloaded-track-copy {
+    min-width: 0;
+  }
+
+  .downloaded-empty {
+    height: 100%;
+    min-height: 220px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+    color: rgba(210, 230, 230, 0.55);
+  }
+
+  .downloaded-player {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) auto minmax(220px, 1fr) 140px;
+    gap: 14px;
+    align-items: center;
+    border-top: 1px solid rgba(0,255,204,0.16);
+    padding-top: 14px;
+  }
+
+  .downloaded-player-title {
+    color: #f0fffe;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .downloaded-player-controls {
+    display: flex;
+    gap: 8px;
+  }
+
+  .downloaded-player-timeline,
+  .downloaded-player-volume {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: rgba(210, 230, 230, 0.58);
+  }
+
+  .downloaded-player-timeline input,
+  .downloaded-player-volume input {
+    width: 100%;
+  }
+
+  @media (max-width: 900px) {
+    .downloaded-modal {
+      width: min(96vw, 96vw);
+      max-height: 92vh;
+    }
+
+    .downloaded-layout {
+      grid-template-columns: 1fr;
+    }
+
+    .downloaded-player {
+      grid-template-columns: 1fr;
+    }
+
+    .downloaded-release-hero {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+
+  /* Discovery Tab Styles */
+
+  /* ── Discover full-screen overlay ──────────────────────────────────────── */
+  .discover-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: var(--bg-color, #0d0d0d);
+    display: flex;
+    flex-direction: column;
+    animation: fadeIn 0.18s ease-out;
+  }
+
+  .discover-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    flex-shrink: 0;
+    gap: 12px;
+    background: rgba(255,255,255,0.02);
+  }
+
+  .discover-topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .discover-topbar-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--accent-color);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    margin-right: 4px;
+  }
+
+  .discover-select {
+    padding: 5px 10px;
+    border-radius: 4px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: var(--surface-light, rgba(255,255,255,0.05));
+    color: white;
+    font-family: inherit;
+    font-size: 12px;
+  }
+
+  .discover-select-genre {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .discover-refresh-btn {
+    padding: 5px 12px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .discover-close-btn {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.7);
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.12s, color 0.12s;
+  }
+  .discover-close-btn:hover {
+    background: rgba(255,255,255,0.12);
+    color: #fff;
+  }
+
+  .discover-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 20px 32px;
+    min-height: 0;
+  }
+
+  .discover-loading {
+    padding: 80px 20px;
+    text-align: center;
+    color: rgba(255,255,255,0.4);
+    font-family: var(--font-mono);
+    letter-spacing: 0.05em;
+  }
+
+  .discover-empty {
+    padding: 80px 20px;
+    text-align: center;
+    color: rgba(255,255,255,0.3);
+    font-style: italic;
+  }
+
+  .discover-sections {
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+    animation: fadeIn 0.3s ease-out;
+  }
+
+  .discover-section {}
+
+  .discover-section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+
+  .discover-section-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--accent-color);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+
+  .discover-section-rule {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, rgba(255,255,255,0.1), transparent);
+  }
+
+  .discover-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 18px;
+  }
+
+  .discovery-card {
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    padding: 12px;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    height: 100%;
+    box-sizing: border-box;
+  }
+
+  .discovery-card:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: var(--accent-color);
+    transform: translateY(-4px);
+    box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+  }
+
+  .discovery-artwork-wrapper {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 1;
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.2);
+  }
+
+  .discovery-artwork {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    transition: transform 0.5s ease;
+  }
+
+  .discovery-card:hover .discovery-artwork {
+    transform: scale(1.08);
+  }
+
+  .discovery-play-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    backdrop-filter: blur(2px);
+  }
+
+  .discovery-card:hover .discovery-play-overlay {
+    opacity: 1;
+  }
+
+  .discovery-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .discovery-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .discovery-subtitle {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.5);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 </style>

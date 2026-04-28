@@ -100,6 +100,10 @@ class ISRCEnricher:
                 if not track_obj:
                     continue
                 isrc = t.get("external_ids", {}).get("isrc")
+                if not isrc:
+                    # Fallback to the partner API using GID
+                    isrc = self._fetch_isrc_via_gid(t["id"])
+
                 if isrc:
                     track_obj.isrc = isrc
                     enriched_count += 1
@@ -132,3 +136,38 @@ class ISRCEnricher:
                         logger.warning(f"[ISRCEnricher] Future error: {e}")
 
         logger.info(f"[ISRCEnricher] ISRC coverage achieved: {enriched_count}/{len(ids)}")
+
+    def _fetch_isrc_via_gid(self, spotify_id: str) -> str | None:
+        """
+        Fallback to spclient.wg.spotify.com partner API for tracks where the
+        public Web API drops the ISRC in the response.
+        """
+        if not spotify_id or len(spotify_id) != 22:
+            return None
+
+        # Convert base62 Spotify ID to 32-char hex GID
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        n = 0
+        for char in spotify_id:
+            idx = alphabet.find(char)
+            if idx < 0:
+                return None
+            n = n * 62 + idx
+        gid = format(n, '032x')
+
+        url = f"https://spclient.wg.spotify.com/metadata/4/track/{gid}?market=from_token"
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        try:
+            r = requests.get(url, headers=headers, timeout=5)
+            if r.ok:
+                data = r.json()
+                for ext in data.get("external_id", []):
+                    if ext.get("type", "").lower() == "isrc":
+                        return ext.get("id")
+        except Exception as e:
+            logger.debug(f"[ISRCEnricher] GID fallback error for {spotify_id}: {e}")
+        return None

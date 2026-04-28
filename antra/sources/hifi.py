@@ -9,14 +9,13 @@ response wins (same strategy as SpotiFLAC).
 Audio quality: up to Hi-Res FLAC 24-bit/192kHz depending on instance.
 Falls back to 16-bit FLAC if hi-res is unavailable for a track.
 
-NOTE: These are community-run servers. They may go down or rotate.
-      Update ENDPOINTS below if instances become unavailable.
-      Priority 5 = runs before JioSaavn and YouTube in the chain.
+NOTE: Endpoint lists are loaded at runtime from the shared endpoint manifest.
 """
 import base64
 import concurrent.futures
+import json
 import logging
-import os
+import random
 import re
 import subprocess
 import sys
@@ -39,60 +38,31 @@ _SUBPROCESS_FLAGS = {}
 if sys.platform == "win32":
     _SUBPROCESS_FLAGS["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-# ── Known public hifi-api endpoints ──────────────────────────────────────────
-# Includes original SpotiFLAC endpoints plus Monochrome (monochrome.tf,
-# mono.squid.wtf) and QQDL community mirrors. The health-check in
-# _get_live_endpoints() filters out any that are down at runtime, so it is
-# safe to list more endpoints here than are actually alive at any given time.
-ENDPOINTS = [
-    # Monochrome (monochrome.tf) backend instances
-    "https://api.monochrome.tf",
-    "https://arran.monochrome.tf",
-    # squid.wtf backends (mono.squid.wtf frontend)
-    "https://triton.squid.wtf",
-    "https://tidal.squid.wtf",
-    # QQDL community mirrors
-    "https://tidal.qqdl.site",
-    "https://vogel.qqdl.site",
-    "https://wolf.qqdl.site",
-    "https://maus.qqdl.site",
-    # binimum original
-    "https://music.binimum.org",
-    # Additional community mirrors — verify liveness before relying on
-    "https://tidal.notabot.dev",
-    "https://hifi.lunar.gg",
-    "https://api.hifi.786.moe",
-    "https://hifi.geeked.wtf",
-    "https://katze.qqdl.site",
-    "https://hund.qqdl.site",
-    "https://tidal.kinoplus.online",
-    "https://hifi.samidy.com",
-    # spotisaver.net community mirrors (verified working 2026-04-09)
-    "https://hifi-one.spotisaver.net",
-    "https://hifi-two.spotisaver.net",
-]
-
 # Quality preference order (try hi-res first, fall back)
 QUALITY_LEVELS = ["HI_RES_LOSSLESS", "LOSSLESS"]
 
 ENDPOINT_CACHE_TTL = 300  # 5 minutes
 MIN_SIMILARITY = 0.25
-REQUEST_TIMEOUT = 8  # seconds per endpoint
-
+REQUEST_TIMEOUT = 8        # seconds per endpoint (search / health check)
+TRACK_ENDPOINT_TIMEOUT = 30  # /track/ calls hit live Tidal API and take 5-15s
 
 class HifiAdapter(BaseSourceAdapter):
     """Free FLAC via community hifi-api instances (Tidal backend)."""
 
     name = "hifi"
-    priority = 2  # After Amazon, before Soulseek
+    priority = 2  # Share priority 2 with Amazon/Apple for load balancing
 
-    def __init__(self):
+    def __init__(
+        self,
+        endpoints: Optional[list[str]] = None,
+    ):
         # Note: IP spoofing headers were removed — they don't bypass network-layer rate limits.
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         })
+        self._endpoints = [ep.rstrip("/") for ep in (endpoints or []) if ep]
         # Cache working endpoints to avoid re-testing on every track
         self._live_endpoints: Optional[list[str]] = None
         self._live_endpoints_ts: float = 0.0
@@ -105,8 +75,8 @@ class HifiAdapter(BaseSourceAdapter):
 
 
     def is_available(self) -> bool:
-        """Always available — no credentials needed."""
-        return True
+        """Available when the manifest provided at least one endpoint."""
+        return bool(self._endpoints)
 
     def is_throttled(self) -> bool:
         """
@@ -144,13 +114,23 @@ class HifiAdapter(BaseSourceAdapter):
 
 
     def _get_live_endpoints(self) -> list[str]:
-        """Return endpoints that respond to a health check, cached for 5 minutes."""
+        """Return endpoints that respond to a health check, cached for 5 minutes.
+
+        Pool = manifest-provided HiFi endpoints. Sorted by historical success count.
+        """
         if self._live_endpoints is not None:
             if time.time() - self._live_endpoints_ts < ENDPOINT_CACHE_TTL:
                 return self._live_endpoints
             else:
                 logger.debug("[HiFi] Endpoint cache expired — re-validating")
                 self._live_endpoints = None
+
+        candidate_pool = list(dict.fromkeys(self._endpoints))
+        if not candidate_pool:
+            logger.warning("[HiFi] No endpoints configured")
+            self._live_endpoints = []
+            self._live_endpoints_ts = time.time()
+            return []
 
         def _check(ep: str) -> Optional[str]:
             try:
@@ -165,16 +145,17 @@ class HifiAdapter(BaseSourceAdapter):
                 logger.debug(f"[HiFi] Unreachable: {ep} — {e}")
             return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ENDPOINTS)) as ex:
-            results = ex.map(_check, ENDPOINTS)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(candidate_pool), 1)) as ex:
+            results = list(ex.map(_check, candidate_pool))
 
-        live = [ep for ep in results if ep is not None]
-        # Sort by historical success count (descending)
-        live.sort(key=lambda ep: self._endpoint_success.get(ep, 0), reverse=True)
+        live_community = [ep for ep in results if ep is not None]
+        live_community.sort(key=lambda ep: self._endpoint_success.get(ep, 0), reverse=True)
 
-        self._live_endpoints = live if live else list(ENDPOINTS)
+        self._live_endpoints = live_community if live_community else candidate_pool
         self._live_endpoints_ts = time.time()
-        logger.debug(f"[HiFi] {len(self._live_endpoints)}/{len(ENDPOINTS)} endpoints live")
+        logger.debug(
+            f"[HiFi] {len(live_community)}/{len(candidate_pool)} community endpoints live"
+        )
         return self._live_endpoints
 
     # ── Search ────────────────────────────────────────────────────────────────
@@ -182,6 +163,8 @@ class HifiAdapter(BaseSourceAdapter):
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         """Search all live endpoints in parallel, return best match."""
         endpoints = self._get_live_endpoints()
+        if not endpoints:
+            return None
 
         # Try ISRC first (exact match, much faster)
         if track.isrc:
@@ -389,7 +372,9 @@ class HifiAdapter(BaseSourceAdapter):
         if "HI_RES" in blob or "HIRES" in blob:
             return 24
         if "LOSSLESS" in blob:
-            return 16
+            # Community HiFi endpoints in this setup serve 24-bit FLAC even when
+            # the search payload only says LOSSLESS, so avoid mislabeling them as 16-bit.
+            return 24
         return None
 
     # ── Download ──────────────────────────────────────────────────────────────
@@ -404,7 +389,7 @@ class HifiAdapter(BaseSourceAdapter):
 
         endpoint, track_id = result.stream_id.split("|", 1)
         endpoints_to_try = []
-        if endpoint not in self._download_blocklist:
+        if endpoint not in self._download_blocklist and endpoint not in endpoints_to_try:
             endpoints_to_try.append(endpoint)
         for candidate in self._get_live_endpoints():
             if candidate in self._download_blocklist:
@@ -469,14 +454,16 @@ class HifiAdapter(BaseSourceAdapter):
 
                 except Exception as e:
                     message = str(e)
-                    if "403 client error" in message.lower() or "404 client error" in message.lower():
+                    # Only blocklist the endpoint for proxy-level errors (4xx from the
+                    # HiFi proxy itself), not for CDN-level failures after manifest decode.
+                    if ("403 client error" in message.lower() or "404 client error" in message.lower()) and "tidal.com" not in message.lower():
                         if candidate_endpoint not in self._download_blocklist:
                             self._download_blocklist.add(candidate_endpoint)
-                            logger.debug(
+                            logger.info(
                                 "[HiFi] Disabling endpoint for this session after /track failure: %s",
                                 candidate_endpoint,
                             )
-                    logger.debug(
+                    logger.info(
                         f"[HiFi] Failed endpoint={candidate_endpoint} quality={quality}: {e}"
                     )
                     continue
@@ -506,7 +493,7 @@ class HifiAdapter(BaseSourceAdapter):
             r = self._session.get(
                 f"{endpoint}/track/",
                 params={"id": track_id, "quality": quality},
-                timeout=REQUEST_TIMEOUT,
+                timeout=TRACK_ENDPOINT_TIMEOUT,
             )
             if r.status_code == 429:
                 # Rate-limited on the download path — back off and let caller try next endpoint
@@ -532,7 +519,6 @@ class HifiAdapter(BaseSourceAdapter):
 
         if "application/vnd.tidal.bts" in manifest_type:
             # BTS manifest = JSON with direct URLs
-            import json
             try:
                 manifest = json.loads(manifest_bytes)
             except Exception as e:
@@ -695,8 +681,7 @@ class HifiAdapter(BaseSourceAdapter):
             getLogger(__name__).debug(f"[HiFi] ffmpeg remux error: {e}")
             return False
 
-    @staticmethod
-    def _try_ffmpeg_concat(segment_files: list[str], output_path: str) -> bool:
+    def _try_ffmpeg_concat(self, segment_files: list[str], output_path: str) -> bool:
         """Use ffmpeg to concat segments into a clean output file."""
         try:
             from antra.utils.runtime import get_ffmpeg_exe
@@ -769,13 +754,13 @@ class HifiAdapter(BaseSourceAdapter):
 def _diagnose():
     """Run with: python -m antra.sources.hifi"""
     logging.basicConfig(level=logging.DEBUG)
-    adapter = HifiAdapter()
+    adapter = HifiAdapter(endpoints=[])
     print("\n=== Endpoint Health Check ===")
     live = adapter._get_live_endpoints()
-    print(f"Live: {len(live)}/{len(ENDPOINTS)}")
+    print(f"Live: {len(live)}/{len(adapter._endpoints)}")
     for ep in live:
         print(f"  [OK] {ep}")
-    dead = [ep for ep in ENDPOINTS if ep not in live]
+    dead = [ep for ep in adapter._endpoints if ep not in live]
     for ep in dead:
         print(f"  [FAIL] {ep}")
 
@@ -844,7 +829,7 @@ def _rate_limit_test():
     Run with: python -c "from antra.sources.hifi import _rate_limit_test; _rate_limit_test()"
     """
     logging.basicConfig(level=logging.INFO)
-    adapter = HifiAdapter()
+    adapter = HifiAdapter(endpoints=[])
     queries = [
         "Blinding Lights The Weeknd",
         "Bohemian Rhapsody Queen",

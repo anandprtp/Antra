@@ -29,6 +29,19 @@ DEFAULT_SPOTIFY_CACHE_PATH = str(Path(_data_dir) / ".spotify_cache")
 _ANTRA_SPOTIFY_CLIENT_ID = "9d6a33e76f6340f98893ac845220e264"
 
 
+
+def _split_urls(value: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw in value.replace("\n", ",").replace(";", ",").split(","):
+        cleaned = raw.strip().rstrip("/")
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        urls.append(cleaned)
+    return urls
+
+
 @dataclass
 class Config:
     # Spotify (required)
@@ -42,6 +55,7 @@ class Config:
     spotify_access_token: str = ""
 
     # Qobuz (optional, preferred for FLAC)
+    qobuz_enabled: bool = False
     qobuz_email: str = ""
     qobuz_password: str = ""
     qobuz_app_id: str = "285473059"
@@ -55,13 +69,23 @@ class Config:
     # Tidal (optional)
     tidal_email: str = ""
     tidal_password: str = ""
+    tidal_enabled: bool = False
+    tidal_auth_mode: str = "session_json"
+    tidal_session_json: str = ""
+    tidal_access_token: str = ""
+    tidal_refresh_token: str = ""
+    tidal_session_id: str = ""
+    tidal_token_type: str = "Bearer"
+    tidal_country_code: str = ""
 
     # YAMS (yams.tf — Qobuz/Deezer backend, requires auth token)
     yams_enabled: bool = True
     yams_auth_token: str = ""
 
-    # DAB Music (optional — no credentials needed, free FLAC via dab.yeet.su)
-    dab_enabled: bool = True
+    # DAB Music download adapter (optional — community Qobuz proxy based).
+    # Disabled by default because these public endpoints are no longer used
+    # for downloads. The adapter remains available as an explicit opt-in.
+    dab_enabled: bool = False
 
     # Qobuz Proxy (optional — no credentials needed, free FLAC via community
     # Qobuz proxy endpoints: dab.yeet.su/api/stream, dabmusic.xyz, qobuz.squid.wtf)
@@ -91,29 +115,26 @@ class Config:
 
     # Apple Music (optional — no credentials needed, lossless ALAC via community proxy)
     apple_enabled: bool = True
-    apple_mirrors: list[str] = field(default_factory=lambda: [
-        "https://apple.squid.wtf",
-        "https://appl.afkarxyz.qzz.io",
-        "https://apple.rnb.su",
-        "https://apple.vov.li",
-    ])
+    apple_mirrors: list[str] = field(default_factory=list)
     # Developer token for Apple Music Catalog API (used for playlist fetching).
     # Songs and albums work without this. Get one from developer.apple.com
     # OR leave blank — Antra will auto-extract one from the Apple Music web player.
     apple_developer_token: str = ""
 
-    # Amazon Music (optional — no credentials needed, free FLAC via community proxy)
-    amazon_enabled: bool = True
-    amazon_mirrors: list[str] = field(default_factory=lambda: [
-        "https://amzn.afkarxyz.qzz.io",
-        "https://amzn.vov.li",
-        "https://amzn.rnb.su",
-        "https://amazon.squid.wtf"
-    ])
+    # Amazon Music download adapter (optional — community proxy based).
+    # Disabled by default because the shared proxy pool is no longer relied on
+    # for downloads. Amazon Music links/metadata can still be handled elsewhere.
+    amazon_enabled: bool = False
+    amazon_mirrors: list[str] = field(default_factory=list)
     amazon_region: str = "US"  # US, UK, DE, FR, JP, CA, IT, ES, IN
     amazon_auth_method: str = "proxy"  # proxy, cookies
     amazon_cookies_path: str = ""
     amazon_insecure_mirrors: bool = True
+
+    # HiFi download adapter (optional — community hifi-api / Tidal proxy pool).
+    # Disabled by default because these public mirrors are no longer used for
+    # downloads. The adapter remains available as an explicit opt-in.
+    hifi_enabled: bool = False
 
     # Output
     output_dir: str = "./Music"
@@ -164,6 +185,26 @@ class Config:
     #   "title_artist" — Title - Artist
     filename_format: str = "default"
 
+    # Direct Amazon Music credentials (JSON blob from amazon_creds.json).
+    # When set, Antra calls the Amazon DMLS API directly with the user's own
+    # paid account — no proxy server required.  Fields: cookie, authorization,
+    # csrf_token, csrf_rnd, csrf_ts, customer_id, device_id, session_id, wvd_path.
+    amazon_direct_creds_json: str = ""
+    # Widevine device path used by Amazon direct-account login flows.
+    # Stored separately so the app can refresh browser-session tokens without
+    # forcing the user to keep editing a large credentials blob manually.
+    amazon_wvd_path: str = ""
+
+    # Direct Apple Music credentials for lossless ALAC downloads.
+    # authorization    — Bearer JWT from music.apple.com (static web player token)
+    # music_user_token — per-user Music-User-Token (~30 day expiry)
+    # storefront       — country code, e.g. "us", "gb"
+    # wvd_path         — path to android_l3.wvd Widevine device file
+    apple_authorization_token: str = ""
+    apple_music_user_token: str = ""
+    apple_storefront: str = "us"
+    apple_wvd_path: str = ""
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -176,6 +217,7 @@ def load_config() -> Config:
         spotify_cache_path=os.getenv("SPOTIFY_CACHE_PATH", DEFAULT_SPOTIFY_CACHE_PATH),
         spotify_sp_dc=os.getenv("SPOTIFY_SP_DC", ""),
         spotify_access_token=os.getenv("SPOTIFY_ACCESS_TOKEN", ""),
+        qobuz_enabled=os.getenv("QOBUZ_ENABLED", "false").lower() == "true",
         qobuz_email=os.getenv("QOBUZ_EMAIL", ""),
         qobuz_password=os.getenv("QOBUZ_PASSWORD", ""),
         qobuz_app_id=os.getenv("QOBUZ_APP_ID", "285473059"),
@@ -184,9 +226,17 @@ def load_config() -> Config:
         deezer_arl_token=os.getenv("DEEZER_ARL_TOKEN", ""),
         tidal_email=os.getenv("TIDAL_EMAIL", ""),
         tidal_password=os.getenv("TIDAL_PASSWORD", ""),
+        tidal_enabled=os.getenv("TIDAL_ENABLED", "false").lower() == "true",
+        tidal_auth_mode=os.getenv("TIDAL_AUTH_MODE", "session_json"),
+        tidal_session_json=os.getenv("TIDAL_SESSION_JSON", ""),
+        tidal_access_token=os.getenv("TIDAL_ACCESS_TOKEN", ""),
+        tidal_refresh_token=os.getenv("TIDAL_REFRESH_TOKEN", ""),
+        tidal_session_id=os.getenv("TIDAL_SESSION_ID", ""),
+        tidal_token_type=os.getenv("TIDAL_TOKEN_TYPE", "Bearer"),
+        tidal_country_code=os.getenv("TIDAL_COUNTRY_CODE", ""),
         yams_enabled=os.getenv("YAMS_ENABLED", "true").lower() == "true",
         yams_auth_token=os.getenv("YAMS_AUTH_TOKEN", ""),
-        dab_enabled=os.getenv("DAB_ENABLED", "true").lower() == "true",
+        dab_enabled=os.getenv("DAB_ENABLED", "false").lower() == "true",
         qobuz_proxy_enabled=os.getenv("QOBUZ_PROXY_ENABLED", "true").lower() == "true",
         jiosaavn_enabled=os.getenv("JIOSAAVN_ENABLED", "true").lower() == "true",
         jiosaavn_quality=os.getenv("JIOSAAVN_QUALITY", "320"),
@@ -195,19 +245,20 @@ def load_config() -> Config:
         musixmatch_api_key=os.getenv("MUSIXMATCH_API_KEY", ""),
         genius_api_key=os.getenv("GENIUS_API_KEY", ""),
         output_dir=os.getenv("OUTPUT_DIR", "./Music"),
-        spotfetch_mirrors=os.getenv(
+        spotfetch_mirrors=_split_urls(os.getenv(
             "SPOTFETCH_MIRRORS",
             "https://sp.afkarxyz.qzz.io/api,https://sp.vov.li/api,https://sp.rnb.su/api,https://spotify.squid.wtf/api",
-        ).split(","),
+        )),
         apple_enabled=os.getenv("APPLE_ENABLED", "true").lower() == "true",
-        apple_mirrors=os.getenv("APPLE_MIRRORS", "https://apple.squid.wtf,https://appl.afkarxyz.qzz.io,https://apple.rnb.su,https://apple.vov.li").split(","),
+        apple_mirrors=_split_urls(os.getenv("APPLE_MIRRORS", "")),
         apple_developer_token=os.getenv("APPLE_DEVELOPER_TOKEN", ""),
-        amazon_enabled=os.getenv("AMAZON_ENABLED", "true").lower() == "true",
-        amazon_mirrors=os.getenv("AMAZON_MIRRORS", "https://amzn.afkarxyz.qzz.io,https://amzn.vov.li,https://amzn.rnb.su,https://amazon.squid.wtf").split(","),
+        amazon_enabled=os.getenv("AMAZON_ENABLED", "false").lower() == "true",
+        amazon_mirrors=_split_urls(os.getenv("AMAZON_MIRRORS", "")),
         amazon_region=os.getenv("AMAZON_REGION", "US"),
         amazon_auth_method=os.getenv("AMAZON_AUTH_METHOD", "proxy"),
         amazon_cookies_path=os.getenv("AMAZON_COOKIES_PATH", ""),
         amazon_insecure_mirrors=os.getenv("AMAZON_INSECURE_MIRRORS", "true").lower() == "true",
+        hifi_enabled=os.getenv("HIFI_ENABLED", "false").lower() == "true",
         max_retries=int(os.getenv("MAX_RETRIES", "3")),
         retry_delay=float(os.getenv("RETRY_DELAY", "2.0")),
         fetch_lyrics=os.getenv("FETCH_LYRICS", "true").lower() == "true",
@@ -225,5 +276,11 @@ def load_config() -> Config:
         library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
         filename_format=os.getenv("FILENAME_FORMAT", "default"),
+        amazon_direct_creds_json=os.getenv("AMAZON_DIRECT_CREDS_JSON", ""),
+        amazon_wvd_path=os.getenv("AMAZON_WVD_PATH", ""),
+        apple_authorization_token=os.getenv("APPLE_AUTHORIZATION_TOKEN", ""),
+        apple_music_user_token=os.getenv("APPLE_MUSIC_USER_TOKEN", ""),
+        apple_storefront=os.getenv("APPLE_STOREFRONT", "us"),
+        apple_wvd_path=os.getenv("APPLE_WVD_PATH", ""),
     )
     return cfg

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,9 @@ type App struct {
 	isStopping     bool
 	ffmpegExe      string // absolute path to bundled ffmpeg (empty = use PATH)
 	ffprobeExe     string // absolute path to bundled ffprobe (empty = use PATH)
+	mediaServer    *http.Server
+	mediaBaseURL   string
+	mediaToken     string
 }
 
 // NewApp creates a new App application struct
@@ -87,6 +91,16 @@ func (a *App) shutdown(ctx context.Context) {
 	_, cmd := a.detachActiveDownload()
 	if cmd != nil {
 		_ = killCommandTree(cmd)
+	}
+
+	a.mu.Lock()
+	mediaServer := a.mediaServer
+	a.mediaServer = nil
+	a.mediaBaseURL = ""
+	a.mediaToken = ""
+	a.mu.Unlock()
+	if mediaServer != nil {
+		_ = mediaServer.Close()
 	}
 
 	if runtime.GOOS == "windows" {

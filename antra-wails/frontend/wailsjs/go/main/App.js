@@ -22,12 +22,32 @@ export function ClearHistory() {
   return window['go']['main']['App']['ClearHistory']();
 }
 
+export function ConfirmAmazonLogin() {
+  return window['go']['main']['App']['ConfirmAmazonLogin']();
+}
+
 export function GetArtistDiscography(arg1) {
   return window['go']['main']['App']['GetArtistDiscography'](arg1);
 }
 
 export function GetConfig() {
   return window['go']['main']['App']['GetConfig']();
+}
+
+export function GetDiscoveryData(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetDiscoveryData'](arg1, arg2, arg3);
+}
+
+export function GetDiscoveryGenres(arg1) {
+  return window['go']['main']['App']['GetDiscoveryGenres'](arg1);
+}
+
+export function GetDownloadedMusicLibrary() {
+  return window['go']['main']['App']['GetDownloadedMusicLibrary']();
+}
+
+export function GetDownloadedRelease(arg1) {
+  return window['go']['main']['App']['GetDownloadedRelease'](arg1);
 }
 
 export function GetHistory() {
@@ -46,6 +66,10 @@ export function GetSpotifyStatus() {
   return window['go']['main']['App']['GetSpotifyStatus']();
 }
 
+export function GetSupportStatus() {
+  return window['go']['main']['App']['GetSupportStatus']();
+}
+
 export function LoginSpotify() {
   return window['go']['main']['App']['LoginSpotify']();
 }
@@ -60,6 +84,10 @@ export function PickAnalyzerFiles() {
 
 export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
+}
+
+export function RetryTrackDownload(arg1) {
+  return window['go']['main']['App']['RetryTrackDownload'](arg1);
 }
 
 export function SaveConfig(arg1) {
@@ -82,8 +110,24 @@ export function SetSpotifyToken(arg1) {
   return window['go']['main']['App']['SetSpotifyToken'](arg1);
 }
 
+export function StartAmazonBrowserLogin() {
+  return window['go']['main']['App']['StartAmazonBrowserLogin']();
+}
+
+export function StartAppleBrowserLogin() {
+  return window['go']['main']['App']['StartAppleBrowserLogin']();
+}
+
 export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
+}
+
+export function StartTidalOAuthLogin() {
+  return window['go']['main']['App']['StartTidalOAuthLogin']();
+}
+
+export function ValidateTidalAuth() {
+  return window['go']['main']['App']['ValidateTidalAuth']();
 }
 
 export function WriteFile(arg1, arg2) {

@@ -16,6 +16,26 @@ lyricsgenius>=3.0.1
 
 # ── NetEase Cloud Music source (Chinese catalog) ─────────────────────────────
 pyncm>=1.8.0
+tidalapi>=0.8.11
 
 # ── Spotify TOTP token generation (no-auth web player token) ─────────────────
 pyotp>=2.9.0
+
+# ── Chrome TLS impersonation — bypasses Cloudflare bot-detection on Spotify ──
+# open.spotify.com/get_access_token checks JA3 TLS fingerprint; Python's ssl
+# module is blocked as a bot.  curl_cffi bundles libcurl patched to reproduce
+# Chrome's exact TLS handshake, fixing 403 "URL Blocked" on that endpoint.
+curl_cffi>=0.7.0
+
+# ── Widevine CDM — required for direct Amazon Music / Apple Music downloads ──
+# pywidevine performs the full Widevine handshake (challenge → license → keys)
+# so users can download using their own paid accounts without a proxy server.
+# construct must be pinned to 2.8.8 — pywidevine is incompatible with 2.9+.
+pywidevine==1.8.0
+construct==2.8.8
+playwright>=1.52.0
+
+# ── WebSocket CDP client — used for Amazon/Apple browser session login ────────
+# Replaces playwright's Node.js driver for CDP communication, saving ~86 MB
+# from the final binary. Pure Python, no native dependencies.
+websockets>=13.0

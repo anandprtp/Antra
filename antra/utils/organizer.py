@@ -77,7 +77,7 @@ class LibraryOrganizer:
         if track.album_artists:
             artist_dir = self._safe(", ".join(track.album_artists))
         else:
-            artist_dir = self._safe(track.primary_artist)
+            artist_dir = self._safe(", ".join(track.artists))
         album_part = self._safe(track.album)
         if track.release_year:
             album_dir = f"{album_part} ({track.release_year})"
@@ -98,15 +98,10 @@ class LibraryOrganizer:
         title = self._safe(track.title)
         artist = self._safe(track.primary_artist)
 
-        # Always disc-prefixed: use the actual disc number if known, otherwise
-        # treat as disc 1. This produces 101/102/201/202 for every source and
-        # every album type. However, for playlists, we force semantic disc 1
-        # to ensure the sequence remains purely numerical (101, 102...) instead
-        # of mistakenly injecting the track's original album disc number.
-        if is_playlist:
-            disc = 1
-        else:
-            disc = track.disc_number or 1
+        # Disc number: playlists always use disc=1 (no multi-disc concept),
+        # albums use the actual disc number or default to 1.
+        # This produces 101/102/201/202 for albums and 101/102/... for playlists.
+        disc = track.disc_number or 1
 
         # title_only keeps its original behaviour (no number prefix at all,
         # except when the album is explicitly multi-disc to avoid collisions).
@@ -129,7 +124,8 @@ class LibraryOrganizer:
                 return f"{disc}{track_number:02d} - {title} - {artist}"
             return f"{title} - {artist}"
 
-        # default: 101 - Title, 201 - Title (disc always prefixed)
+        # default: disc-prefixed numbering (101, 102, 201, 202) for both
+        # albums and playlists. Playlists always use disc=1 → 101, 102, ...
         if track_number:
             return f"{disc}{track_number:02d} - {title}"
         return title

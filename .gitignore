@@ -58,5 +58,44 @@ ehthumbs.db
 *.swo
 .claude/
 
+# Internal / sensitive
 BUGS.md
 CLAUDE.md
+
+# User local state (download history, library index)
+.antra_state.json
+
+# Claude AI session files
+.claude/
+
+# Go build cache
+.gocache/
+
+# API mirror servers (contain credentials and server configs)
+API-Mirrors/
+
+# Temp / scratch folders
+_tmp_votify/
+spotiflac_repo/
+tidal-dl-ng-1-repo/
+
+# Loose root-level asset files (already in antra-wails/frontend/public/icons/)
+amazon-music.jpg
+apple_logo.png
+qobuz_icon.png
+tidal_logo_icon_147227.webp
+
+# Temp debug/scratchpad files
+artist_embed_data.json
+artist_html.txt
+probe_repaired.wav
+fail.log
+ci_log.txt
+ci_log2.txt
+antra.log
+
+# Duplicate / draft docs
+"README - Copy.md"
+README\ -\ Copy.md
+CHANGELOG_v1.1.4.md
+PERSONAL_CREDS_FEATURE.md
