@@ -27,7 +27,7 @@
 <br/>
 
 <p align="center">
-  <img src="assets/screenshots/Screenshot%202026-04-18%20022522.png" width="780"/>
+  <img src="assets/screenshots/Screenshot%202026-04-29%20021124.png" width="780"/>
 </p>
 
 ---
