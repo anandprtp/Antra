@@ -14,16 +14,17 @@
 
 ## Multi-Source Audio Engine
 
-Antra doesn't rely on a single source. In lossless mode, it queries **all** lossless-capable sources in parallel and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
+Antra uses the accounts you configure in Settings. In lossless mode it queries all connected lossless-capable services in parallel and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
 
 ```
 Source chain (per track):
 
-  Community-run APIs  →  Tidal · Qobuz · Amazon Music  (FLAC, up to 24-bit/192kHz)
-  Soulseek P2P        →  anything the community has, including rare and out-of-print releases
+  Your accounts  →  Tidal · Qobuz · Amazon Music  (FLAC, up to 24-bit/192kHz)
+                    Apple Music  (AAC 256 kbps only — no ALAC)
+  Soulseek P2P   →  anything the community has, including rare and out-of-print releases
 ```
 
-When a server is temporarily rate-limited, Antra moves it to the back of the queue and continues from the others with no stalls or dead time. In strict lossless mode, a track is marked failed rather than falling back to a lossy source.
+In strict lossless mode, a track is marked failed rather than falling back to a lossy source. **Amazon Music FLAC requires an L3/L1-certified .wvd file** — set the path in Amazon settings before downloading.
 
 ---
 
@@ -124,6 +125,12 @@ Search for any artist by Spotify or Apple Music URL. Antra fetches their full di
 
 ---
 
+## Spotify Podcast Downloads
+
+Paste any Spotify podcast episode or show URL and Antra downloads the audio directly — no account required. Episodes are tagged with title, show name, description, and cover art, and saved alongside your music library.
+
+---
+
 ## Parallel Download Engine
 
 Antra downloads 2 tracks concurrently by default. Playlists and albums that would take minutes sequentially complete in a fraction of the time.
@@ -151,7 +158,7 @@ A dedicated log panel (accessible via the 📋 button) shows verbose download ou
 
 ## Source Health Check
 
-Three chips below the URL bar show the live status of the community-run Tidal, Qobuz, and Amazon servers. Each chip displays whether the adapter is **enabled** (green glow, brand-tinted background) or **disabled** (dark red border, dimmed). Clicking a chip opens the adapter's settings section; clicking a disabled chip also toggles it on and saves the config. Parallel health probes show a live/total count with per-endpoint status dots. No server URLs are ever displayed.
+Chips below the URL bar show the status of each configured source. Each chip displays whether the adapter is **enabled** (green glow, brand-tinted background) or **disabled** (dark red border, dimmed). Clicking a chip opens that adapter's settings section; clicking a disabled chip also toggles it on and saves the config. Parallel health probes confirm your account credentials are reachable and show a live/total count with per-endpoint status dots.
 
 ---
 
@@ -169,15 +176,20 @@ Supports batch analysis with gallery view, side-by-side comparison, and PNG expo
 
 ---
 
-## No Account Required
+## Account Setup
 
-Antra works out of the box with no logins, no API keys, and no subscription:
+Antra uses your own streaming accounts as audio sources — no shared keys, no middleman. Free trials work for all services. Set everything up once in Settings; Antra remembers your credentials.
 
-- Spotify metadata: anonymous, no credentials needed
-- Apple Music metadata: anonymous catalog access
-- Amazon Music metadata: anonymous page parsing
+| Service | What you get | Notes |
+|---|---|---|
+| **Tidal** | FLAC up to 24-bit/96kHz | Free trial works. Hi-Res tier recommended. |
+| **Qobuz** | FLAC up to 24-bit/192kHz | Free trial works. Studio Premier tier for hi-res. |
+| **Amazon Music** | FLAC up to 24-bit/192kHz | Browser-based login (CDP). Requires an L3/L1-certified `.wvd` file for decryption. |
+| **Apple Music** | AAC 256 kbps | Browser-based login. ALAC/lossless is not available to web clients — AAC only. |
+| **Spotify** | Metadata + podcast audio | No audio for music tracks. Podcast episodes download directly. |
+| **Soulseek** | Whatever the community has | Optional P2P fallback for rare/out-of-print releases. |
 
-Optionally wire in a Spotify account or Apple Developer token for private playlists and deeper metadata.
+Spotify is always available for metadata and URL resolution — no login needed. Music downloads come from whichever lossless account you have configured.
 
 ---
 
@@ -196,7 +208,8 @@ For tracks that aren't available through any streaming-adjacent source (rare alb
 | Mode | Output |
 |---|---|
 | **Auto** (default) | Best available. Lossless preferred, MP3 fallback if no lossless source exists. |
-| **Lossless** | FLAC only. `.m4a` containers (e.g. Tidal segments) are re-containerized to `.flac`. Track is marked failed rather than falling back to lossy. |
+| **Lossless / FLAC** | FLAC only. `.m4a` containers (e.g. Tidal segments) are re-containerized to `.flac`. Track is marked failed rather than falling back to lossy. |
+| **AAC** | Uses Apple Music (if configured) or Amazon as AAC sources directly. No FLAC download and transcode. |
 | **MP3** | Uses dedicated MP3 sources directly. No FLAC download and transcode. |
 
 ---

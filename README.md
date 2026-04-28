@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Resolve Spotify · Apple Music · Amazon Music and get lossless audio. Free, forever.</strong>
+  <strong>Connect your Tidal · Qobuz · Amazon Music or Apple Music account and download hi-res lossless audio. Spotify podcasts too. Free, forever.</strong>
 </p>
 
 <p align="center">
@@ -34,15 +34,17 @@
 
 ## What it does
 
-Paste a Spotify, Apple Music, or Amazon Music link (playlist, album, or artist) and Antra queries all lossless-capable sources in parallel, picks the highest bit-depth result, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
+Connect your own Tidal, Qobuz, Amazon Music, or Apple Music account (free trials work), paste any Spotify, Apple Music, or Amazon Music link — playlist, album, artist, or podcast — and Antra picks the highest-quality source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
-No premium account. No Python. No setup. One binary.
+Use your own account. No middleman. No Python. One binary.
 
 ```
-Sources:  Community-run APIs (Tidal · Qobuz · Amazon) + Soulseek P2P fallback
+Sources:  Your Tidal · Qobuz · Amazon Music accounts (FLAC, up to 24-bit/192kHz)
+          Apple Music account (AAC 256 kbps)
+          Soulseek P2P (rare / out-of-print releases)
 Matching: ISRC-based, exact pressing every time — best 24-bit source wins
-Output:   FLAC · auto-tagged · Navidrome · Jellyfin · Plex ready
-Binary:   74 MB self-contained executable
+Output:   FLAC · ALAC · AAC · auto-tagged · Navidrome · Jellyfin · Plex ready
+Note:     Amazon Music FLAC requires an L3/L1-certified .wvd file
 ```
 
 → **[Full feature guide](FEATURES.md)**
@@ -67,10 +69,11 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 ## Quick start
 
 1. Launch Antra and pick your Music Library folder on first run
-2. Paste any Spotify, Apple Music, or Amazon Music URL
-3. Press **Add to Library**
+2. Go to **Settings** and connect at least one account (Tidal, Qobuz, or Amazon Music — free trials work)
+3. Paste any Spotify, Apple Music, Amazon Music, or Spotify podcast URL
+4. Press **Add to Library**
 
-That's it. Tracks download, get tagged, and land in the right folder automatically.
+Tracks download, get tagged, and land in the right folder automatically.
 
 ---
 
