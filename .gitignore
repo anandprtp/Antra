@@ -8,12 +8,19 @@ venv/
 env/
 dist/
 build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Environment / secrets
 .env
 *.env.local
 .antra_auth.json
 .antra_qobuz_creds.json
+*.wvd
 *.log
 
 # Desktop app build artifacts
@@ -24,6 +31,16 @@ antra-wails/frontend/node_modules/
 antra-wails/frontend/package.json.md5
 antra-wails/*.exe
 
+# Go
+*.test
+coverage.out
+
+# CI / temp logs
+ci_log*.txt
+ci_log*.log
+*.tmp
+*.bak
+
 # Music library (user data - not part of the repo)
 Music/
 
@@ -31,11 +48,15 @@ Music/
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
+*.lnk
 
-# IDE
+# IDE / tooling
 .vscode/
 .idea/
 *.swp
+*.swo
+.claude/
 
 BUGS.md
 CLAUDE.md
