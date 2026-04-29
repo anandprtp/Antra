@@ -44,7 +44,7 @@ Sources:  Your Tidal · Qobuz · Amazon Music accounts (FLAC, up to 24-bit/192kH
           Soulseek P2P (rare / out-of-print releases)
 Matching: ISRC-based, exact pressing every time — best 24-bit source wins
 Output:   FLAC · ALAC · AAC · auto-tagged · Navidrome · Jellyfin · Plex ready
-Note:     Amazon Music FLAC requires an L3/L1-certified .wvd file
+Note:     Amazon Music FLAC requires an L3/L1-certified .wvd file — [how to get one](WIDEVINE.md)
 ```
 
 → **[Full feature guide](FEATURES.md)**
