@@ -46,7 +46,7 @@ Matching: ISRC-based, exact pressing every time — best 24-bit source wins
 Output:   FLAC · ALAC · AAC · auto-tagged · Navidrome · Jellyfin · Plex ready
 ```
 
-> **Amazon Music FLAC** requires an L3/L1-certified `.wvd` file. → [How to get one](WIDEVINE.md)
+> **Amazon Music FLAC** requires an L3/L1-certified `.wvd` file.
 
 → **[Full feature guide](FEATURES.md)**
 
