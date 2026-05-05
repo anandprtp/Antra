@@ -71,7 +71,7 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 3. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
 4. Press **Add to Library**
 
-Tracks download, get tagged, and land in the right folder automatically.
+Tracks saved, get tagged, and land in the right folder automatically.
 
 ---
 
