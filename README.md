@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Paste Spotify · Apple Music · Amazon Music · Tidal · Qobuz or Deezer links and download your library in FLAC, ALAC, AAC, or MP3.</strong>
+  <strong>Paste Spotify · Apple Music · Amazon Music · Tidal · Qobuz or Deezer links and get your library in FLAC, ALAC, AAC, or MP3.</strong>
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
 
 ## What it does
 
-Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link (playlist, album, artist, track, or podcast) and Antra resolves the best available source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
+Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link (playlist, album, artist, track, or podcast) and Antra resolves the best available source, gets it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
 No Python. No setup pain. One binary.
 
