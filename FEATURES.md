@@ -14,17 +14,17 @@
 
 ## Multi-Source Audio Engine
 
-Antra uses the accounts you configure in Settings. In lossless mode it queries all connected lossless-capable services in parallel and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
+Antra resolves links from Spotify, Apple Music, Amazon Music, Tidal, Qobuz, and Deezer. In lossless mode it queries all active lossless-capable sources and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
 
 ```
 Source chain (per track):
 
-  Your accounts  →  Tidal · Qobuz · Amazon Music  (FLAC, up to 24-bit/192kHz)
-                    Apple Music  (AAC 256 kbps only — no ALAC)
-  Soulseek P2P   →  anything the community has, including rare and out-of-print releases
+  Antra mirror servers  →  Tidal · Qobuz · Amazon Music · Deezer · Apple Music
+  Built-in fallbacks    →  lossy and source-specific fallback adapters
+  Soulseek P2P          →  anything the community has, including rare and out-of-print releases
 ```
 
-In strict lossless mode, a track is marked failed rather than falling back to a lossy source. **Amazon Music FLAC requires an L3/L1-certified .wvd file** — set the path in Amazon settings before downloading.
+Downloads from Antra mirror servers require an **Antra Access Key**, generated inside the app in Settings. Each key is valid for **24 hours or 2000 songs**, and a fresh key can be requested after 24 hours.
 
 ---
 
@@ -176,20 +176,23 @@ Supports batch analysis with gallery view, side-by-side comparison, and PNG expo
 
 ---
 
-## Account Setup
+## Access Key & Optional Accounts
 
-Antra uses your own streaming accounts as audio sources — no shared keys, no middleman. Free trials work for all services. Set everything up once in Settings; Antra remembers your credentials.
+Antra’s default download flow uses Antra mirror servers plus the in-app **Antra Access Key**. You generate the key once in Settings and Antra saves it automatically. For most users, that is all the setup required.
 
-| Service | What you get | Notes |
+Optional premium logins are still available for services that support direct account-based downloads or metadata workflows.
+
+| Item | What it does | Notes |
 |---|---|---|
-| **Tidal** | FLAC up to 24-bit/96kHz | Free trial works. Hi-Res tier recommended. |
-| **Qobuz** | FLAC up to 24-bit/192kHz | Free trial works. Studio Premier tier for hi-res. |
-| **Amazon Music** | FLAC up to 24-bit/192kHz | Browser-based login (CDP). Requires an L3/L1-certified `.wvd` file for decryption. |
-| **Apple Music** | AAC 256 kbps | Browser-based login. ALAC/lossless is not available to web clients — AAC only. |
-| **Spotify** | Metadata + podcast audio | No audio for music tracks. Podcast episodes download directly. |
-| **Soulseek** | Whatever the community has | Optional P2P fallback for rare/out-of-print releases. |
+| **Antra Access Key** | Unlocks mirror-server downloads | Generated in Settings. Valid for 24 hours or 2000 songs. |
+| **Tidal login** | Optional direct premium integration | Useful for premium account flows and OAuth-based setup. |
+| **Qobuz login** | Optional direct Qobuz access | Used when you want your own Qobuz credentials active. |
+| **Amazon Music login** | Optional browser-based account capture | Requires an L3/L1-certified `.wvd` file for decryption. |
+| **Apple Music login** | Optional Apple browser session capture | Apple downloads in Antra are AAC-only. |
+| **Spotify** | Metadata + podcast audio | No music-track audio from Spotify itself. |
+| **Soulseek** | Optional P2P fallback | Good for rare or out-of-print releases. |
 
-Spotify is always available for metadata and URL resolution — no login needed. Music downloads come from whichever lossless account you have configured.
+Spotify, Apple Music, Amazon Music, Tidal, Qobuz, and Deezer links are all supported as input URLs.
 
 ---
 
@@ -296,10 +299,12 @@ For large shows (100+ episodes) this means downloads take time. Leave Antra runn
 
 | Mode | Output |
 |---|---|
-| **Auto** (default) | Best available. Lossless preferred, MP3 fallback if no lossless source exists. |
-| **Lossless / FLAC** | FLAC only. `.m4a` containers (e.g. Tidal segments) are re-containerized to `.flac`. Track is marked failed rather than falling back to lossy. |
-| **AAC** | Uses Apple Music (if configured) or Amazon as AAC sources directly. No FLAC download and transcode. |
-| **MP3** | Uses dedicated MP3 sources directly. No FLAC download and transcode. |
+| **FLAC 24-bit** | Highest available lossless source, prioritising hi-res where available. |
+| **FLAC 16-bit** | CD-quality lossless, with 16-bit sources preferred over 24-bit where possible. |
+| **ALAC** | Apple-compatible lossless output. |
+| **AAC** | Native AAC sources first, lossless only as fallback when needed. |
+| **MP3** | Native MP3/lossy sources first, lossless only as fallback when needed. |
+| **Auto** | Best available source with lossless preferred. |
 
 ---
 
