@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Connect your Tidal · Qobuz · Amazon Music or Apple Music account and download hi-res lossless audio. Spotify podcasts too. Free, forever.</strong>
+  <strong>Paste Spotify · Apple Music · Amazon Music · Tidal · Qobuz or Deezer links and download your library in FLAC, ALAC, AAC, or MP3. Free, forever.</strong>
 </p>
 
 <p align="center">
@@ -34,19 +34,18 @@
 
 ## What it does
 
-Connect your own Tidal, Qobuz, Amazon Music, or Apple Music account (free trials work), paste any Spotify, Apple Music, or Amazon Music link — playlist, album, artist, or podcast — and Antra picks the highest-quality source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
+Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link — playlist, album, artist, track, or podcast — and Antra resolves the best available source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
-Use your own account. No middleman. No Python. One binary.
+No Python. No setup pain. One binary.
 
 ```
-Sources:  Your Tidal · Qobuz · Amazon Music accounts (FLAC, up to 24-bit/192kHz)
-          Apple Music account (AAC 256 kbps)
-          Soulseek P2P (rare / out-of-print releases)
-Matching: ISRC-based, exact pressing every time — best 24-bit source wins
-Output:   FLAC · ALAC · AAC · auto-tagged · Navidrome · Jellyfin · Plex ready
+Links:    Spotify · Apple Music · Amazon Music · Tidal · Qobuz · Deezer
+Sources:  Antra mirror servers + built-in fallbacks
+Quality:  FLAC 24-bit · FLAC 16-bit · ALAC · AAC · MP3
+Output:   Auto-tagged · lyrics + artwork · Navidrome · Jellyfin · Plex ready
 ```
 
-> **Amazon Music FLAC** requires an L3/L1-certified `.wvd` file.
+> Spotify podcasts are supported too.
 
 → **[Full feature guide](FEATURES.md)**
 
@@ -70,8 +69,8 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 ## Quick start
 
 1. Launch Antra and pick your Music Library folder on first run
-2. Go to **Settings** and connect at least one account (Tidal, Qobuz, or Amazon Music — free trials work)
-3. Paste any Spotify, Apple Music, Amazon Music, or Spotify podcast URL
+2. Choose your preferred output format: `FLAC 24-bit`, `FLAC 16-bit`, `ALAC`, `AAC`, or `MP3`
+3. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
 4. Press **Add to Library**
 
 Tracks download, get tagged, and land in the right folder automatically.
