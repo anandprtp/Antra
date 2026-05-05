@@ -46,6 +46,7 @@ Output:   Auto-tagged · lyrics + artwork · Navidrome · Jellyfin · Plex ready
 ```
 
 > Spotify podcasts are supported too.
+> Downloads from Antra's mirror servers require an in-app Antra Access Key. Generate it in Settings with one click. Each key is valid for 24 hours or 2000 songs, and you can request a fresh one after 24 hours.
 
 → **[Full feature guide](FEATURES.md)**
 
@@ -69,9 +70,10 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 ## Quick start
 
 1. Launch Antra and pick your Music Library folder on first run
-2. Choose your preferred output format: `FLAC 24-bit`, `FLAC 16-bit`, `ALAC`, `AAC`, or `MP3`
-3. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
-4. Press **Add to Library**
+2. Open **Settings** and generate your **Antra Access Key**
+3. Choose your preferred output format: `FLAC 24-bit`, `FLAC 16-bit`, `ALAC`, `AAC`, or `MP3`
+4. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
+5. Press **Add to Library**
 
 Tracks download, get tagged, and land in the right folder automatically.
 
