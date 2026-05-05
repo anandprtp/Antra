@@ -3,14 +3,13 @@
 </p>
 
 <p align="center">
-  <strong>Paste Spotify · Apple Music · Amazon Music · Tidal · Qobuz or Deezer links and download your library in FLAC, ALAC, AAC, or MP3. Free, forever.</strong>
+  <strong>Paste Spotify · Apple Music · Amazon Music · Tidal · Qobuz or Deezer links and download your library in FLAC, ALAC, AAC, or MP3.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/anandprtp/Antra/releases"><img src="https://img.shields.io/github/v/release/anandprtp/Antra?color=0ea5e9&label=latest&style=flat-square&labelColor=0d1117"/></a>
   <img src="https://img.shields.io/badge/Windows%20·%20macOS%20·%20Linux-supported-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <img src="https://img.shields.io/badge/License-MIT-0ea5e9?style=flat-square&labelColor=0d1117"/>
-  <img src="https://img.shields.io/badge/Free-Forever-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <a href="https://t.me/antraaverse"><img src="https://img.shields.io/badge/Community-Telegram-26A5E4?style=flat-square&labelColor=0d1117&logo=telegram&logoColor=white"/></a>
 </p>
 
@@ -34,19 +33,17 @@
 
 ## What it does
 
-Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link — playlist, album, artist, track, or podcast — and Antra resolves the best available source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
+Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link (playlist, album, artist, track, or podcast) and Antra resolves the best available source, downloads it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
 No Python. No setup pain. One binary.
 
 ```
 Links:    Spotify · Apple Music · Amazon Music · Tidal · Qobuz · Deezer
-Sources:  Antra mirror servers + built-in fallbacks
 Quality:  FLAC 24-bit · FLAC 16-bit · ALAC · AAC · MP3
 Output:   Auto-tagged · lyrics + artwork · Navidrome · Jellyfin · Plex ready
 ```
 
 > Spotify podcasts are supported too.
-> Downloads from Antra's mirror servers require an in-app Antra Access Key. Generate it in Settings with one click. Each key is valid for 24 hours or 2000 songs, and you can request a fresh one after 24 hours.
 
 → **[Full feature guide](FEATURES.md)**
 
@@ -70,10 +67,9 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 ## Quick start
 
 1. Launch Antra and pick your Music Library folder on first run
-2. Open **Settings** and generate your **Antra Access Key**
-3. Choose your preferred output format: `FLAC 24-bit`, `FLAC 16-bit`, `ALAC`, `AAC`, or `MP3`
-4. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
-5. Press **Add to Library**
+2. Choose your preferred output format: `FLAC 24-bit`, `FLAC 16-bit`, `ALAC`, `AAC`, or `MP3`
+3. Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, Deezer, or Spotify podcast URL
+4. Press **Add to Library**
 
 Tracks download, get tagged, and land in the right folder automatically.
 
@@ -95,9 +91,9 @@ python build_desktop.py
 
 ## Keep Antra alive
 
-Antra is free and always will be. It takes real time to maintain: tracking API changes, fixing broken sources, and shipping new features.
+Antra takes real time to maintain: tracking API changes, fixing broken sources, and shipping new features.
 
-If Antra saves you money on streaming subscriptions, consider giving back:
+If Antra saves you time, consider giving back:
 
 <p align="center">
   <a href="https://ko-fi.com/antraverse">
