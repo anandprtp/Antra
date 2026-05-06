@@ -14,8 +14,7 @@ slskd-api>=0.1.5
 # ── Optional lyrics provider wrapper ────────────────────────────────────────
 lyricsgenius>=3.0.1
 
-# ── NetEase Cloud Music source (Chinese catalog) ─────────────────────────────
-pyncm>=1.8.0
+# ── Tidal API client ─────────────────────────────────────────────────────────
 tidalapi>=0.8.11
 
 # ── Spotify TOTP token generation (no-auth web player token) ─────────────────
