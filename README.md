@@ -128,6 +128,14 @@ Optional integration with the Soulseek P2P network for rare albums, limited pres
 
 ---
 
+## Contributing
+
+Thank you for your interest in contributing to Antra. At this time I am not actively looking for contributions, and pull requests may not be merged into the main codebase. I appreciate the thought and effort behind them regardless.
+
+If you have found a bug or have a feature idea, feel free to open an issue and I will take a look when I can.
+
+---
+
 ## Disclaimer
 
 This repository and its contents are provided strictly for educational and research purposes. The software is provided "as-is" without warranty of any kind, express or implied, as stated in the MIT License.
