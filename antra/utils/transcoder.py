@@ -14,13 +14,17 @@ if sys.platform == "win32":
 
 
 OUTPUT_FORMAT_EXTENSION = {
-    "source": None,
-    "lossless": None,
-    "mp3": ".mp3",
-    "aac": ".m4a",   # AAC in M4A container
-    "alac": ".m4a",  # ALAC in M4A container
-    "m4a": ".m4a",
-    "flac": ".flac",
+    "source":      None,
+    "lossless":    None,
+    "lossless-16": None,
+    "lossless-24": None,
+    "alac-16":     None,
+    "alac-24":     None,
+    "mp3":         ".mp3",
+    "aac":         ".m4a",
+    "alac":        ".m4a",
+    "m4a":         ".m4a",
+    "flac":        ".flac",
 }
 
 
@@ -38,37 +42,36 @@ class AudioTranscoder:
         return os.path.splitext(file_path)[1].lower() in self._LOSSY_EXTENSIONS
 
     def needs_conversion(self, file_path: str, target_format: str) -> bool:
-        if target_format == "source":
+        # Normalise bit-depth variants to their base format for conversion logic.
+        # lossless-16 / lossless-24 → lossless, alac-16 / alac-24 → alac
+        base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
+
+        if base_format == "source":
             return False
-        if target_format == "lossless":
-            # "Lossless" means keep native lossless containers — but convert
-            # .m4a (ALAC/FLAC-in-M4A from Tidal) to .flac for uniformity,
-            # since users in lossless mode expect .flac files.
+        if base_format == "lossless":
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".m4a":
-                return True   # re-container M4A → FLAC
+                return True
             return False
-        if target_format == "flac":
-            # Never upscale lossy → lossless container (fake FLAC, no quality gain).
+        if base_format == "flac":
             if self._is_lossy(file_path):
                 return False
             ext = os.path.splitext(file_path)[1].lower()
-            # .m4a can be ALAC (lossless) but we still convert to .flac for uniformity
             return ext not in {".flac"}
 
-        if target_format == "alac":
+        if base_format == "alac":
             if self._is_lossy(file_path):
-                return False  # Don't fake-ALAC a lossy source
+                return False
             ext = os.path.splitext(file_path)[1].lower()
-            return ext == ".flac"  # Only transcode from FLAC; .m4a already ALAC
+            return ext == ".flac"
 
-        if target_format == "aac":
+        if base_format == "aac":
             ext = os.path.splitext(file_path)[1].lower()
-            return ext not in {".m4a", ".aac"}  # Skip if already in an AAC container
+            return ext not in {".m4a", ".aac"}
 
         ext = os.path.splitext(file_path)[1].lower()
-        target_ext = OUTPUT_FORMAT_EXTENSION[target_format]
-        return ext != target_ext
+        target_ext = OUTPUT_FORMAT_EXTENSION.get(target_format)
+        return target_ext is not None and ext != target_ext
 
     def convert(self, file_path: str, target_format: str) -> str:
         if target_format == "source":
@@ -115,33 +118,36 @@ class AudioTranscoder:
 
     @staticmethod
     def _plan(target_format: str) -> ConversionPlan:
-        if target_format in ("lossless", "flac"):
+        # Normalise bit-depth variants to base format
+        base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
+
+        if base_format in ("lossless", "flac"):
             return ConversionPlan(
                 target_format="flac",
                 extension=".flac",
                 codec_args=["-c:a", "flac"],
             )
-        if target_format == "mp3":
+        if base_format == "mp3":
             return ConversionPlan(
-                target_format=target_format,
+                target_format=base_format,
                 extension=".mp3",
                 codec_args=["-c:a", "libmp3lame", "-b:a", "320k"],
             )
-        if target_format == "alac":
+        if base_format == "alac":
             return ConversionPlan(
-                target_format=target_format,
+                target_format=base_format,
                 extension=".m4a",
                 codec_args=["-c:a", "alac"],
             )
-        if target_format == "aac":
+        if base_format == "aac":
             return ConversionPlan(
-                target_format=target_format,
+                target_format=base_format,
                 extension=".m4a",
                 codec_args=["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"],
             )
-        if target_format == "m4a":
+        if base_format == "m4a":
             return ConversionPlan(
-                target_format=target_format,
+                target_format=base_format,
                 extension=".m4a",
                 codec_args=["-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart"],
             )

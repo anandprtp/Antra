@@ -210,7 +210,25 @@ class DeezerAdapter(BaseSourceAdapter):
             if resp.status_code == 200:
                 data = resp.json()
                 if "id" in data and "error" not in data:
-                    return self._build_result(data, track, isrc_match=True)
+                    result = self._build_result(data, track, isrc_match=True)
+                    # Sanity-check duration to catch Pt. 1 / Pt. 2 collisions
+                    dur_ms = int(data.get("duration", 0)) * 1000
+                    if track.duration_ms and dur_ms:
+                        from antra.utils.matching import duration_close
+                        if not duration_close(
+                            track.duration_ms / 1000,
+                            dur_ms / 1000,
+                            tolerance=30,
+                        ):
+                            logger.info(
+                                "[Deezer] ISRC match for '%s' rejected — "
+                                "duration mismatch (expected %.0fs, got %.0fs)",
+                                track.title,
+                                track.duration_ms / 1000,
+                                dur_ms / 1000,
+                            )
+                            return None
+                    return result
         except Exception as e:
             logger.debug(f"[Deezer] ISRC lookup failed: {e}")
         return None

@@ -122,6 +122,9 @@ class AmazonMusicFetcher:
             raise RuntimeError(
                 f"[AmazonMusic] Could not find track metadata in page for ASIN {asin}."
             )
+        for track in tracks:
+            if not track.amazon_asin:
+                track.amazon_asin = asin
         return tracks
 
     def _fetch_album(self, domain: str, asin: str, marketplace_id: str) -> list[TrackMetadata]:
@@ -222,6 +225,68 @@ class AmazonMusicFetcher:
         Parse a /tracks/{ASIN} page.
         Amazon uses <music-detail-header label="SONG"> for the track hero section.
         """
+        # Try JSON-LD first — it reliably contains album name for single tracks
+        # via the MusicRecording @type with an inAlbum property.
+        jsonld_album = ""
+        jsonld_artist = ""
+        jsonld_title = ""
+        jsonld_img = ""
+        jsonld_isrc = ""
+        jsonld_release_date = ""
+        jsonld_duration_ms = None
+        try:
+            import json as _json
+            for script_content in re.findall(
+                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                html, re.DOTALL | re.IGNORECASE
+            ):
+                sc = script_content.strip()
+                if not sc:
+                    continue
+                try:
+                    jld = _json.loads(sc)
+                except Exception:
+                    continue
+                # Single track page: @type = MusicRecording
+                if jld.get("@type") == "MusicRecording":
+                    jsonld_title = jld.get("name", "")
+                    in_album = jld.get("inAlbum") or {}
+                    jsonld_album = in_album.get("name", "") if isinstance(in_album, dict) else ""
+                    by_artist = jld.get("byArtist") or {}
+                    jsonld_artist = by_artist.get("name", "") if isinstance(by_artist, dict) else ""
+                    jsonld_isrc = (jld.get("isrcCode") or "").strip()
+                    jsonld_release_date = (jld.get("datePublished") or "")[:10]
+                    img = jld.get("image")
+                    if isinstance(img, str):
+                        jsonld_img = img
+                    elif isinstance(img, list) and img:
+                        jsonld_img = img[0] if isinstance(img[0], str) else ""
+                    jsonld_duration_ms = _parse_iso_duration(jld.get("duration", ""))
+                    # Also try inAlbum image if the recording itself has no image
+                    if not jsonld_img and isinstance(in_album, dict):
+                        album_img = in_album.get("image")
+                        if isinstance(album_img, str):
+                            jsonld_img = album_img
+                        elif isinstance(album_img, list) and album_img:
+                            jsonld_img = album_img[0] if isinstance(album_img[0], str) else ""
+                    break
+        except Exception:
+            pass
+
+        # og:image is the most reliable artwork source for single track pages —
+        # Amazon always sets it to the album cover art.
+        og_image = ""
+        m_og = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        if not m_og:
+            m_og = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, re.IGNORECASE)
+        if m_og:
+            og_image = m_og.group(1).strip()
+
+        any_image = ""
+        m_any_image = re.search(r'image-src="([^"]+)"', html, re.IGNORECASE)
+        if m_any_image:
+            any_image = html_module.unescape(m_any_image.group(1)).strip()
+
         # The detail header for a track has label="SONG" (or "EXPLICIT SONG"),
         # headline = track title, primary-text = artist name,
         # secondary-text = album name.
@@ -230,26 +295,48 @@ class AmazonMusicFetcher:
             label = _get_dq('label', attrs).upper()
             if 'SONG' not in label and 'TRACK' not in label:
                 continue
-            title = _get_dq('headline', attrs)
-            artist = _get_dq('primary-text', attrs)
-            album = _get_dq('secondary-text', attrs)
-            img = _get_dq('image-src', attrs)
+            title = _get_dq('headline', attrs) or jsonld_title
+            artist = _get_dq('primary-text', attrs) or jsonld_artist
+            # Prefer JSON-LD album name — the header's secondary-text is often
+            # missing or truncated on single-track pages.
+            album = _get_dq('secondary-text', attrs) or jsonld_album
+            # Artwork priority: header image-src → any page image-src → og:image → JSON-LD image
+            img = _get_dq('image-src', attrs) or any_image or og_image or jsonld_img
             if not title:
                 continue
             return [TrackMetadata(
                 title=title,
                 artists=[artist] if artist else [],
                 album=album or "",
+                release_date=jsonld_release_date or None,
+                release_year=int(jsonld_release_date[:4]) if jsonld_release_date[:4].isdigit() else None,
+                duration_ms=jsonld_duration_ms or None,
+                isrc=jsonld_isrc or None,
                 artwork_url=img or None,
+                amazon_asin=None,
             )]
 
-        # Fallback: look for any music-detail-header with a headline (track title)
+        # Fallback: use JSON-LD data directly if header parsing failed
+        if jsonld_title:
+            return [TrackMetadata(
+                title=jsonld_title,
+                artists=[jsonld_artist] if jsonld_artist else [],
+                album=jsonld_album or "",
+                release_date=jsonld_release_date or None,
+                release_year=int(jsonld_release_date[:4]) if jsonld_release_date[:4].isdigit() else None,
+                duration_ms=jsonld_duration_ms or None,
+                isrc=jsonld_isrc or None,
+                artwork_url=any_image or og_image or jsonld_img or None,
+                amazon_asin=None,
+            )]
+
+        # Last resort: look for any music-detail-header with a headline (track title)
         for attrs in headers_raw:
             title = _get_dq('headline', attrs)
             artist = _get_dq('primary-text', attrs)
-            img = _get_dq('image-src', attrs)
+            img = _get_dq('image-src', attrs) or any_image or og_image or jsonld_img
             if title and artist:
-                return [TrackMetadata(title=title, artists=[artist], album="", artwork_url=img or None)]
+                return [TrackMetadata(title=title, artists=[artist], album="", artwork_url=img or None, amazon_asin=None)]
 
         return []
 
@@ -383,6 +470,14 @@ class AmazonMusicFetcher:
 
         _, artwork_url = self._extract_album_metadata(html)
 
+        # Also try JSON-LD image field (not always present on regional pages)
+        if not artwork_url:
+            jld_image = data.get("image")
+            if isinstance(jld_image, str) and jld_image.startswith("http"):
+                artwork_url = jld_image
+            elif isinstance(jld_image, list) and jld_image:
+                artwork_url = jld_image[0] if isinstance(jld_image[0], str) else None
+
         raw_tracks = data.get("track", [])
         if not raw_tracks:
             return []
@@ -468,15 +563,18 @@ class AmazonMusicFetcher:
         headers_raw = re.findall(r'<music-detail-header\b([^>]+)>', html, re.DOTALL)
         for attrs in headers_raw:
             label = _get_dq('label', attrs).upper()
-            if 'ALBUM' in label or 'EP' in label or 'PLAYLIST' in label:
+            # Match English and localised labels (Álbum, Album, EP, Playlist, etc.)
+            if any(kw in label for kw in ('ALBUM', 'ÁLBUM', 'EP', 'PLAYLIST', 'SINGLE')):
                 name = _get_dq('headline', attrs) or _get_dq('primary-text', attrs)
-                return name, _get_dq('image-src', attrs) or None
-        # Fallback: first detail header
-        if headers_raw:
-            name = _get_dq('headline', headers_raw[0]) or _get_dq('primary-text', headers_raw[0])
-            img = _get_dq('image-src', headers_raw[0])
-            if name:
-                return name, img or None
+                img = _get_dq('image-src', attrs) or None
+                if name or img:
+                    return name, img
+        # Fallback: first detail header that has either a name or image
+        for attrs in headers_raw:
+            name = _get_dq('headline', attrs) or _get_dq('primary-text', attrs)
+            img = _get_dq('image-src', attrs) or None
+            if name or img:
+                return name or "", img
         return "", None
 
     # ── Artist discography ────────────────────────────────────────────────────

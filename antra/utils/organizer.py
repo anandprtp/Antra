@@ -39,11 +39,18 @@ class LibraryOrganizer:
         root: str,
         full_albums: bool = False,
         folder_structure: str = "standard",
+        album_folder_structure: str = "",
+        playlist_folder_structure: str = "",
+        single_track_structure: str = "album_numbered",
         filename_format: str = "default",
     ):
         self.root = Path(root).resolve()
         self.full_albums = full_albums
-        self.folder_structure = folder_structure
+        legacy_structure = folder_structure or "standard"
+        self.folder_structure = legacy_structure
+        self.album_folder_structure = album_folder_structure or legacy_structure
+        self.playlist_folder_structure = playlist_folder_structure or legacy_structure
+        self.single_track_structure = single_track_structure or "album_numbered"
         self.filename_format = filename_format
         self.root.mkdir(parents=True, exist_ok=True)
         self.albums_root = self.root / "Albums"
@@ -63,14 +70,36 @@ class LibraryOrganizer:
         if track.playlist_name:
             playlist_dir = self._safe(track.playlist_name)
             track_number = track.playlist_position or track.track_number
-            filename = self._format_filename(track, track_number, is_playlist=True)
-            if self.folder_structure == "flat":
+            filename = self._format_filename(track, track_number, disc_number=1)
+            if self.playlist_folder_structure == "flat":
                 folder = self.root / playlist_dir
             else:
                 folder = self.playlists_root / playlist_dir
             folder.mkdir(parents=True, exist_ok=True)
             return str(folder / filename)
 
+        if (track.request_kind or "").lower() == "track":
+            return self._single_track_output_path(track)
+
+        folder = self._album_folder(track)
+        filename = self._format_filename(track, track.track_number)
+        folder.mkdir(parents=True, exist_ok=True)
+        return str(folder / filename)
+
+    def _single_track_output_path(self, track: TrackMetadata) -> str:
+        if self.single_track_structure == "file":
+            folder = self.root
+            filename = self._format_filename(track, None, disc_number=1)
+        else:
+            folder = self._album_folder(track)
+            if self.single_track_structure == "album_numbered":
+                filename = self._format_filename(track, 1, disc_number=1)
+            else:
+                filename = self._format_filename(track, None, disc_number=1)
+        folder.mkdir(parents=True, exist_ok=True)
+        return str(folder / filename)
+
+    def _album_folder(self, track: TrackMetadata) -> Path:
         # Use album-level artists for the folder name so joint albums
         # (e.g. "PARTYNEXTDOOR & Drake") land in one combined folder
         # instead of splitting by per-track artist.
@@ -84,24 +113,24 @@ class LibraryOrganizer:
         else:
             album_dir = album_part
 
-        filename = self._format_filename(track, track.track_number, is_playlist=False)
+        if self.album_folder_structure == "flat":
+            return self.root / album_dir
+        return self.albums_root / artist_dir / album_dir
 
-        if self.folder_structure == "flat":
-            folder = self.root / album_dir
-        else:
-            folder = self.albums_root / artist_dir / album_dir
-        folder.mkdir(parents=True, exist_ok=True)
-        return str(folder / filename)
-
-    def _format_filename(self, track: TrackMetadata, track_number: Optional[int], is_playlist: bool = False) -> str:
+    def _format_filename(
+        self,
+        track: TrackMetadata,
+        track_number: Optional[int],
+        *,
+        disc_number: Optional[int] = None,
+    ) -> str:
         """Build the filename stem according to self.filename_format."""
         title = self._safe(track.title)
         artist = self._safe(track.primary_artist)
 
-        # Disc number: playlists always use disc=1 (no multi-disc concept),
-        # albums use the actual disc number or default to 1.
-        # This produces 101/102/201/202 for albums and 101/102/... for playlists.
-        disc = track.disc_number or 1
+        # Albums use the actual disc number or default to 1. Playlists and
+        # single-track numbering pass an explicit override so they remain 101/102/...
+        disc = disc_number if disc_number is not None else (track.disc_number or 1)
 
         # title_only keeps its original behaviour (no number prefix at all,
         # except when the album is explicitly multi-disc to avoid collisions).
@@ -185,7 +214,7 @@ class LibraryOrganizer:
         return playlist_path
 
     def write_playlist_manifest(self, playlist_name: str, file_paths: list[str]) -> str:
-        manifest_root = self.root if self.folder_structure == "flat" else self.playlists_root
+        manifest_root = self.root if self.playlist_folder_structure == "flat" else self.playlists_root
         manifest_path = manifest_root / f"{self._safe(playlist_name)}.m3u"
         lines = ["#EXTM3U"]
         for file_path in file_paths:

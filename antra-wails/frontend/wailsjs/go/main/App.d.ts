@@ -44,6 +44,8 @@ export function PickAnalyzerFiles():Promise<Array<string>>;
 
 export function PickDirectory():Promise<string>;
 
+export function RequestAccessKey():Promise<main.KeyGenResult>;
+
 export function RetryTrackDownload(arg1:string):Promise<void>;
 
 export function SaveConfig(arg1:main.Config):Promise<void>;

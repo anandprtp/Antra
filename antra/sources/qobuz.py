@@ -163,7 +163,27 @@ class QobuzAdapter(BaseSourceAdapter):
             items = (resp.json().get("tracks") or {}).get("items", [])
             for item in items:
                 if item.get("isrc", "").upper() == (track.isrc or "").upper():
-                    return self._item_to_result(item, track, isrc_match=True)
+                    result = self._item_to_result(item, track, isrc_match=True)
+                    if result is None:
+                        continue
+                    # Sanity-check duration to catch Pt. 1 / Pt. 2 collisions
+                    duration_s = item.get("duration")
+                    if track.duration_ms and duration_s:
+                        from antra.utils.matching import duration_close
+                        if not duration_close(
+                            track.duration_ms / 1000,
+                            duration_s,
+                            tolerance=30,
+                        ):
+                            logger.info(
+                                "[Qobuz] ISRC match for '%s' rejected — "
+                                "duration mismatch (expected %.0fs, got %.0fs)",
+                                track.title,
+                                track.duration_ms / 1000,
+                                duration_s,
+                            )
+                            return None
+                    return result
         except Exception as e:
             logger.debug(f"[Qobuz] ISRC search failed: {e}")
         return None
@@ -251,6 +271,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 stream_id=str(item["id"]),
                 similarity_score=1.0 if isrc_match else 0.0,
                 isrc_match=isrc_match,
+                is_explicit=item.get("parental_warning") if isinstance(item.get("parental_warning"), bool) else None,
             )
         except Exception:
             return None

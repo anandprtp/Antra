@@ -32,12 +32,15 @@ type Config struct {
 	AmazonEnabled           bool     `json:"amazon_enabled"`
 	AmazonDirectCredsJSON   string   `json:"amazon_direct_creds_json,omitempty"`
 	AmazonWVDPath           string   `json:"amazon_wvd_path,omitempty"`
+	AmazonRegion            string   `json:"amazon_region,omitempty"`
 	QobuzEnabled            bool     `json:"qobuz_enabled"`
 	QobuzEmail              string   `json:"qobuz_email,omitempty"`
 	QobuzPassword           string   `json:"qobuz_password,omitempty"`
 	QobuzAppID              string   `json:"qobuz_app_id,omitempty"`
 	QobuzAppSecret          string   `json:"qobuz_app_secret,omitempty"`
 	QobuzUserAuthToken      string   `json:"qobuz_user_auth_token,omitempty"`
+	DeezerARLToken          string   `json:"deezer_arl_token,omitempty"`
+	DeezerBFSecret          string   `json:"deezer_bf_secret,omitempty"`
 	SoulseekEnabled         bool     `json:"soulseek_enabled"`
 	SoulseekUsername        string   `json:"soulseek_username,omitempty"`
 	SoulseekPassword        string   `json:"soulseek_password,omitempty"`
@@ -49,6 +52,9 @@ type Config struct {
 	LibraryMode             string   `json:"library_mode,omitempty"`
 	PreferExplicit          *bool    `json:"prefer_explicit,omitempty"`
 	FolderStructure         string   `json:"folder_structure,omitempty"`
+	AlbumFolderStructure    string   `json:"album_folder_structure,omitempty"`
+	PlaylistFolderStructure string   `json:"playlist_folder_structure,omitempty"`
+	SingleTrackStructure    string   `json:"single_track_structure,omitempty"`
 	FilenameFormat          string   `json:"filename_format,omitempty"`
 	SpotifySpDc             string   `json:"spotify_sp_dc,omitempty"`
 	TidalEnabled            bool     `json:"tidal_enabled"`
@@ -59,6 +65,7 @@ type Config struct {
 	TidalSessionID          string   `json:"tidal_session_id,omitempty"`
 	TidalTokenType          string   `json:"tidal_token_type,omitempty"`
 	TidalCountryCode        string   `json:"tidal_country_code,omitempty"`
+	AntraApiKey             string   `json:"antra_api_key,omitempty"`
 }
 
 type HistoryItem struct {
@@ -109,8 +116,13 @@ func (a *App) GetConfig() Config {
 		cfg.MaxRetries = 3
 		cfg.AppleStorefront = "us"
 		cfg.QobuzAppID = "285473059"
+		cfg.DeezerBFSecret = "g4el58wc0zvf9na1"
 		cfg.TidalAuthMode = "session_json"
 		cfg.TidalTokenType = "Bearer"
+		cfg.FolderStructure = "standard"
+		cfg.AlbumFolderStructure = "standard"
+		cfg.PlaylistFolderStructure = "standard"
+		cfg.SingleTrackStructure = "album_numbered"
 		return cfg
 	}
 
@@ -138,11 +150,26 @@ func (a *App) GetConfig() Config {
 	if cfg.QobuzAppID == "" {
 		cfg.QobuzAppID = "285473059"
 	}
+	if cfg.DeezerBFSecret == "" {
+		cfg.DeezerBFSecret = "g4el58wc0zvf9na1"
+	}
 	if cfg.TidalAuthMode == "" {
 		cfg.TidalAuthMode = "session_json"
 	}
 	if cfg.TidalTokenType == "" {
 		cfg.TidalTokenType = "Bearer"
+	}
+	if cfg.FolderStructure == "" {
+		cfg.FolderStructure = "standard"
+	}
+	if cfg.AlbumFolderStructure == "" {
+		cfg.AlbumFolderStructure = cfg.FolderStructure
+	}
+	if cfg.PlaylistFolderStructure == "" {
+		cfg.PlaylistFolderStructure = cfg.FolderStructure
+	}
+	if cfg.SingleTrackStructure == "" {
+		cfg.SingleTrackStructure = "album_numbered"
 	}
 	return cfg
 }
@@ -159,11 +186,26 @@ func (a *App) SaveConfig(cfg Config) error {
 	if cfg.QobuzAppID == "" {
 		cfg.QobuzAppID = "285473059"
 	}
+	if cfg.DeezerBFSecret == "" {
+		cfg.DeezerBFSecret = "g4el58wc0zvf9na1"
+	}
 	if cfg.TidalAuthMode == "" {
 		cfg.TidalAuthMode = "session_json"
 	}
 	if cfg.TidalTokenType == "" {
 		cfg.TidalTokenType = "Bearer"
+	}
+	if cfg.FolderStructure == "" {
+		cfg.FolderStructure = "standard"
+	}
+	if cfg.AlbumFolderStructure == "" {
+		cfg.AlbumFolderStructure = cfg.FolderStructure
+	}
+	if cfg.PlaylistFolderStructure == "" {
+		cfg.PlaylistFolderStructure = cfg.FolderStructure
+	}
+	if cfg.SingleTrackStructure == "" {
+		cfg.SingleTrackStructure = "album_numbered"
 	}
 	dir := getAppDataDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -1082,11 +1124,21 @@ type endpointManifestDab struct {
 	Stream []string `json:"stream"`
 }
 
+type endpointManifestMirrors struct {
+	Tidal  string `json:"tidal"`
+	Qobuz  string `json:"qobuz"`
+	Deezer string `json:"deezer"`
+	Amazon string `json:"amazon"`
+	Apple  string `json:"apple"`
+}
+
 type endpointManifest struct {
-	Hifi   []string            `json:"hifi"`
-	Amazon []string            `json:"amazon"`
-	Apple  []string            `json:"apple"`
-	Dab    endpointManifestDab `json:"dab"`
+	Hifi    []string                `json:"hifi"`
+	Amazon  []string                `json:"amazon"`
+	Apple   []string                `json:"apple"`
+	Dab     endpointManifestDab     `json:"dab"`
+	Mirrors endpointManifestMirrors `json:"mirrors"`
+	ApiKey  string                  `json:"api_key"`
 }
 
 func getEndpointManifestCachePaths() []string {
@@ -1293,20 +1345,43 @@ func normalizeURLList(urls []string) []string {
 func endpointsForHealthSource(manifest endpointManifest, source string) []string {
 	switch source {
 	case "hifi":
-		return append([]string{}, manifest.Hifi...)
+		eps := append([]string{}, manifest.Hifi...)
+		if manifest.Mirrors.Tidal != "" {
+			eps = append([]string{manifest.Mirrors.Tidal}, eps...)
+		}
+		return eps
 	case "amazon":
-		return append([]string{}, manifest.Amazon...)
+		eps := append([]string{}, manifest.Amazon...)
+		if manifest.Mirrors.Amazon != "" {
+			eps = append([]string{manifest.Mirrors.Amazon}, eps...)
+		}
+		return eps
 	case "apple":
-		return append([]string{}, manifest.Apple...)
+		eps := append([]string{}, manifest.Apple...)
+		if manifest.Mirrors.Apple != "" {
+			eps = append([]string{manifest.Mirrors.Apple}, eps...)
+		}
+		return eps
+	case "qobuz":
+		if manifest.Mirrors.Qobuz != "" {
+			return []string{manifest.Mirrors.Qobuz}
+		}
+		return nil
 	case "dab":
 		return append([]string{}, manifest.Dab.Search...)
+	case "deezer":
+		if manifest.Mirrors.Deezer != "" {
+			return []string{manifest.Mirrors.Deezer}
+		}
+		return nil
 	default:
 		return nil
 	}
 }
 
 // CheckSourceHealth probes all known endpoints for a given source ("hifi", "amazon",
-// "dab") in parallel and returns a JSON-encoded SourceHealthResult.
+// "apple", "qobuz", "deezer", "dab") in parallel and returns a JSON-encoded
+// SourceHealthResult.
 //
 // Health check URLs mirror the adapters' own liveness checks:
 // GetSlskdWebUIInfo returns the slskd web UI URL, username, and generated password
@@ -1347,7 +1422,8 @@ func getSlskdStatePath() string {
 }
 
 func probeHifiEndpoint(client *http.Client, base string) (bool, error) {
-	resp, err := client.Get(base + "/search/?s=test")
+	// Use the public health endpoint (GET /) — no API key needed
+	resp, err := client.Get(base + "/")
 	if err != nil {
 		return false, err
 	}
@@ -1390,7 +1466,7 @@ func (a *App) CheckSourceHealth(source string) string {
 			default:
 				var checkURL string
 				switch source {
-				case "amazon":
+				case "amazon", "apple", "qobuz", "deezer":
 					checkURL = base + "/"
 				case "dab":
 					checkURL = base + "/search?q=test"
@@ -1401,7 +1477,7 @@ func (a *App) CheckSourceHealth(source string) string {
 				if err == nil {
 					resp.Body.Close()
 					switch source {
-					case "amazon", "apple":
+					case "amazon", "apple", "qobuz", "deezer":
 						alive = resp.StatusCode == 200 || resp.StatusCode == 404
 					default:
 						alive = resp.StatusCode == 200
@@ -1435,4 +1511,88 @@ func (a *App) CheckSourceHealth(source string) string {
 	}
 	b, _ := json.Marshal(res)
 	return string(b)
+}
+
+// ── Self-serve key generation ─────────────────────────────────────────────────
+
+// KeyGenResult is returned by RequestAccessKey to the Svelte frontend.
+type KeyGenResult struct {
+	OK            bool   `json:"ok"`
+	Key           string `json:"key,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
+	DownloadLimit int    `json:"download_limit,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// RequestAccessKey calls the VPS key-generation endpoint, saves the returned
+// key into the local config, and returns the result to the frontend.
+//
+// The VPS URL is read from the endpoint manifest (mirrors.tidal field).
+// If the manifest is unavailable, the function returns an error.
+func (a *App) RequestAccessKey() KeyGenResult {
+	// 1. Load the manifest to discover the Tidal mirror URL.
+	manifest := loadEndpointManifest()
+	tidalURL := strings.TrimRight(manifest.Mirrors.Tidal, "/")
+	if tidalURL == "" {
+		return KeyGenResult{
+			OK:    false,
+			Error: "Could not reach Antra servers. Check your internet connection and try again.",
+		}
+	}
+
+	// 2. POST to the key-generation endpoint.
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(tidalURL+"/api/keys/generate", "application/json", nil)
+	if err != nil {
+		return KeyGenResult{
+			OK:    false,
+			Error: "Could not reach Antra servers. Check your internet connection and try again.",
+		}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == 429 {
+		// Rate-limited — parse the detail message from the VPS response.
+		var detail struct {
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal(body, &detail) == nil && detail.Detail != "" {
+			return KeyGenResult{OK: false, Error: detail.Detail}
+		}
+		return KeyGenResult{OK: false, Error: "You already have an active key. Try again in 24 hours."}
+	}
+
+	if resp.StatusCode != 200 {
+		return KeyGenResult{
+			OK:    false,
+			Error: fmt.Sprintf("Server returned an error (%d). Try again later.", resp.StatusCode),
+		}
+	}
+
+	// 3. Parse the response.
+	var result struct {
+		Key           string `json:"key"`
+		ExpiresAt     string `json:"expires_at"`
+		DownloadLimit int    `json:"download_limit"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil || result.Key == "" {
+		return KeyGenResult{OK: false, Error: "Unexpected response from server. Try again later."}
+	}
+
+	// 4. Save the key into the local config so it takes effect immediately.
+	cfg := a.GetConfig()
+	cfg.AntraApiKey = result.Key
+	if err := a.SaveConfig(cfg); err != nil {
+		wailsRuntime.LogErrorf(a.ctx, "RequestAccessKey: failed to save config: %v", err)
+		// Still return the key — user can paste it manually.
+	}
+
+	return KeyGenResult{
+		OK:            true,
+		Key:           result.Key,
+		ExpiresAt:     result.ExpiresAt,
+		DownloadLimit: result.DownloadLimit,
+	}
 }

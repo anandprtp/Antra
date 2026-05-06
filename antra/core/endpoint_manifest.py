@@ -5,15 +5,46 @@ The app ships with a single remote manifest URL that you control. That manifest
 publishes the current endpoint pools for the community-backed lossless sources
 so desktop users can follow endpoint changes without reinstalling the app.
 
-Schema:
+Schema (v2 — includes private mirror servers):
 {
   "hifi": ["https://..."],
   "amazon": ["https://...", "https://..."],
   "dab": {
     "search": ["https://..."],
     "stream": ["https://...", "https://..."]
+  },
+  "mirrors": {
+    "tidal":  "https://your-tidal-host.example",
+    "qobuz":  "https://your-qobuz-host.example",
+    "deezer": "https://your-deezer-host.example",
+    "amazon": "https://your-amazon-host.example",
+    "apple":  "https://your-apple-host.example"
   }
 }
+
+The "mirrors" block is optional. When present, the values override the
+corresponding TIDAL_MIRROR_URL / QOBUZ_MIRROR_URL / DEEZER_MIRROR_URL env vars
+(env vars take precedence if both are set).
+
+The manifest URL itself is set via ANTRA_ENDPOINT_MANIFEST_URL in .env.
+It can be any HTTPS endpoint you control — a Cloudflare Worker, a private
+server route, or a secret-path JSON file. The URL is never committed to source
+control and is only known to you.
+
+To serve your own manifest from your laptop server, add a static route to any
+of your FastAPI servers, e.g.:
+
+    @app.get("/manifest/your-secret-path")   # unguessable path = your secret
+    async def manifest():
+        return {
+            "mirrors": {
+                "tidal":  "https://your-tidal-host.example",
+                "qobuz":  "https://your-qobuz-host.example",
+                "deezer": "https://your-deezer-host.example"
+            }
+        }
+
+Then set: ANTRA_ENDPOINT_MANIFEST_URL=https://your-manifest-host.example/manifest/your-secret-path
 """
 from __future__ import annotations
 
@@ -21,7 +52,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +60,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# No built-in remote manifest is shipped anymore. Community download endpoints
-# are no longer auto-loaded by default; a manifest URL must be provided
-# explicitly via ANTRA_ENDPOINT_MANIFEST_URL if this loader is reused for
-# non-download experiments.
-DEFAULT_ENDPOINT_MANIFEST_URL = ""
+# Built-in fallback manifest URL. Users can still override this via
+# ANTRA_ENDPOINT_MANIFEST_URL or explicit mirror URL env vars.
+DEFAULT_ENDPOINT_MANIFEST_URL = "https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw"
 
 try:
     from platformdirs import user_data_dir
@@ -54,6 +83,14 @@ class EndpointManifest:
     apple: list[str]
     dab_search: list[str]
     dab_stream: list[str]
+    # Private mirror server URLs (optional — only present in your personal manifest)
+    mirror_tidal: str = ""
+    mirror_qobuz: str = ""
+    mirror_deezer: str = ""
+    mirror_amazon: str = ""
+    mirror_apple: str = ""
+    # API key for mirror servers (delivered alongside URLs so users need only one config value)
+    api_key: str = ""
 
     def health_endpoints(self, source: str) -> list[str]:
         if source == "hifi":
@@ -165,9 +202,18 @@ def _parse_manifest(payload: Any) -> EndpointManifest:
         dab_search = _normalize_url_list(dab.get("search"))
         dab_stream = _normalize_url_list(dab.get("stream"))
     else:
-        # Legacy fallback: treat `dab` as the search endpoint pool only.
         dab_search = _normalize_url_list(dab)
         dab_stream = []
+
+    # Parse optional private mirror block
+    mirrors = payload.get("mirrors") or {}
+    mirror_tidal  = (mirrors.get("tidal")  or "").strip().rstrip("/")
+    mirror_qobuz  = (mirrors.get("qobuz")  or "").strip().rstrip("/")
+    mirror_deezer = (mirrors.get("deezer") or "").strip().rstrip("/")
+    mirror_amazon = (mirrors.get("amazon") or "").strip().rstrip("/")
+    mirror_apple  = (mirrors.get("apple")  or "").strip().rstrip("/")
+    # API key delivered alongside mirror URLs
+    api_key = (payload.get("api_key") or "").strip()
 
     return EndpointManifest(
         hifi=_normalize_url_list(payload.get("hifi")),
@@ -175,6 +221,12 @@ def _parse_manifest(payload: Any) -> EndpointManifest:
         apple=_normalize_url_list(payload.get("apple")),
         dab_search=dab_search,
         dab_stream=dab_stream,
+        mirror_tidal=mirror_tidal,
+        mirror_qobuz=mirror_qobuz,
+        mirror_deezer=mirror_deezer,
+        mirror_amazon=mirror_amazon,
+        mirror_apple=mirror_apple,
+        api_key=api_key,
     )
 
 
@@ -207,6 +259,14 @@ def _write_cache(manifest: EndpointManifest) -> None:
                         "search": manifest.dab_search,
                         "stream": manifest.dab_stream,
                     },
+                    "mirrors": {
+                        "tidal":  manifest.mirror_tidal,
+                        "qobuz":  manifest.mirror_qobuz,
+                        "deezer": manifest.mirror_deezer,
+                        "amazon": manifest.mirror_amazon,
+                        "apple":  manifest.mirror_apple,
+                    },
+                    "api_key": manifest.api_key,
                 },
                 indent=2,
             ),

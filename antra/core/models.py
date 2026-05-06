@@ -29,6 +29,9 @@ class TrackMetadata:
     title: str
     artists: list[str]
     album: str
+    source_service: Optional[str] = None
+    source_rule: Optional[str] = None
+    request_kind: Optional[str] = None  # "track" | "album" | "playlist"
     playlist_name: Optional[str] = None
     playlist_owner: Optional[str] = None
     playlist_description: Optional[str] = None
@@ -45,6 +48,8 @@ class TrackMetadata:
     album_id: Optional[str] = None
     spotify_url: Optional[str] = None
     amazon_asin: Optional[str] = None  # Track ASIN when sourced from Amazon Music URL
+    apple_music_id: Optional[str] = None  # Apple Music catalog track ID, set when input is an Apple Music URL
+    deezer_track_id: Optional[str] = None  # Track ID when sourced from a Deezer URL
     upc: Optional[str] = None
     iswc: Optional[str] = None
     audio_traits: list[str] = field(default_factory=list)

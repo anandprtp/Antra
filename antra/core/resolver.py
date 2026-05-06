@@ -44,10 +44,13 @@ class SourceResolver:
     the first result that meets the acceptance threshold.
 
     Priority order (lower number = tried first):
+      1  — tidal_mirror  (self-hosted Tidal server — 24-bit HiRes FLAC)
+      1  — qobuz_mirror  (self-hosted Qobuz server — 24-bit FLAC)
       2  — Amazon    (community proxy — free lossless tier)
       2  — Apple     (community proxy — ALAC hi-res tier)
       2  — HiFi      (Tidal-backed hifi-api pool)
       2  — DAB       (community Qobuz proxy backend)
+      3  — deezer_mirror (self-hosted Deezer server — 16-bit FLAC fallback)
       3  — Soulseek  (P2P via slskd — optional)
       10 — Qobuz     (if configured, FLAC lossless)
       20 — Tidal     (direct account adapter, if configured)
@@ -157,11 +160,37 @@ class SourceResolver:
             if adapter.name not in excluded:
                 by_priority[adapter.priority].append(adapter)
 
-        lossy_preferred = self._is_lossy_preferred_mode()
+        lossy_preferred  = self._is_lossy_preferred_mode()
+        lossless16       = self._is_lossless16_mode()
         normal_ordered: list[BaseSourceAdapter] = []
         cooling_ordered: list[BaseSourceAdapter] = []
 
-        if lossy_preferred:
+        if lossless16:
+            # 16-bit mode: Deezer/deezer_mirror come before all other lossless sources
+            # so they are queried first — they always return 16-bit FLAC.
+            deezer_normal: list[BaseSourceAdapter] = []
+            other_normal: list[BaseSourceAdapter] = []
+            for priority in sorted(by_priority.keys()):
+                group = by_priority[priority]
+                normal = [
+                    a for a in group
+                    if not self._is_rate_limited(a.name) or getattr(a, "_premium_endpoints", None)
+                ]
+                cooling = [
+                    a for a in group
+                    if self._is_rate_limited(a.name) and not getattr(a, "_premium_endpoints", None)
+                ]
+                normal = self._rotate_tier(priority, "lossless16-normal", normal)
+                cooling = self._rotate_tier(priority, "lossless16-cooling", cooling)
+                for a in normal:
+                    if a.name in {"deezer", "deezer_mirror"}:
+                        deezer_normal.append(a)
+                    else:
+                        other_normal.append(a)
+                cooling_ordered.extend(cooling)
+            normal_ordered = deezer_normal + other_normal
+
+        elif lossy_preferred:
             # MP3 mode: split working adapters into lossy-first then lossless-fallback.
             # Each sub-list preserves priority ordering; within each priority tier,
             # adapters are still rotated for even load distribution.
@@ -208,17 +237,95 @@ class SourceResolver:
 
         return normal_ordered + cooling_ordered
 
+    @staticmethod
+    def _service_adapter_names(service: Optional[str]) -> set[str]:
+        mapping = {
+            "apple": {"apple"},
+            "deezer": {"deezer", "deezer_mirror"},
+            "amazon": {"amazon"},
+            "qobuz": {"qobuz", "qobuz_mirror", "dab"},
+            "tidal": {"tidal", "tidal_mirror", "hifi"},
+        }
+        return mapping.get((service or "").lower(), set())
+
+    def _adapter_matches_service(self, adapter: BaseSourceAdapter, service: Optional[str]) -> bool:
+        return adapter.name in self._service_adapter_names(service)
+
+    def _build_track_resolve_order(
+        self,
+        track: TrackMetadata,
+        excluded: set[str],
+    ) -> list[BaseSourceAdapter]:
+        base_order = self._build_resolve_order(excluded)
+        rule = (getattr(track, "source_rule", None) or "").lower()
+        service = getattr(track, "source_service", None)
+
+        if rule == "exclusive" and service:
+            allowed = self._service_adapter_names(service)
+            if (
+                (service or "").lower() == "amazon"
+                and self._is_lossy_preferred_mode()
+            ):
+                allowed = set(allowed) | {"youtube"}
+            return [adapter for adapter in base_order if adapter.name in allowed]
+
+        if rule == "prefer_hires" and service:
+            preferred = [adapter for adapter in base_order if self._adapter_matches_service(adapter, service)]
+            fallback = [adapter for adapter in base_order if not self._adapter_matches_service(adapter, service)]
+            return preferred + fallback
+
+        return base_order
+
+    def _should_skip_adapter_for_track(
+        self,
+        track: TrackMetadata,
+        adapter: BaseSourceAdapter,
+    ) -> bool:
+        if getattr(track, "amazon_asin", None):
+            if self._is_lossy_preferred_mode():
+                return adapter.name not in {"amazon", "youtube"}
+            if "amazon" in getattr(self, "_current_excluded_for_track", set()):
+                return True
+        if getattr(track, "amazon_asin", None) and "amazon" in getattr(self, "_current_excluded_for_track", set()):
+            if getattr(adapter, "always_lossy", False):
+                return True
+        if getattr(track, "amazon_asin", None) and adapter.name in {"jiosaavn", "netease", "youtube"}:
+            return True
+        # Deezer is reserved for Deezer URLs only — unless 16-bit mode is active,
+        # where Deezer is explicitly the preferred first-choice source for all tracks.
+        if adapter.name in {"deezer", "deezer_mirror"}:
+            if self._is_lossless16_mode():
+                return False
+            return (getattr(track, "source_service", None) or "").lower() != "deezer"
+        return False
+
+
+
     def _is_quality_aware_mode(self) -> bool:
-        return self.preferred_output_format in {"source", "flac", "lossless", "alac"}
+        return self.preferred_output_format in {"source", "flac", "lossless", "alac", "lossless-16", "lossless-24", "alac-16", "alac-24"}
 
     def _is_lossless_only_mode(self) -> bool:
-        return self.preferred_output_format in {"flac", "lossless", "alac"}
+        return self.preferred_output_format in {"flac", "lossless", "alac", "lossless-16", "lossless-24", "alac-16", "alac-24"}
 
     def _is_lossy_preferred_mode(self) -> bool:
         return self.preferred_output_format in {"mp3", "aac", "m4a"}
 
+    def _is_lossless16_mode(self) -> bool:
+        return self.preferred_output_format in {"lossless-16", "alac-16"}
+
     def _quality_tier(self, result: SearchResult) -> int:
-        if self.preferred_output_format in {"source", "flac", "lossless"}:
+        if self.preferred_output_format in {"source", "flac", "lossless", "lossless-16", "lossless-24", "alac-16", "alac-24"}:
+            # In 16-bit mode, 16-bit lossless is the ideal tier — rank it highest.
+            # 24-bit results are still lossless but exceed the requested quality,
+            # so they rank below 16-bit (we prefer not to download more than needed).
+            if self._is_lossless16_mode():
+                if result.is_lossless and result.bit_depth == 16:
+                    return 5  # ideal: exactly 16-bit lossless
+                if result.is_lossless and (result.bit_depth or 0) >= 24:
+                    return 3  # over-spec: 24-bit when 16-bit was requested
+                if result.is_lossless:
+                    return 2  # lossless, unknown bit depth
+                return 0      # lossy — rejected in lossless-only mode
             if result.is_lossless and (result.bit_depth or 0) >= 24 and (result.sample_rate_hz or 0) >= 96000:
                 return 5
             if result.is_lossless and (result.bit_depth or 0) >= 24:
@@ -241,23 +348,38 @@ class SourceResolver:
         """
         Sort key for comparing lossless results across adapters.
         Priority (highest first):
-          1. bit_depth (24 > 16 > None)
-          2. sample_rate_hz (96000 > 48000 > 44100 > None)
-          3. quality_kbps (higher is better)
-          4. isrc_match (exact match preferred)
-          5. similarity_score (adjusted for explicit preference)
-          6. adapter priority (lower number = higher priority, so negate)
+          1. quality_tier — in 16-bit mode, 16-bit lossless ranks above 24-bit;
+             in all other modes, higher bit_depth ranks higher.
+          2. source_match: adapter matches track's source service (e.g. Apple URL → apple adapter wins)
+          3. adapter priority (lower number = higher priority, so negate)
+          4. sample_rate_hz
+          5. quality_kbps
+          6. isrc_match
+          7. similarity_score
         """
         similarity = result.similarity_score
         if track is not None:
             similarity += self._explicit_penalty(track, result)
+        # Boost the adapter that matches the track's source service so that
+        # e.g. an Apple Music URL always downloads via Apple (not QobuzMirror).
+        source_match = int(
+            track is not None
+            and (getattr(track, "source_service", None) or "").lower() == adapter.name
+        )
+        # In 16-bit mode use quality_tier (which ranks 16-bit highest) instead of
+        # raw bit_depth (which would always rank 24-bit above 16-bit).
+        if self._is_lossless16_mode():
+            quality_rank = self._quality_tier(result)
+        else:
+            quality_rank = result.bit_depth or 0
         return (
-            result.bit_depth or 0,
+            quality_rank,
+            source_match,
+            -adapter.priority,
             result.sample_rate_hz or 0,
             result.quality_kbps or 0,
             1 if result.isrc_match else 0,
             similarity,
-            -adapter.priority,
         )
 
     def _explicit_penalty(
@@ -274,10 +396,22 @@ class SourceResolver:
           -0.20  result title contains "radio edit", "clean version", etc. but
                  the original track title does NOT (so the tag is not intentional)
            0.00  everything else (unknown explicit status → neutral)
-        """
-        if not self.prefer_explicit or not track.is_explicit:
-            return 0.0
 
+        Note: track.is_explicit=False from Apple Music clean editions is treated
+        as unknown (None) — Apple Music US may only carry the clean version while
+        Qobuz/Tidal have the explicit one. Only skip the penalty when the track
+        is genuinely confirmed non-explicit (e.g. from Spotify which carries both
+        versions and explicitly marks them).
+        """
+        if not self.prefer_explicit:
+            return 0.0
+        # track.is_explicit=False from Apple Music just means that storefront's
+        # listing is clean — treat it as unknown so we still prefer explicit results.
+        # track.is_explicit=None means we don't know → still prefer explicit.
+        # Only skip entirely when track.is_explicit is confirmed True (explicit).
+        # Actually: apply penalty to clean *results* whenever prefer_explicit is on,
+        # regardless of what the source metadata says about the track itself.
+        # This way, if Qobuz has both clean and explicit, explicit always wins.
         if result.is_explicit is False:
             return -0.20
 
@@ -306,7 +440,8 @@ class SourceResolver:
             # Biases final candidate selection toward hi-res when multiple adapters
             # return results — e.g. prefer a 24-bit Amazon result over a 16-bit HiFi
             # result with an identical similarity score.
-            if self._track_wants_hires(track) and self._quality_tier(result) >= 4:
+            # Skip this bonus in 16-bit mode — we explicitly want 16-bit, not hi-res.
+            if not self._is_lossless16_mode() and self._track_wants_hires(track) and self._quality_tier(result) >= 4:
                 similarity += 0.05
         return (
             float(self._quality_tier(result)),
@@ -336,8 +471,8 @@ class SourceResolver:
 
     def _result_looks_clean(self, track: TrackMetadata, result: SearchResult) -> bool:
         """Return True if the result appears to be a clean/edited version while
-        the target track is known to be explicit."""
-        if not self.prefer_explicit or not track.is_explicit:
+        prefer_explicit is on."""
+        if not self.prefer_explicit:
             return False
         if result.is_explicit is False:
             return True
@@ -369,6 +504,10 @@ class SourceResolver:
             meets_threshold = self._meets_quality_aware_threshold(result, adapter)
             if not meets_threshold:
                 return False
+            # In 16-bit mode, accept immediately once we have a 16-bit lossless result
+            # (tier 5 in lossless16 mode). No need to keep searching for 24-bit sources.
+            if self._is_lossless16_mode():
+                return self._quality_tier(result) >= 5
             # Only accept immediately if it is hi-res lossless, otherwise keep
             # searching to see if a higher priority or other adapter has hi-res.
             is_hires = self._quality_tier(result) >= 4
@@ -401,8 +540,53 @@ class SourceResolver:
 
         In default (source) mode:
           - Returns the first result that meets ACCEPT_THRESHOLD.
+
+        Special case — Amazon-sourced tracks (track.amazon_asin is set):
+          Only the Amazon adapter is tried. Text search on Tidal/Qobuz would find
+          wrong recordings for common song titles (e.g. "Let It Snow" → Dean Martin
+          instead of the original artist). Amazon has the exact ASIN so it's the
+          only reliable source.
         """
         excluded = excluded_adapters or set()
+        self._current_excluded_for_track = set(excluded)
+
+        # Amazon-sourced tracks: prefer Amazon adapter first (has exact ASIN).
+        # If Amazon fails AND the track has an ISRC, allow fallback to Tidal/Qobuz
+        # (ISRC matching is reliable). Without ISRC, skip text search fallback
+        # because common song titles (e.g. "Let It Snow") will match wrong artists.
+        if getattr(track, "amazon_asin", None) and "amazon" not in excluded:
+            amazon_adapter = next(
+                (a for a in self.adapters if a.name == "amazon" and a.name not in excluded),
+                None,
+            )
+            if amazon_adapter:
+                try:
+                    result = amazon_adapter.search(track)
+                except Exception:
+                    result = None
+                if result:
+                    return result, amazon_adapter
+            # Amazon failed — fall through to ISRC-based search on other adapters
+            # only if the track has an ISRC (reliable match). Without ISRC, give up
+            # to avoid wrong-artist text search matches.
+            if not getattr(track, "isrc", None) and not self._is_lossy_preferred_mode():
+                logger.debug(
+                    "[Resolver] Amazon-sourced track '%s' has no ISRC and Amazon failed — "
+                    "skipping text search fallback to avoid wrong-artist matches",
+                    track.title,
+                )
+                return None
+            if self._is_lossy_preferred_mode():
+                logger.debug(
+                    "[Resolver] Amazon-sourced track '%s' — Amazon failed, trying strict YouTube fallback",
+                    track.title,
+                )
+            else:
+                logger.debug(
+                    "[Resolver] Amazon-sourced track '%s' — Amazon failed, trying ISRC fallback",
+                    track.title,
+                )
+
         best_result: Optional[SearchResult] = None
         best_adapter: Optional[BaseSourceAdapter] = None
         candidates: list[tuple[SearchResult, BaseSourceAdapter]] = []
@@ -411,9 +595,17 @@ class SourceResolver:
         # to pick the highest bit_depth/sample_rate result after querying everyone.
         lossless_candidates: list[tuple[SearchResult, BaseSourceAdapter]] = []
 
-        resolve_order = self._build_resolve_order(excluded)
+        resolve_order = self._build_track_resolve_order(track, excluded)
 
         for adapter in resolve_order:
+            if self._should_skip_adapter_for_track(track, adapter):
+                logger.debug(
+                    "[Resolver] Skipping %s for '%s' — filtered by source-specific rule",
+                    adapter.name,
+                    track.title,
+                )
+                continue
+
             # HiFi throttle check — only defer to Amazon if Amazon hasn't already
             # been tried and failed. If Amazon is excluded (failed), we come back
             # to HiFi even when throttled — it's still lossless and better than
@@ -467,6 +659,9 @@ class SourceResolver:
             # ── Quality-aware (lossless) mode ──────────────────────────────────
             # Collect ALL lossless results from all adapters, then pick the best
             # by bit_depth → sample_rate_hz at the end. Never stop early.
+            # Exception: in lossless-16 mode, stop as soon as Deezer finds the
+            # track — it always returns 16-bit FLAC and there's no need to also
+            # query the 24-bit sources.
             if self._is_quality_aware_mode():
                 is_lossy_adapter = getattr(adapter, "always_lossy", False)
 
@@ -478,7 +673,10 @@ class SourceResolver:
                             f"'{result.title}' {result.bit_depth or '?'}bit/"
                             f"{result.sample_rate_hz or '?'}Hz ({result.quality_label})"
                         )
-                    # Keep going — don't return yet, query remaining adapters
+                        if self._is_lossless16_mode() and adapter.name in {"deezer", "deezer_mirror"}:
+                            logger.info("[Resolver] 16-bit mode: Deezer found the track — skipping 24-bit sources")
+                            break
+                    # Keep going — collect all lossless candidates, pick best after
                     continue
 
                 # Lossy result in quality-aware mode — record as fallback but keep going
@@ -486,11 +684,13 @@ class SourceResolver:
 
             # ── Lossy-preferred mode (mp3/aac) ────────────────────────────────
             if self._is_lossy_preferred_mode():
-                if getattr(adapter, "always_lossy", False):
-                    # This is a native lossy source — accept it if score is good enough
-                    if result.isrc_match:
+                if not result.is_lossless:
+                    # Native lossy result — accept it if score is good enough, even when
+                    # the adapter can also return lossless on other tracks (e.g. Amazon).
+                    if result.isrc_match and self._meets_quality_aware_threshold(result, adapter):
                         return result, adapter
-                    if result.similarity_score >= LOSSY_ACCEPT_THRESHOLD:
+                    threshold = YOUTUBE_ACCEPT_THRESHOLD if adapter.name == "youtube" else LOSSY_ACCEPT_THRESHOLD
+                    if result.similarity_score >= threshold:
                         return result, adapter
                 # Lossless adapter in lossy mode — record as fallback but keep
                 # trying lossy sources first. Don't accept it here.
@@ -572,7 +772,7 @@ class SourceResolver:
             if self._is_lossy_preferred_mode():
                 lossy_candidates = [
                     (r, a) for r, a in candidates
-                    if getattr(a, "always_lossy", False)
+                    if not r.is_lossless
                     and self._meets_quality_aware_threshold(r, a)
                 ]
                 if lossy_candidates:
@@ -619,13 +819,19 @@ class SourceResolver:
                 return accepted_result, accepted_adapter
 
         if best_result and best_adapter:
+            if best_adapter.name == "youtube" and not self._meets_quality_aware_threshold(best_result, best_adapter):
+                logger.info(
+                    "[Resolver] Best YouTube match for '%s' stayed below strict threshold — failing cleanly",
+                    track.title,
+                )
+                return None
             # In lossy-preferred mode: if the best result is a low-confidence lossy
             # source, prefer a lossless fallback (engine will transcode) over a
             # potentially wrong track from a noisy lossy source.
-            if self._is_lossy_preferred_mode() and getattr(best_adapter, "always_lossy", False):
+            if self._is_lossy_preferred_mode() and not best_result.is_lossless:
                 lossless_fallback = [
                     (r, a) for r, a in candidates
-                    if not getattr(a, "always_lossy", False)
+                    if r.is_lossless
                 ]
                 if lossless_fallback:
                     best_lf, best_lf_adapter = max(

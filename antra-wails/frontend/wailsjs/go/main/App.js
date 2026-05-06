@@ -86,6 +86,10 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
+export function RequestAccessKey() {
+  return window['go']['main']['App']['RequestAccessKey']();
+}
+
 export function RetryTrackDownload(arg1) {
   return window['go']['main']['App']['RetryTrackDownload'](arg1);
 }

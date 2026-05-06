@@ -1823,12 +1823,47 @@ def _run_apple_browser_login(cfg, config_path: str | None) -> None:
                     "apple_storefront": storefront,
                 }))
 
+                # Push tokens to VPS mirror if configured
+                vps_message = "Apple Music session captured and saved."
+                vps_ok = False
+                try:
+                    from antra.core.endpoint_manifest import load_endpoint_manifest
+                    manifest = load_endpoint_manifest()
+                    mirror_apple = manifest.mirror_apple
+                    api_key = cfg.antra_api_key or manifest.api_key
+
+                    if mirror_apple and api_key:
+                        import requests as _req
+                        resp = _req.post(
+                            f"{mirror_apple}/api/refresh-token",
+                            json={
+                                "authorization": captured["authorization"],
+                                "media_user_token": captured["music_user_token"],
+                                "storefront": storefront,
+                                "account": 1,
+                            },
+                            headers={"X-Api-Key": api_key},
+                            timeout=10,
+                        )
+                        if resp.status_code == 200:
+                            vps_ok = True
+                            vps_message = "Token captured and pushed to VPS server."
+                        else:
+                            vps_message = f"Token captured locally. VPS push failed ({resp.status_code}) — update manually."
+                    elif mirror_apple:
+                        vps_message = "Token captured locally. No API key set — VPS push skipped."
+                    else:
+                        vps_message = "Token captured and saved locally."
+                except Exception as _vps_err:
+                    vps_message = f"Token captured locally. VPS push error: {_vps_err}"
+
                 print(json.dumps({
                     "type": "apple_login_success",
                     "authorization_token": captured["authorization"],
                     "music_user_token": captured["music_user_token"],
                     "storefront": storefront,
-                    "message": "Apple Music session captured and saved automatically.",
+                    "vps_ok": vps_ok,
+                    "message": vps_message,
                 }), flush=True)
             finally:
                 await session.stop()
@@ -1913,7 +1948,12 @@ def _run_amazon_browser_login(cfg, config_path):
             "message": "Opening your browser for Amazon Music login...",
         }), flush=True)
 
-        launch_state = _launch_debug_browser_process("Amazon Music", "https://music.amazon.com/")
+        # Use the configured regional storefront URL
+        from antra.sources.amazon import _DirectAmazonClient
+        region = (getattr(cfg, "amazon_region", "us") or "us").strip().lower()
+        start_url = _DirectAmazonClient._STOREFRONT_URLS.get(region, "https://music.amazon.com/")
+
+        launch_state = _launch_debug_browser_process("Amazon Music", start_url)
         port = int(launch_state["debug_port"])
         browser_spec = launch_state["spec"]
         captured = {}
@@ -1992,7 +2032,7 @@ def _run_amazon_browser_login(cfg, config_path):
                     if attempt in (0, 2, 5, 10, 20, 35):
                         try:
                             sid = await _cdp_find_music_tab(session, port, "music.amazon.com", timeout=2.0)
-                            await _cdp_navigate(session, sid, "https://music.amazon.com/home")
+                            await _cdp_navigate(session, sid, start_url + "home")
                         except Exception:
                             pass
                     await _asyncio.sleep(1)
@@ -2029,8 +2069,9 @@ def _run_amazon_browser_login(cfg, config_path):
 
                 try:
                     sid = await _cdp_find_music_tab(session, port, "music.amazon.com", timeout=5.0)
-                    cookies = await _cdp_get_cookies(session, sid,
-                        ["https://music.amazon.com", "https://www.amazon.com", "https://amazon.com"])
+                    # Collect cookies from both the regional domain and the base amazon.com
+                    cookie_urls = [start_url.rstrip("/"), "https://www.amazon.com", "https://amazon.com"]
+                    cookies = await _cdp_get_cookies(session, sid, cookie_urls)
                     cookie_string = _build_amazon_cookie_string_from_context(cookies)
                 except Exception:
                     cookie_string = ""
@@ -2326,6 +2367,11 @@ def main():
             if settings.get("qobuz_user_auth_token") is not None:
                 os.environ["QOBUZ_USER_AUTH_TOKEN"] = str(settings.get("qobuz_user_auth_token") or "")
 
+            if settings.get("deezer_arl_token") is not None:
+                os.environ["DEEZER_ARL_TOKEN"] = str(settings.get("deezer_arl_token") or "")
+            if settings.get("deezer_bf_secret") is not None:
+                os.environ["DEEZER_BF_SECRET"] = str(settings.get("deezer_bf_secret") or "g4el58wc0zvf9na1")
+
             if "tidal_enabled" in settings:
                 os.environ["TIDAL_ENABLED"] = "true" if settings["tidal_enabled"] else "false"
             if settings.get("tidal_auth_mode") is not None:
@@ -2383,10 +2429,17 @@ def main():
             # load_dotenv's override=True (which runs at import time) cannot leave a
             # stale value from a .env file if the config key is absent.
             os.environ["FOLDER_STRUCTURE"] = settings.get("folder_structure") or "standard"
+            os.environ["ALBUM_FOLDER_STRUCTURE"] = settings.get("album_folder_structure") or settings.get("folder_structure") or "standard"
+            os.environ["PLAYLIST_FOLDER_STRUCTURE"] = settings.get("playlist_folder_structure") or settings.get("folder_structure") or "standard"
+            os.environ["SINGLE_TRACK_STRUCTURE"] = settings.get("single_track_structure") or "album_numbered"
             os.environ["FILENAME_FORMAT"] = settings.get("filename_format") or "default"
 
             if "prefer_explicit" in settings:
                 os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
+
+            # API key for self-hosted mirror servers
+            if settings.get("antra_api_key") is not None:
+                os.environ["ANTRA_API_KEY"] = str(settings.get("antra_api_key") or "")
 
 
         except Exception as e:
@@ -2415,7 +2468,7 @@ def main():
         _run_amazon_browser_login(cfg, args.config)
         sys.exit(0)
 
-    print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Folder structure: {cfg.folder_structure}"}))
+    print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Album layout: {getattr(cfg, 'album_folder_structure', cfg.folder_structure)} | Playlist layout: {getattr(cfg, 'playlist_folder_structure', cfg.folder_structure)} | Single layout: {getattr(cfg, 'single_track_structure', 'album_numbered')} | Output format: {cfg.output_format}"}))
 
     service = AntraService(cfg)
     options = RuntimeOptions(
@@ -2430,6 +2483,9 @@ def main():
                 cfg.output_dir,
                 full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
                 folder_structure=getattr(cfg, "folder_structure", "standard"),
+                album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
             )
         except Exception as e:
@@ -2470,6 +2526,9 @@ def main():
             cfg.output_dir,
             full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
             folder_structure=getattr(cfg, "folder_structure", "standard"),
+            album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
             filename_format=getattr(cfg, "filename_format", "default"),
         )
     except Exception as e:

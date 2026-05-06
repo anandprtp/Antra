@@ -173,10 +173,25 @@ class Config:
     #                    track to exist in multiple album folders (e.g. studio album + Best Of)
     library_mode: str = "smart_dedup"
 
-    # Folder structure layout:
-    #   "standard" — Artist / Album (Year) / files  (default, Navidrome/Jellyfin/Plex compatible)
-    #   "flat"     — Album (Year) / files  (no artist wrapper, simpler manual organisation)
+    # Legacy folder structure layout retained for backward compatibility.
+    # New installs should use the more specific per-content settings below.
     folder_structure: str = "standard"
+
+    # Album folder layout:
+    #   "standard" — Albums / Artist / Album (Year) / files
+    #   "flat"     — Albums / Album (Year) / files
+    album_folder_structure: str = "standard"
+
+    # Playlist folder layout:
+    #   "standard" — Playlists / Playlist Name / files
+    #   "flat"     — <root> / Playlist Name / files
+    playlist_folder_structure: str = "standard"
+
+    # Single-track layout:
+    #   "album_numbered" — store under the album folder as 101 - Title (default)
+    #   "album"          — store under the album folder without forced numbering
+    #   "file"           — store as a standalone file in the library root
+    single_track_structure: str = "album_numbered"
 
     # Filename format for downloaded tracks:
     #   "default"      — NN - Title  (track-number prefix, current behaviour)
@@ -205,6 +220,28 @@ class Config:
     apple_storefront: str = "us"
     apple_wvd_path: str = ""
 
+    # ── Self-hosted mirror servers (API-Mirrors on laptop) ────────────────────
+    # Set these to your Cloudflare Tunnel URLs (or http://localhost:PORT for local).
+    # Leave blank to disable the mirror adapter.
+    #
+    # Tidal mirror  — 24-bit HiRes FLAC, priority 1 (highest)
+    # Requires per-session SOCKS5 proxies in tidal_api/sessions/proxies.json
+    # because Tidal API rejects Indian IPs.
+    tidal_mirror_url: str = ""
+
+    # Qobuz mirror  — 24-bit FLAC, priority 1
+    # WARNING: Qobuz bans automated API access since Oct 2025. Use at own risk.
+    qobuz_mirror_url: str = ""
+
+    # Deezer mirror — 16-bit FLAC, priority 3 (fallback after 24-bit sources)
+    # No IP restriction — works from India without proxy.
+    deezer_mirror_url: str = ""
+
+    # API key for mirror servers.
+    # Normally delivered automatically via the manifest — users don't set this directly.
+    # Override with ANTRA_API_KEY if you want to bypass the manifest for testing.
+    antra_api_key: str = ""
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -224,6 +261,7 @@ def load_config() -> Config:
         qobuz_app_secret=os.getenv("QOBUZ_APP_SECRET", ""),
         qobuz_user_auth_token=os.getenv("QOBUZ_USER_AUTH_TOKEN", ""),
         deezer_arl_token=os.getenv("DEEZER_ARL_TOKEN", ""),
+        deezer_bf_secret=os.getenv("DEEZER_BF_SECRET", "g4el58wc0zvf9na1"),
         tidal_email=os.getenv("TIDAL_EMAIL", ""),
         tidal_password=os.getenv("TIDAL_PASSWORD", ""),
         tidal_enabled=os.getenv("TIDAL_ENABLED", "false").lower() == "true",
@@ -275,6 +313,9 @@ def load_config() -> Config:
         prefer_explicit=os.getenv("PREFER_EXPLICIT", "true").lower() == "true",
         library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
+        album_folder_structure=os.getenv("ALBUM_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
+        playlist_folder_structure=os.getenv("PLAYLIST_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
+        single_track_structure=os.getenv("SINGLE_TRACK_STRUCTURE", "album_numbered"),
         filename_format=os.getenv("FILENAME_FORMAT", "default"),
         amazon_direct_creds_json=os.getenv("AMAZON_DIRECT_CREDS_JSON", ""),
         amazon_wvd_path=os.getenv("AMAZON_WVD_PATH", ""),
@@ -282,5 +323,9 @@ def load_config() -> Config:
         apple_music_user_token=os.getenv("APPLE_MUSIC_USER_TOKEN", ""),
         apple_storefront=os.getenv("APPLE_STOREFRONT", "us"),
         apple_wvd_path=os.getenv("APPLE_WVD_PATH", ""),
+        tidal_mirror_url=os.getenv("TIDAL_MIRROR_URL", ""),
+        qobuz_mirror_url=os.getenv("QOBUZ_MIRROR_URL", ""),
+        deezer_mirror_url=os.getenv("DEEZER_MIRROR_URL", ""),
+        antra_api_key=os.getenv("ANTRA_API_KEY", ""),
     )
     return cfg

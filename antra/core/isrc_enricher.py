@@ -48,8 +48,9 @@ class ISRCEnricher:
         return r.json().get("accessToken")
 
     def enrich_tracks(self, tracks: list[TrackMetadata], max_workers=2):
-        if not self.token:
-            self.token = self._get_anonymous_token()
+        # Always get a fresh token — never reuse one that may be rate-limited
+        # from a previous call in the same process.
+        self.token = self._get_anonymous_token()
 
         # Build map
         id_to_track = {t.spotify_id: t for t in tracks if t.spotify_id}
@@ -79,9 +80,15 @@ class ISRCEnricher:
                     return []
                 if r.status_code == 429:
                     if attempt <= 3:
-                        wait = 2 ** attempt  # 2s, 4s, 8s
-                        logger.warning(f"[ISRCEnricher] Rate limited (429), attempt {attempt}/3. Retrying in {wait}s...")
+                        # Honor Retry-After but cap at 5s — if Spotify wants us to
+                        # wait 46s, the anonymous token pool is exhausted. Skip rather
+                        # than block the download queue for 100+ seconds.
+                        retry_after = int(r.headers.get("Retry-After", 2 ** attempt))
+                        wait = min(retry_after, 5)
+                        logger.warning(f"[ISRCEnricher] Rate limited (429), attempt {attempt}/3. Waiting {wait}s then rotating to fresh token...")
                         time.sleep(wait)
+                        # Regenerate — retrying with the same token always re-hits the limit.
+                        self.token = self._get_anonymous_token()
                         return fetch_batch(batch_ids, attempt + 1)
                     logger.warning("[ISRCEnricher] Rate limited (429) after 3 retries. Skipping batch.")
                     return []

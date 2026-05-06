@@ -20,6 +20,23 @@ from antra.sources.odesli import OdesliEnricher
 logger = logging.getLogger(__name__)
 
 
+def _humanize_amazon_error(message: str) -> str:
+    text = (message or "").strip()
+    lowered = text.lower()
+    if "contentnotavailable" in lowered:
+        return "[Amazon] This track is not available from the current Amazon marketplace/account."
+    if "no cenc samples found" in lowered or "decryption failed" in lowered:
+        return "[Amazon] Amazon returned an unreadable protected audio stream for this track."
+    if "token expired or geo-restricted" in lowered:
+        return "[Amazon] Amazon could not serve this track right now (token expired or region restricted)."
+    if text.startswith("[Amazon] All mirrors failed. Last error: "):
+        inner = text.split("Last error:", 1)[1].strip()
+        humanized_inner = _humanize_amazon_error(inner)
+        if humanized_inner != inner:
+            return humanized_inner
+    return text
+
+
 class _DirectAmazonClient:
     """
     Direct Amazon Music DMLS/Widevine client — no proxy server needed.
@@ -28,8 +45,61 @@ class _DirectAmazonClient:
     csrf_ts, customer_id, device_id, session_id, wvd_path}
     """
 
+    # Amazon marketplace IDs by country code.
+    # Used when marketplace_id is not stored in the credentials JSON.
+    _MARKETPLACE_IDS = {
+        "us": ("ATVPDKIKX0DER", "US"),
+        "br": ("A2Q3Y263D00KWC", "BR"),
+        "ca": ("A2EUQ1WTGCTBG2", "CA"),
+        "mx": ("A1AM78C64UM0Y8", "MX"),
+        "gb": ("A1F83G8C2ARO7P", "GB"),
+        "de": ("A1PA6795UKMFR9", "DE"),
+        "fr": ("A13V1IB3VIYZZH", "FR"),
+        "it": ("APJ6JRA9NG5V4",  "IT"),
+        "es": ("A1RKKUPIHCS9HS", "ES"),
+        "jp": ("A1VC38T7YXB528", "JP"),
+        "au": ("A39IBJ37TRP1C6", "AU"),
+        "in": ("A21TJRUUN4KGV",  "IN"),
+    }
+
+    # Amazon Music regional storefront URLs by country code.
+    _STOREFRONT_URLS = {
+        "us": "https://music.amazon.com/",
+        "br": "https://music.amazon.com.br/",
+        "ca": "https://music.amazon.ca/",
+        "mx": "https://music.amazon.com.mx/",
+        "gb": "https://music.amazon.co.uk/",
+        "de": "https://music.amazon.de/",
+        "fr": "https://music.amazon.fr/",
+        "it": "https://music.amazon.it/",
+        "es": "https://music.amazon.es/",
+        "jp": "https://music.amazon.co.jp/",
+        "au": "https://music.amazon.com.au/",
+        "in": "https://music.amazon.in/",
+    }
     _DMLS_URL = "https://music.amazon.com/NA/api/dmls/"
-    _INVALID_ESCAPE_RE = re.compile(r'\\([^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))')
+
+    # Regional DMLS API endpoints. The path segment reflects Amazon's internal
+    # region grouping, not the country code directly.
+    _DMLS_URLS = {
+        "us": "https://music.amazon.com/NA/api/dmls/",
+        "ca": "https://music.amazon.com/NA/api/dmls/",
+        "mx": "https://music.amazon.com/NA/api/dmls/",
+        "br": "https://music.amazon.com.br/NA/api/dmls/",
+        "gb": "https://music.amazon.co.uk/EU/api/dmls/",
+        "de": "https://music.amazon.de/EU/api/dmls/",
+        "fr": "https://music.amazon.fr/EU/api/dmls/",
+        "it": "https://music.amazon.it/EU/api/dmls/",
+        "es": "https://music.amazon.es/EU/api/dmls/",
+        "jp": "https://music.amazon.co.jp/FE/api/dmls/",
+        "au": "https://music.amazon.com.au/FE/api/dmls/",
+        "in": "https://music.amazon.in/IN/api/dmls/",
+    }
+
+    def _get_dmls_url(self) -> str:
+        """Return the correct regional DMLS endpoint for the configured marketplace."""
+        cc = (self._creds or {}).get("country_code", "us").strip().lower()
+        return self._DMLS_URLS.get(cc, self._DMLS_URL)
 
     def __init__(self, creds_json: str):
         self._creds: Optional[dict] = None
@@ -47,6 +117,25 @@ class _DirectAmazonClient:
         required = ("cookie", "authorization", "csrf_token", "wvd_path")
         return all(self._creds.get(k) for k in required)
 
+    def _get_marketplace(self) -> tuple[str, str]:
+        """
+        Return (marketplaceId, territoryId) for the DMLS API.
+        Priority:
+          1. Explicit marketplace_id + territory_id fields in the credentials JSON
+          2. country_code field in credentials JSON → looked up in _MARKETPLACE_IDS
+          3. Default: US
+        Users on non-US storefronts (e.g. Brazil) should add
+        "country_code": "br" to their credentials JSON, or set
+        "marketplace_id": "A2Q3Y263D00KWC" and "territory_id": "BR" directly.
+        """
+        c = self._creds or {}
+        mid = c.get("marketplace_id", "").strip()
+        tid = c.get("territory_id", "").strip()
+        if mid and tid:
+            return mid, tid
+        cc = c.get("country_code", "us").strip().lower()
+        return self._MARKETPLACE_IDS.get(cc, ("ATVPDKIKX0DER", "US"))
+
     def _safe_json_loads(self, text: str) -> dict:
         try:
             return json.loads(text)
@@ -56,16 +145,19 @@ class _DirectAmazonClient:
 
     def _build_headers(self) -> dict:
         c = self._creds
+        # Use the regional storefront URL for Origin/Referer
+        cc = (c or {}).get("country_code", "us").strip().lower()
+        storefront = self._STOREFRONT_URLS.get(cc, "https://music.amazon.com/")
         return {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "Origin": "https://music.amazon.com",
-            "Referer": "https://music.amazon.com/",
+            "Origin": storefront.rstrip("/"),
+            "Referer": storefront,
             "Cookie": c["cookie"],
             "content-type": "application/json",
             "Content-Encoding": "amz-1.0",
             "csrf-token": c["csrf_token"],
-            "csrf-rnd": c["csrf_rnd"],
-            "csrf-ts": c["csrf_ts"],
+            "csrf-rnd": c.get("csrf_rnd", ""),
+            "csrf-ts": c.get("csrf_ts", ""),
             "Authorization": c["authorization"],
         }
 
@@ -75,10 +167,9 @@ class _DirectAmazonClient:
             "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getDashManifestsV2"
         )
         c = self._creds
-        # customer_id and device_id may be empty if not captured during login.
-        # Use safe fallback values — Amazon accepts these for manifest requests.
         customer_id = c.get("customer_id") or ""
         device_id = c.get("device_id") or "antra-web-player"
+        mid, tid = self._get_marketplace()
         payload = {
             "deviceToken": {"deviceTypeId": "A16ZV8BU3SN1N3", "deviceId": device_id},
             "appMetadata": {"https": "true"},
@@ -90,27 +181,47 @@ class _DirectAmazonClient:
             "musicDashVersionList": ["SIREN_KATANA_NO_CLEAR_LEAD"],
             "contentProtectionList": ["TRACK_PSSH"],
             "tryAsinSubstitution": True,
-            "customerInfo": {"marketplaceId": "ATVPDKIKX0DER", "territoryId": "US"},
+            "customerInfo": {"marketplaceId": mid, "territoryId": tid},
             "appInfo": {"musicAgent": "Maestro/1.0 WebCP/1.0.10034.0 (7dbf-196c-WebC-2b70-7689c)"},
         }
         # Only include customerId if we have it — omitting it avoids 400 errors
         # when the field is an empty string.
         if customer_id:
             payload["customerId"] = customer_id
-        r = requests.post(self._DMLS_URL, headers=headers, json=payload, timeout=20)
+        r = requests.post(self._get_dmls_url(), headers=headers, json=payload, timeout=20)
         if r.status_code == 401:
             raise RuntimeError(
                 "[Amazon-Direct] Authorization expired (401) — re-extract credentials from music.amazon.com"
             )
         if r.status_code != 200:
             raise RuntimeError(f"[Amazon-Direct] Manifest request failed: {r.status_code}")
-        return self._safe_json_loads(r.text)
+        result = self._safe_json_loads(r.text)
+        # Check for application-level errors in the response
+        content_list = result.get("contentResponseList") or []
+        if content_list:
+            status = content_list[0].get("statusCode") or content_list[0].get("errorCode") or ""
+            if status and status not in ("OK", "SUCCESS", "200", ""):
+                raise RuntimeError(
+                    f"[Amazon-Direct] Track not available in marketplace {mid}/{tid}: {status}"
+                )
+        return result
 
     def _parse_manifest(self, data: dict) -> tuple[str, str]:
         try:
-            manifest_xml = data["contentResponseList"][0]["manifest"]
+            content_list = data.get("contentResponseList") or []
+            if not content_list:
+                raise RuntimeError("[Amazon-Direct] Empty contentResponseList — track may not be available in this marketplace")
+            manifest_xml = content_list[0].get("manifest", "")
         except (KeyError, IndexError) as e:
             raise RuntimeError(f"[Amazon-Direct] Unexpected manifest structure: {e}")
+
+        if not manifest_xml or not manifest_xml.strip():
+            # Log the full response keys to help diagnose
+            keys = list((data.get("contentResponseList") or [{}])[0].keys()) if data.get("contentResponseList") else list(data.keys())
+            raise RuntimeError(
+                f"[Amazon-Direct] Empty manifest — track ASIN may not be available in the configured marketplace "
+                f"(marketplaceId={self._get_marketplace()[0]}). Response keys: {keys}"
+            )
 
         root = ET.fromstring(manifest_xml)
         ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011", "cenc": "urn:mpeg:cenc:2013"}
@@ -188,7 +299,7 @@ class _DirectAmazonClient:
             headers["x-amzn-application-version"] = "1.0.10034.0"
             headers["x-amzn-os-version"] = "1.0"
 
-            r = requests.post(self._DMLS_URL, json=payload, headers=headers, timeout=20)
+            r = requests.post(self._get_dmls_url(), json=payload, headers=headers, timeout=20)
             if r.status_code != 200:
                 raise RuntimeError(
                     f"[Amazon-Direct] License request failed: {r.status_code} {r.text[:200]}"
@@ -234,13 +345,20 @@ class AmazonAdapter(BaseSourceAdapter):
         mirrors: list[str],
         api_key: Optional[str] = None,
         direct_creds_json: str = "",
+        mirror_api_key: str = "",
+        preferred_output_format: str = "source",
     ):
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         })
+        # Inject API key for self-hosted mirror servers
+        if mirror_api_key:
+            self._session.headers["X-API-Key"] = mirror_api_key
         self._odesli = OdesliEnricher(api_key=api_key)
         self.priority = 2  # Shared free-lossless tier with Apple/HiFi/DAB
+        self._preferred_output_format = (preferred_output_format or "source").lower()
+        self._prefer_lossy_download = self._preferred_output_format in {"mp3", "aac", "m4a"}
 
         # Mirror management
         self._mirrors = [m.rstrip("/") for m in mirrors if m]
@@ -327,6 +445,27 @@ class AmazonAdapter(BaseSourceAdapter):
             logger.debug(f"[Amazon] No Amazon ID found for '{track.title}'")
             return None
 
+        # Use track title as album fallback for singles where the page scraper
+        # couldn't extract an album name (Amazon single pages often omit it).
+        album = track.album or track.title or ""
+
+        if self._prefer_lossy_download:
+            return SearchResult(
+                source="amazon",
+                title=track.title,
+                artists=track.artists,
+                album=album,
+                duration_ms=track.duration_ms,
+                audio_format=AudioFormat.OPUS,
+                quality_kbps=None,
+                is_lossless=False,
+                download_url=None,
+                stream_id=amazon_id,
+                similarity_score=1.0,
+                isrc_match=True if track.isrc else False,
+                is_explicit=track.is_explicit,
+            )
+
         # Amazon's community proxy serves Ultra HD (24-bit lossless) streams.
         # Explicitly marking bit_depth=24 so the resolver quality-tier comparison
         # correctly ranks this as tier-4 (Hi-Res), equal to Apple/HiFi.
@@ -334,16 +473,17 @@ class AmazonAdapter(BaseSourceAdapter):
             source="amazon",
             title=track.title,
             artists=track.artists,
-            album=track.album,
+            album=album,
             duration_ms=track.duration_ms,
             audio_format=AudioFormat.FLAC,
             quality_kbps=None,
             is_lossless=True,
-            bit_depth=24,  # Ultra HD — 24-bit lossless via community proxy
+            bit_depth=24,
             download_url=None,
             stream_id=amazon_id,
-            similarity_score=1.0,  # Odesli match is authoritative
+            similarity_score=1.0,
             isrc_match=True if track.isrc else False,
+            is_explicit=track.is_explicit,
         )
 
     def download(self, result: SearchResult, output_path: str) -> str:
@@ -385,7 +525,8 @@ class AmazonAdapter(BaseSourceAdapter):
 
             try:
                 logger.debug(f"[Amazon] Fetching stream info (attempt {attempt+1}/{max_attempts}) from {mirror}...")
-                resp = self._session.get(api_url, timeout=20)
+                params = {"prefer_lossy": "true"} if self._prefer_lossy_download else None
+                resp = self._session.get(api_url, params=params, timeout=20)
 
                 if resp.status_code == 200:
                     data = resp.json()
@@ -401,12 +542,33 @@ class AmazonAdapter(BaseSourceAdapter):
                     saw_rate_limit = True
                     raise RateLimitedError(f"[Amazon] Rate limited (429) on {mirror}")
 
+                # 404 = content not available / no lossless stream — all mirrors
+                # will return the same answer, so stop immediately rather than
+                # wasting time rotating through the pool.
+                if resp.status_code == 404:
+                    detail = ""
+                    try:
+                        detail = resp.json().get("detail", "")
+                    except Exception:
+                        pass
+                    msg = detail or "Track not available in this marketplace"
+                    logger.info(f"[Amazon] 404 from mirror — {msg}")
+                    raise RuntimeError(f"[Amazon] ContentNotAvailable: {msg}")  # re-raised outside loop below
+
                 # 403/503 means mirror is blocking/refreshing — permanently remove it
                 if resp.status_code in (403, 503):
                     logger.debug(f"[Amazon] Mirror returned {resp.status_code} — removing from pool for session")
                     self._mirror_failures[mirror] = 99
                     self._current_mirror = None
                     last_error = f"API error {resp.status_code}"
+                    continue
+
+                # 500 from our own server = Amazon bearer token expired OR geo-restriction
+                # Treat as soft failure — don't permanently remove the mirror
+                if resp.status_code == 500:
+                    logger.debug(f"[Amazon] Mirror returned 500 — soft failure (token expired or geo-restricted)")
+                    self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
+                    last_error = f"API error 500 (unavailable — token expired or geo-restricted)"
                     continue
 
                 logger.debug(f"[Amazon] Mirror {mirror} returned {resp.status_code}")
@@ -425,16 +587,17 @@ class AmazonAdapter(BaseSourceAdapter):
             self._mirror_failures[mirror] = self._mirror_failures.get(mirror, 0) + 1
 
         if saw_rate_limit:
-            raise RateLimitedError(last_error or "[Amazon] Rate limited")
-        raise RuntimeError(f"[Amazon] All mirrors failed. Last error: {last_error}")
+            raise RateLimitedError(_humanize_amazon_error(last_error or "[Amazon] Rate limited"))
+        raise RuntimeError(_humanize_amazon_error(f"[Amazon] All mirrors failed. Last error: {last_error}"))
 
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
         # Never retry after a 429 — fall through to the next source immediately.
         if isinstance(error, RateLimitedError):
             return False
         err = str(error)
-        # 404 means the ASIN doesn't exist on any mirror — retrying won't help.
-        if "404" in err:
+        # Marketplace/content misses are deterministic — retrying the same ASIN
+        # on the same mirror won't help.
+        if "404" in err or "ContentNotAvailable" in err or "not available in any marketplace" in err:
             return False
         return True
 
@@ -449,47 +612,51 @@ class AmazonAdapter(BaseSourceAdapter):
                 for chunk in r.iter_content(65536):
                     f.write(chunk)
 
-        # Probing the encrypted file to determine the codec (FLAC vs AAC)
-        try:
-            from antra.utils.runtime import get_ffprobe_exe
-            ffprobe = get_ffprobe_exe() or "ffprobe"
-            cmd = [
-                ffprobe, "-v", "quiet",
-                "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name",
-                "-of", "default=noprint_wrappers=1:nokey=1",
-                temp_enc_path
-            ]
-            codec = subprocess.check_output(cmd, **_SUBPROCESS_FLAGS).decode().strip()
-            logger.debug(f"[Amazon] Probed codec: {codec}")
-            dec_ext = ".flac" if codec == "flac" else ".m4a"
-        except Exception as e:
-            logger.debug(f"[Amazon] Probing failed: {e}")
-            codec = "unknown"
-            dec_ext = ".m4a"
+        codec, duration_seconds = self._probe_audio_stream(temp_enc_path)
+        if codec:
+            logger.debug(
+                f"[Amazon] Probed codec: {codec}"
+                + (f" duration={duration_seconds:.2f}s" if duration_seconds else "")
+            )
+        else:
+            logger.debug("[Amazon] Probing failed — treating stream as generic M4A/MP4")
+        dec_ext = ".flac" if codec == "flac" else ".m4a"
 
         # Decrypt
         final_path = output_path + dec_ext
         if not decryption_key:
             logger.warning(f"[Amazon] No decryption key provided — assuming track is unencrypted.")
-            os.rename(temp_enc_path, final_path)
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            os.replace(temp_enc_path, final_path)
         else:
             logger.debug(f"[Amazon] Decrypting {codec.upper()} stream using session key...")
             ffmpeg_err = self._decrypt_file(temp_enc_path, final_path, decryption_key)
             if ffmpeg_err is not None:
                 logger.warning(f"[Amazon] ffmpeg decryption failed: {ffmpeg_err} — trying Python fallback")
+            if ffmpeg_err is not None:
                 py_err = self._decrypt_cenc_python(temp_enc_path, final_path, decryption_key)
                 if py_err is not None:
                     if os.path.exists(temp_enc_path):
                         os.remove(temp_enc_path)
                     raise RuntimeError(
-                        f"[Amazon] Decryption failed. ffmpeg: {ffmpeg_err[:200]} | python: {py_err}"
+                        "[Amazon] Amazon returned an unreadable protected audio stream for this track."
                     )
-                logger.debug("[Amazon] Python CENC fallback succeeded.")
-            os.remove(temp_enc_path)
+                else:
+                    logger.debug("[Amazon] Python CENC fallback succeeded.")
+            if os.path.exists(temp_enc_path):
+                os.remove(temp_enc_path)
 
         # Post-process: Standardize extension and remux if needed
-        return self._finalize_audio(final_path)
+        final_audio_path = self._finalize_audio(final_path)
+        if not self._prefer_lossy_download and not self._is_lossless_output(final_audio_path):
+            try:
+                if os.path.exists(final_audio_path):
+                    os.remove(final_audio_path)
+            except Exception:
+                pass
+            raise RuntimeError("[Amazon] Refusing lossy Amazon stream in lossless mode")
+        return final_audio_path
 
     def _decrypt_file(self, input_path: str, output_path: str, key: str) -> Optional[str]:
         """
@@ -703,9 +870,8 @@ class AmazonAdapter(BaseSourceAdapter):
     def _finalize_audio(self, path: str) -> str:
         """
         Remux to .flac if lossless FLAC is wrapped in M4A container.
-        Tries ffprobe for codec detection; when ffprobe is unavailable, performs
-        a blind remux attempt — Amazon Ultra HD is always FLAC-in-M4A so this
-        is safe and eliminates the extra engine transcoder pass.
+        Skips remux when the codec is known to be lossy (OPUS, AAC, etc.) —
+        those files are left as .m4a for the engine's transcoder to handle.
         """
         if not path.lower().endswith(".m4a"):
             return path
@@ -713,6 +879,7 @@ class AmazonAdapter(BaseSourceAdapter):
         # Try ffprobe to confirm codec
         ffprobe_ran = False
         codec_is_flac = False
+        probed_codec = None
         try:
             from antra.utils.runtime import get_ffprobe_exe
             ffprobe = get_ffprobe_exe()
@@ -724,12 +891,20 @@ class AmazonAdapter(BaseSourceAdapter):
                     "-of", "default=noprint_wrappers=1:nokey=1",
                     path
                 ]
-                codec_is_flac = subprocess.check_output(
+                probed_codec = subprocess.check_output(
                     cmd, **_SUBPROCESS_FLAGS
-                ).decode().strip() == "flac"
+                ).decode().strip().lower()
+                codec_is_flac = probed_codec == "flac"
                 ffprobe_ran = True
         except Exception:
             pass
+
+        # If we know it's a lossy codec (opus, aac, mp4a, etc.), leave it as .m4a
+        # so the engine's transcoder can convert it to the requested output format.
+        _LOSSY_CODECS = {"opus", "aac", "mp4a", "vorbis", "mp3"}
+        if ffprobe_ran and probed_codec and probed_codec in _LOSSY_CODECS:
+            logger.debug(f"[Amazon] Skipping FLAC remux — codec is {probed_codec.upper()}, leaving as .m4a for transcoder")
+            return path
 
         # Remux when ffprobe says FLAC, or when ffprobe wasn't available
         # (Amazon HD streams are always FLAC-in-M4A — blind attempt is safe).
@@ -741,6 +916,67 @@ class AmazonAdapter(BaseSourceAdapter):
                 return flac_path
 
         return path
+
+    def _is_lossless_output(self, path: str) -> bool:
+        if path.lower().endswith(".flac"):
+            return True
+        try:
+            from antra.utils.runtime import get_ffprobe_exe
+            ffprobe = get_ffprobe_exe() or "ffprobe"
+            cmd = [
+                ffprobe, "-v", "quiet",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ]
+            codec = subprocess.check_output(cmd, **_SUBPROCESS_FLAGS).decode().strip().lower()
+            return codec == "flac" or codec == "alac"
+        except Exception:
+            return False
+
+    def _is_playable_without_decryption(self, path: str) -> bool:
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+            ffmpeg = get_ffmpeg_exe() or "ffmpeg"
+            result = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", path, "-f", "null", "-"],
+                capture_output=True,
+                timeout=120,
+                **_SUBPROCESS_FLAGS,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _probe_audio_stream(self, path: str) -> tuple[Optional[str], Optional[float]]:
+        try:
+            from antra.utils.runtime import get_ffprobe_exe
+
+            ffprobe = get_ffprobe_exe() or "ffprobe"
+            cmd = [
+                ffprobe,
+                "-v", "quiet",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name:format=duration",
+                "-of", "json",
+                path,
+            ]
+            raw = subprocess.check_output(cmd, **_SUBPROCESS_FLAGS).decode("utf-8", errors="ignore")
+            data = json.loads(raw or "{}")
+            streams = data.get("streams") or []
+            codec = (streams[0].get("codec_name") if streams else None) or None
+            duration_raw = (data.get("format") or {}).get("duration")
+            duration = None
+            if duration_raw not in (None, ""):
+                try:
+                    duration = float(duration_raw)
+                except Exception:
+                    duration = None
+            return codec, duration
+        except Exception as e:
+            logger.debug(f"[Amazon] Audio probe failed: {e}")
+            return None, None
 
     def _remux_to_flac(self, input_path: str, output_path: str) -> bool:
         """Bit-perfect container swap."""

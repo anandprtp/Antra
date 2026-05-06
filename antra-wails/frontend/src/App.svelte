@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin } from '../wailsjs/go/main/App.js';
+  import { onMount, tick } from 'svelte';
+  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, RequestAccessKey } from '../wailsjs/go/main/App.js';
   import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus } from '../wailsjs/go/main/App.js';
-  import { EventsOn, BrowserOpenURL } from '../wailsjs/runtime/runtime.js';
+  import { EventsOn, BrowserOpenURL, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
+  import AntraLogo from './AntraLogo.svelte';
 
   let config: main.Config = {
     download_path: '',
@@ -21,17 +22,23 @@
     amazon_enabled: false,
     amazon_direct_creds_json: '',
     amazon_wvd_path: '',
+    amazon_region: 'us',
     qobuz_enabled: false,
     qobuz_email: '',
     qobuz_password: '',
     qobuz_app_id: '285473059',
     qobuz_app_secret: '',
     qobuz_user_auth_token: '',
+    deezer_arl_token: '',
+    deezer_bf_secret: 'g4el58wc0zvf9na1',
     output_format: 'lossless',
     max_retries: 3,
     library_mode: 'smart_dedup',
     prefer_explicit: true,
     folder_structure: 'standard',
+    album_folder_structure: 'standard',
+    playlist_folder_structure: 'standard',
+    single_track_structure: 'album_numbered',
     filename_format: 'default',
     spotify_sp_dc: '',
     tidal_enabled: false,
@@ -42,6 +49,7 @@
     tidal_session_id: '',
     tidal_token_type: 'Bearer',
     tidal_country_code: '',
+    antra_api_key: '',
   };
   let tidalValidationStatus: { ok: boolean; message: string; display_name?: string; country_code?: string } | null = null;
   let tidalValidationLoading = false;
@@ -102,11 +110,14 @@
   let setupMode = false;
   let showHistory = false;
   let showSettings = false;
+  let showFolderSettings = false;
   let settingsScrollTarget: string | null = null; // id of settings section to scroll to on open
   let showDownloadedMusic = false;
+  let settingsButtonEl: HTMLButtonElement | null = null;
   let slskdWebUIInfo: {url: string, username: string, password: string} | null = null;
   let historyItems: any[] = [];
   let inputUrl = '';
+  let inputUrlEl: HTMLTextAreaElement | null = null;
   let isDownloading = false;
 
   interface LibraryReleaseSummary {
@@ -169,20 +180,45 @@
     { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', bgEnabled: 'rgba(29,185,222,0.14)',  border: '#1DB9DE', text: '#1DB9DE' },
     { key: 'apple',  label: 'Apple',   abbr: '',  bg: '#230a10', bgEnabled: 'rgba(252,60,68,0.14)',   border: '#fc3c44', text: '#fc3c44' },
     { key: 'amazon', label: 'Amazon',  abbr: 'a', bg: '#1a1200', bgEnabled: 'rgba(255,153,0,0.14)',   border: '#FF9900', text: '#FF9900' },
-    { key: 'dab',    label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', bgEnabled: 'rgba(123,94,167,0.18)',  border: '#7B5EA7', text: '#7B5EA7' },
+    { key: 'qobuz',  label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', bgEnabled: 'rgba(123,94,167,0.18)',  border: '#7B5EA7', text: '#7B5EA7' },
+    { key: 'deezer', label: 'Deezer',  abbr: 'D', bg: '#001219', bgEnabled: 'rgba(0,196,80,0.14)',    border: '#00C450', text: '#00C450' },
   ];
   const formatOptions = [
-    { value: 'auto',     name: 'Auto',     label: 'Best available — lossless preferred, MP3 fallback' },
-    { value: 'lossless', name: 'Lossless', label: 'FLAC only — skip if unavailable' },
-    { value: 'alac',     name: 'ALAC',     label: 'Apple Lossless .m4a — iPhone / Apple Music compatible' },
-    { value: 'aac',      name: 'AAC',      label: '~320kbps AAC — uses JioSaavn directly' },
-    { value: 'mp3',      name: 'MP3',      label: '~320kbps MP3 — uses JioSaavn / NetEase directly' },
+    { value: 'auto',     name: 'Auto', label: 'Best available — lossless preferred, MP3 fallback' },
+    { value: 'lossless', name: 'FLAC', label: 'FLAC lossless — highest quality from any source' },
+    { value: 'alac',     name: 'ALAC', label: 'Apple Lossless .m4a — iPhone / Apple Music compatible' },
+    { value: 'aac',      name: 'AAC',  label: '~320kbps AAC — uses JioSaavn directly' },
+    { value: 'mp3',      name: 'MP3',  label: '~320kbps MP3 — uses JioSaavn / NetEase directly' },
   ];
 
-  async function checkHealth(src: string) {
+  // Derive parent format and bit-depth from the stored output_format value
+  // e.g. 'lossless-16' → parent='lossless', bitDepth='16'
+  $: _fmtBase       = (config.output_format || 'auto').replace(/-16$|-24$/, '');
+  $: _fmtBitDepth   = config.output_format?.endsWith('-16') ? '16' : config.output_format?.endsWith('-24') ? '24' : '';
+  $: showBitDepthRow = _fmtBase === 'lossless' || _fmtBase === 'alac';
+
+  async function setParentFormat(val: string) {
+    // Preserve bit-depth selection when switching between FLAC and ALAC
+    if ((val === 'lossless' || val === 'alac') && _fmtBitDepth) {
+      config.output_format = val + '-' + _fmtBitDepth;
+    } else {
+      config.output_format = val;
+    }
+    await SaveConfig(config);
+  }
+
+  async function setBitDepth(depth: string) {
+    config.output_format = _fmtBase + '-' + depth;
+    await SaveConfig(config);
+  }
+
+  async function checkHealth(src: string, opts: { openPopover?: boolean } = {}) {
+    const { openPopover = true } = opts;
     healthPopoverSource = src;
     healthLoading = true;
-    showHealthPopover = true;
+    if (openPopover) {
+      showHealthPopover = true;
+    }
     try {
       const raw = await CheckSourceHealth(src);
       healthCache[src] = JSON.parse(raw);
@@ -191,32 +227,15 @@
     finally { healthLoading = false; }
   }
 
-  // Map health chip key → settings section id and config enabled key
-  const chipSettingsMap: Record<string, { sectionId: string; enableKey: string }> = {
-    hifi:   { sectionId: 'settings-tidal',  enableKey: 'tidal_enabled'  },
-    apple:  { sectionId: 'settings-apple',  enableKey: 'apple_enabled'  },
-    amazon: { sectionId: 'settings-amazon', enableKey: 'amazon_enabled' },
-    dab:    { sectionId: 'settings-qobuz',  enableKey: 'qobuz_enabled'  },
-  };
-
-  // Explicit reactive enabled states — Svelte tracks these directly.
-  // Using $: ensures they update whenever config changes (e.g. after GetConfig() in onMount).
-  $: chipEnabled = {
-    hifi:   !!config.tidal_enabled,
-    apple:  !!config.apple_enabled,
-    amazon: !!config.amazon_enabled,
-    dab:    !!config.qobuz_enabled,
-  };
-
-  function isChipEnabled(key: string): boolean {
-    return !!chipEnabled[key];
-  }
+  // Chip liveness: green when endpoint health cache shows at least one live endpoint.
+  $: chipLive = Object.fromEntries(
+    healthSources.map(s => [s.key, !!(healthCache[s.key] && healthCache[s.key].live > 0)])
+  );
 
   async function openSettingsAt(sectionId: string) {
     settingsScrollTarget = sectionId;
     showSettings = true;
     try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; }
-    // Wait for the modal DOM to render, then scroll the target section into view
     setTimeout(() => {
       const el = document.getElementById(sectionId);
       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -225,16 +244,7 @@
   }
 
   function handleChipClick(src: string) {
-    // Always open settings at the adapter's section — whether enabled or not.
-    // Disabled: enables the adapter, saves config, then opens settings.
-    // Enabled: opens settings directly (so user can manage credentials).
-    const m = chipSettingsMap[src];
-    if (!m) return;
-    if (!isChipEnabled(src)) {
-      (config as any)[m.enableKey] = true;
-      SaveConfig(config).catch(() => {});
-    }
-    openSettingsAt(m.sectionId);
+    checkHealth(src);
   }
 
   // ── Tracklist scroll state ─────────────────────────────────────────────────
@@ -251,6 +261,28 @@
 
   function scrollTracklistToBottom() {
     if (tracklistEl) { tracklistEl.scrollTop = tracklistEl.scrollHeight; tracklistAtBottom = true; }
+  }
+
+  async function pasteClipboardIntoUrlBox(event: MouseEvent) {
+    if (isDownloading || !inputUrlEl) return;
+
+    event.preventDefault();
+
+    try {
+      const clipboardText = await ClipboardGetText();
+      if (!clipboardText) return;
+
+      const start = inputUrlEl.selectionStart ?? inputUrl.length;
+      const end = inputUrlEl.selectionEnd ?? inputUrl.length;
+      inputUrl = inputUrl.slice(0, start) + clipboardText + inputUrl.slice(end);
+
+      await tick();
+      const caret = start + clipboardText.length;
+      inputUrlEl.focus();
+      inputUrlEl.setSelectionRange(caret, caret);
+    } catch (error) {
+      console.error('Right-click paste failed:', error);
+    }
   }
 
   // ── Multi-URL separators ────────────────────────────────────────────────────
@@ -396,6 +428,15 @@
       if (!config.folder_structure) {
         config.folder_structure = 'standard';
       }
+      if (!config.album_folder_structure) {
+        config.album_folder_structure = config.folder_structure || 'standard';
+      }
+      if (!config.playlist_folder_structure) {
+        config.playlist_folder_structure = config.folder_structure || 'standard';
+      }
+      if (!config.single_track_structure) {
+        config.single_track_structure = 'album_numbered';
+      }
       if (!config.filename_format) {
         config.filename_format = 'default';
       }
@@ -533,6 +574,17 @@
         sponsorToastTimer = setTimeout(() => dismissSponsorToast(), 9000);
       }, 1200);
     }
+
+    // Kick off health checks for all VPS endpoints on startup
+    for (const src of healthSources) {
+      checkHealth(src.key, { openPopover: false }).catch(() => {});
+    }
+
+    const handleWindowResize = () => {
+      if (showKeyReminder) updateKeyReminderPosition();
+    };
+    window.addEventListener('resize', handleWindowResize);
+    return () => window.removeEventListener('resize', handleWindowResize);
   });
 
   function updateAutoScrollState() {
@@ -649,6 +701,19 @@
       }
       if (typeof payload.message === 'string' && payload.message.includes('0xc000013a')) {
         return; // standard cancel status on windows
+      }
+      // Hide adapter startup / source chain logs — the health chips already show this info
+      if (typeof payload.message === 'string') {
+        const msg = payload.message;
+        if (
+          /^\[OK\].*adapter enabled/.test(msg) ||
+          /^\[Sources\] Active download chain:/.test(msg) ||
+          /^Enriching tracks with album metadata/.test(msg) ||
+          /^\[Spotify\] Partner API: \d+ tracks for album/.test(msg) ||
+          /^\[Spotify\] Used partner GraphQL API for album/.test(msg)
+        ) {
+          return;
+        }
       }
       addLog(payload.level, payload.message);
     } else if (payload.type === 'progress') {
@@ -1356,6 +1421,10 @@
     }
     await SaveConfig(config);
     setupMode = false;
+    if (!config.antra_api_key?.trim()) {
+      await tick();
+      showKeyReminderToast();
+    }
   }
 
   async function startDownload() {
@@ -1530,8 +1599,99 @@
     if (!config.max_retries || config.max_retries < 1) {
       config.max_retries = 3;
     }
+    config.folder_structure = config.album_folder_structure || 'standard';
     await SaveConfig(config);
     showSettings = false;
+  }
+
+  // ── Access key reminder toast ───────────────────────────────────────────────
+  let showKeyReminder = false;
+  let keyReminderLeaving = false;
+  let keyReminderTimer: ReturnType<typeof setTimeout>;
+  let keyReminderStyle = '';
+
+  function updateKeyReminderPosition() {
+    if (!settingsButtonEl) {
+      keyReminderStyle = '';
+      return;
+    }
+    const rect = settingsButtonEl.getBoundingClientRect();
+    const width = 320;
+    const top = rect.bottom + 14;
+    const left = Math.max(16, rect.right - width);
+    keyReminderStyle = `top:${top}px; left:${left}px;`;
+  }
+
+  function showKeyReminderToast() {
+    updateKeyReminderPosition();
+    showKeyReminder = true;
+    keyReminderLeaving = false;
+    clearTimeout(keyReminderTimer);
+    keyReminderTimer = setTimeout(() => dismissKeyReminder(), 6000);
+  }
+
+  function dismissKeyReminder() {
+    keyReminderLeaving = true;
+    clearTimeout(keyReminderTimer);
+    setTimeout(() => { showKeyReminder = false; keyReminderLeaving = false; }, 450);
+  }
+
+  async function openSettings() {
+    showSettings = true;
+    try {
+      const raw = await GetSlskdWebUIInfo();
+      const info = JSON.parse(raw);
+      slskdWebUIInfo = (info && info.url) ? info : null;
+    } catch {
+      slskdWebUIInfo = null;
+    }
+  }
+
+  function openSettingsForKey() {
+    dismissKeyReminder();
+    openSettingsAt('access-key-section');
+  }
+  interface KeyGenState {
+    phase: 'idle' | 'loading' | 'success' | 'error';
+    error?: string;
+    expiresAt?: string;
+    downloadLimit?: number;
+  }
+  let keyGen: KeyGenState = { phase: 'idle' };
+
+  async function requestKey() {
+    keyGen = { phase: 'loading' };
+    try {
+      const result = await RequestAccessKey();
+      if (result.ok) {
+        // config.antra_api_key is already saved by the Go backend
+        config = await GetConfig();
+        keyGen = {
+          phase: 'success',
+          expiresAt: result.expires_at,
+          downloadLimit: result.download_limit,
+        };
+      } else {
+        keyGen = { phase: 'error', error: result.error || 'Unknown error. Try again.' };
+      }
+    } catch (e: any) {
+      keyGen = { phase: 'error', error: e?.message || 'Could not reach Antra servers.' };
+    }
+  }
+
+  function formatKeyExpiry(isoStr: string): string {
+    try {
+      const exp = new Date(isoStr);
+      const now = new Date();
+      const diffMs = exp.getTime() - now.getTime();
+      if (diffMs <= 0) return 'expired';
+      const diffH = Math.floor(diffMs / 3600000);
+      const diffM = Math.floor((diffMs % 3600000) / 60000);
+      if (diffH >= 1) return `${diffH}h ${diffM}m remaining`;
+      return `${diffM}m remaining`;
+    } catch {
+      return '';
+    }
   }
 
   async function validateTidalSettings() {
@@ -1667,13 +1827,7 @@
 {:else if setupMode}
   <main class="setup">
     <div class="logo">
-      <pre>
-    ___    _   __ ______  ____     ___
-   /   |  / | / //_  __/ / __ \  /   |
-  / /| | /  |/ /  / /   / /_/ / / /| |
- / ___ |/ /|  /  / /   / _, _/ / ___ |
-/_/  |_/_/ |_/  /_/   /_/ |_/ /_/  |_|
-      </pre>
+      <AntraLogo />
       <p>Your music. Offline. Lossless.</p>
       <p style="font-size: 12px; opacity: 0.5; margin-top: -8px;">Paste a Spotify, Apple Music, or Amazon Music playlist and Antra builds your music library automatically.</p>
       <p style="font-size: 11px; opacity: 0.35; margin-top: -4px; letter-spacing: 0.04em;">OPTIMIZED FOR NAVIDROME &amp; JELLYFIN</p>
@@ -1689,68 +1843,6 @@
           <button on:click={pickDir}>Browse</button>
         </div>
       </div>
-      <div class="field" style="margin-top: 20px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 8px;">Folder Structure</p>
-        <div style="display: flex; flex-direction: column; gap: 10px;">
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="standard" bind:group={config.folder_structure} style="margin-top: 2px;" />
-            <div>
-              Standard <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist / Album / files</span>
-              <p style="font-size: 11px; color: #555; margin: 3px 0 0;">Recommended for Navidrome, Jellyfin, and Plex.</p>
-            </div>
-          </label>
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="flat" bind:group={config.folder_structure} style="margin-top: 2px;" />
-            <div>
-              Flat <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Album / files</span>
-              <p style="font-size: 11px; color: #555; margin: 3px 0 0;">No artist folder. Good for manual organisation.</p>
-            </div>
-          </label>
-        </div>
-      </div>
-
-      <div class="field" style="margin-top: 20px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 8px;">Filename Format</p>
-        <div style="display: flex; flex-direction: column; gap: 8px;">
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="default" bind:group={config.filename_format} />
-            <span>Default <span style="font-size: 11px; opacity: 0.6;">01 - Title.flac</span></span>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_only" bind:group={config.filename_format} />
-            <span>Title only <span style="font-size: 11px; opacity: 0.6;">Title.flac</span></span>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="artist_title" bind:group={config.filename_format} />
-            <span>Artist – Title <span style="font-size: 11px; opacity: 0.6;">Artist - Title.flac</span></span>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_artist" bind:group={config.filename_format} />
-            <span>Title – Artist <span style="font-size: 11px; opacity: 0.6;">Title - Artist.flac</span></span>
-          </label>
-        </div>
-      </div>
-
-      <div class="field" style="margin-top: 20px;">
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
-          <input type="checkbox" bind:checked={config.soulseek_enabled} style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Enable Soulseek (P2P) — optional</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Find rare or hi-res versions not on streaming services. Requires a free account.</p>
-          </div>
-        </label>
-      </div>
-
-      {#if config.soulseek_enabled}
-        <div class="field" style="margin-top: 16px; padding: 14px; background: rgba(0,255,204,0.03); border: 1px solid rgba(0,255,204,0.1); border-radius: 6px;">
-          <label for="slskUsername" style="font-size: 13px;">Soulseek Username</label>
-          <input id="slskUsername" type="text" bind:value={config.soulseek_username} placeholder="Your Soulseek username" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-          <label for="slskPassword" style="font-size: 13px; margin-top: 12px; display: block;">Soulseek Password</label>
-          <input id="slskPassword" type="password" bind:value={config.soulseek_password} placeholder="Your Soulseek password" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-          <p style="font-size: 11px; color: #555; margin: 8px 0 0;">No account? Just pick a username &amp; password — <span style="color: var(--accent-color);">it's created automatically on first connect</span></p>
-        </div>
-      {/if}
-
       <button style="margin-top: 24px; width: 100%;" on:click={saveSetup}>Build My Library →</button>
     </div>
   </main>
@@ -1768,7 +1860,8 @@
           <button on:click={openDownloadedMusic} title="Downloaded Music" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🎵</button>
           <button on:click={openHistory} title="Library History" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🕒</button>
           <button on:click={() => { showAnalyzer = true; }} title="Audio Analyzer" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🔬</button>
-          <button on:click={async () => { showSettings = true; try { const raw = await GetSlskdWebUIInfo(); const info = JSON.parse(raw); slskdWebUIInfo = (info && info.url) ? info : null; } catch { slskdWebUIInfo = null; } }} title="Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">⚙️</button>
+          <button on:click={() => showFolderSettings = true} title="Library & Folder Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">📁</button>
+          <button bind:this={settingsButtonEl} on:click={openSettings} title="Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">⚙️</button>
           <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
           <div class="kofi-wrap">
             <button on:click={() => kofiTooltipVisible = !kofiTooltipVisible} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
@@ -1850,11 +1943,13 @@
         <!-- URL input -->
         <div class="input-bar" style="display: flex; gap: 8px; align-items: flex-start;">
           <textarea
+            bind:this={inputUrlEl}
             bind:value={inputUrl}
             placeholder="Paste one or more Spotify / Apple Music / SoundCloud / Amazon Music URLs (one per line or comma-separated)..."
             disabled={isDownloading}
             rows="4"
             on:keydown={(e) => e.key === 'Enter' && e.ctrlKey && startDownload()}
+            on:contextmenu={pasteClipboardIntoUrlBox}
             style="flex: 1; min-width: 0; resize: vertical; min-height: 64px; max-height: 200px; font-family: inherit; font-size: 13px;"
           ></textarea>
           {#if isDownloading}
@@ -1870,44 +1965,71 @@
       <!-- Source health chips + format selector -->
       <div class="source-health-bar">
         {#each healthSources as src}
-          {@const enabled = !!chipEnabled[src.key]}
+          {@const live = !!chipLive[src.key]}
+          {@const checked = src.key in healthCache}
           <button
             class="health-chip"
-            class:health-chip-disabled={!enabled}
-            class:health-chip-enabled={enabled}
-            style={enabled
+            class:health-chip-disabled={checked && !live}
+            class:health-chip-enabled={live}
+            style={live
               ? `background:${src.bgEnabled};`
               : `background:rgba(0,0,0,0);`}
             on:click={() => handleChipClick(src.key)}
-            title={!enabled
-              ? `Tap to enable ${src.label} — opens settings`
-              : `${src.label} — click to manage`}
+            title={!checked
+              ? `Check ${src.label} endpoint`
+              : live
+                ? src.key === 'apple'
+                  ? `Apple — AAC / MP3 only`
+                  : `${src.label} — endpoint live`
+                : `${src.label} — endpoint down`}
           >
-            {#if enabled}
-              <span class="health-chip-on-badge">on</span>
+            {#if !checked}
+              <span class="health-chip-off-badge">···</span>
+            {:else if live}
+              <span class="health-chip-on-badge">live</span>
             {:else}
-              <span class="health-chip-off-badge">off</span>
+              <span class="health-chip-off-badge">down</span>
             {/if}
             {#if src.key === 'hifi'}
-              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
+              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
             {:else if src.key === 'apple'}
-              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
+              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
             {:else if src.key === 'amazon'}
-              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1}; border-radius: 4px;" />
-            {:else if src.key === 'dab'}
-              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{!enabled ? 0.25 : 1};" />
+              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1}; border-radius: 4px;" />
+            {:else if src.key === 'qobuz'}
+              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
+            {:else if src.key === 'deezer'}
+              <img src="/icons/deezer.webp" alt="Deezer" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
             {/if}
           </button>
         {/each}
         <div class="format-selector">
-          {#each formatOptions as fmt}
-            <button
-              class="format-pill"
-              class:active={config.output_format === fmt.value}
-              title={fmt.label}
-              on:click={async () => { config.output_format = fmt.value; await SaveConfig(config); }}
-            >{fmt.name}</button>
-          {/each}
+          <div class="format-main-row">
+            {#each formatOptions as fmt}
+              <button
+                class="format-pill"
+                class:active={_fmtBase === fmt.value}
+                title={fmt.label}
+                on:click={() => setParentFormat(fmt.value)}
+              >{fmt.name}</button>
+            {/each}
+          </div>
+          {#if showBitDepthRow}
+            <div class="format-sub-row">
+              <button
+                class="format-pill format-pill--sub"
+                class:active={_fmtBitDepth === '16'}
+                title="{_fmtBase === 'lossless' ? 'FLAC 16-bit — Deezer first, other mirrors as fallback' : 'ALAC 16-bit — standard lossless'}"
+                on:click={() => setBitDepth('16')}
+              >16-bit</button>
+              <button
+                class="format-pill format-pill--sub"
+                class:active={_fmtBitDepth === '24'}
+                title="{_fmtBase === 'lossless' ? 'FLAC 24-bit Hi-Res — Tidal / Qobuz preferred' : 'ALAC 24-bit Hi-Res — Apple Hi-Res Lossless'}"
+                on:click={() => setBitDepth('24')}
+              >24-bit</button>
+            </div>
+          {/if}
         </div>
       </div>
     </div>
@@ -2201,6 +2323,28 @@
   </div>
 {/if}
 
+<!-- ── Access key reminder toast ─────────────────────────────────────────── -->
+{#if showKeyReminder}
+  <!-- svelte-ignore a11y-click-events-have-key-events -->
+  <!-- svelte-ignore a11y-no-static-element-interactions -->
+  <div
+    class="key-reminder-toast"
+    class:leaving={keyReminderLeaving}
+    style={keyReminderStyle}
+    on:click={openSettingsForKey}
+    on:mouseenter={() => clearTimeout(keyReminderTimer)}
+    on:mouseleave={() => { keyReminderTimer = setTimeout(() => dismissKeyReminder(), 2500); }}
+  >
+    <div class="key-reminder-icon">🔑</div>
+    <div class="key-reminder-body">
+      <p class="key-reminder-title">Hey, Sailor!</p>
+      <p class="key-reminder-text">Don't forget to activate your access key — required to download from Antra's servers.</p>
+      <span class="key-reminder-cta">Open Settings →</span>
+    </div>
+    <button class="key-reminder-close" on:click|stopPropagation={dismissKeyReminder} title="Dismiss">×</button>
+  </div>
+{/if}
+
 {#if showDownloadedMusic}
 <div class="modal-overlay" on:click={() => showDownloadedMusic = false}>
   <div class="modal-content downloaded-modal" on:click|stopPropagation>
@@ -2431,6 +2575,74 @@
     </div>
     <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
+      <!-- ── Antra Access Key ──────────────────────────────────────────────── -->
+      <div id="access-key-section" class="field" style="background: rgba(0,255,204,0.04); border: 1px solid rgba(0,255,204,0.15); border-radius: 8px; padding: 14px 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px; color: var(--accent-color);">🔑 Antra Access Key</p>
+        <p style="font-size: 11px; color: #666; margin: 0 0 12px;">
+          Required to download music from Antra's shared lossless servers (Tidal, Apple Music, Amazon Music, Qobuz, Deezer).
+          Each key is valid for 24 hours or 2000 downloads — whichever comes first.
+        </p>
+
+        {#if config.antra_api_key && keyGen.phase !== 'success'}
+          <!-- Key already set — show masked key + status + refresh option -->
+          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
+            <input
+              type="password"
+              value={config.antra_api_key}
+              readonly
+              style="flex: 1; box-sizing: border-box; font-family: monospace; font-size: 12px; opacity: 0.7;"
+            />
+            <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Active</span>
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <button
+              on:click={requestKey}
+              disabled={keyGen.phase === 'loading'}
+              style="font-size: 12px; padding: 6px 14px; opacity: {keyGen.phase === 'loading' ? 0.6 : 1};"
+            >
+              {keyGen.phase === 'loading' ? '⏳ Generating…' : '↻ Get New Key'}
+            </button>
+            <span style="font-size: 11px; color: #555;">Key expires after 24h or 2000 downloads</span>
+          </div>
+          {#if keyGen.phase === 'error'}
+            <p style="font-size: 11px; color: #f87171; margin: 8px 0 0;">{keyGen.error}</p>
+          {/if}
+
+        {:else if keyGen.phase === 'success'}
+          <!-- Just generated a new key -->
+          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
+            <input
+              type="password"
+              value={config.antra_api_key}
+              readonly
+              style="flex: 1; box-sizing: border-box; font-family: monospace; font-size: 12px;"
+            />
+            <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Ready</span>
+          </div>
+          <p style="font-size: 11px; color: #86efac; margin: 0;">
+            ✓ Key saved automatically.
+            {#if keyGen.expiresAt} Valid for {formatKeyExpiry(keyGen.expiresAt)}.{/if}
+            {#if keyGen.downloadLimit} Up to {keyGen.downloadLimit} downloads.{/if}
+          </p>
+
+        {:else}
+          <!-- No key yet — show the Get Key button prominently -->
+          <button
+            on:click={requestKey}
+            disabled={keyGen.phase === 'loading'}
+            style="width: 100%; padding: 10px; font-size: 13px; font-weight: 600; background: rgba(0,255,204,0.12); border: 1px solid rgba(0,255,204,0.3); color: var(--accent-color); border-radius: 6px; cursor: pointer; opacity: {keyGen.phase === 'loading' ? 0.6 : 1};"
+          >
+            {keyGen.phase === 'loading' ? '⏳ Generating your key…' : '✦ Get Access Key'}
+          </button>
+          {#if keyGen.phase === 'error'}
+            <p style="font-size: 11px; color: #f87171; margin: 8px 0 0;">{keyGen.error}</p>
+          {/if}
+          <p style="font-size: 11px; color: #444; margin: 8px 0 0;">
+            One click — no account needed. Key is saved automatically.
+          </p>
+        {/if}
+      </div>
+
       <div class="field">
         <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
           <input type="checkbox" bind:checked={config.prefer_explicit} style="margin-top: 2px;" />
@@ -2451,76 +2663,6 @@
             bind:value={config.max_retries}
             style="width: 96px;"
           />
-        </div>
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Library Mode</p>
-        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="smart_dedup" bind:group={config.library_mode} style="margin-top: 2px;" />
-            <div>
-              Smart Dedup <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Default — skip if already in library anywhere)</span>
-              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Saves storage. If a track was downloaded as part of a Best Of, it won't be re-downloaded for the studio album.</p>
-            </div>
-          </label>
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="full_albums" bind:group={config.library_mode} style="margin-top: 2px;" />
-            <div>
-              Full Albums <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Each album complete — allows cross-album duplicates)</span>
-              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Every album folder is always complete. A track on both a studio album and a compilation will exist in both folders.</p>
-            </div>
-          </label>
-        </div>
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Folder Structure</p>
-        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="standard" bind:group={config.folder_structure} style="margin-top: 2px;" />
-            <div>
-              Standard <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Artist / Album / files)</span>
-              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Default. Compatible with Navidrome, Jellyfin, and Plex.</p>
-            </div>
-          </label>
-          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="flat" bind:group={config.folder_structure} style="margin-top: 2px;" />
-            <div>
-              Flat <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Album / files — no artist folder)</span>
-              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Simpler layout for manual organisation or single-artist libraries.</p>
-            </div>
-          </label>
-        </div>
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Filename Format</p>
-        <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="default" bind:group={config.filename_format} />
-            <div>Default <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">01 - Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_only" bind:group={config.filename_format} />
-            <div>Title only <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="artist_title" bind:group={config.filename_format} />
-            <div>Artist – Title <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist - Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_artist" bind:group={config.filename_format} />
-            <div>Title – Artist <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title - Artist.flac</span></div>
-          </label>
-        </div>
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <label for="outDirModal">Music Folder</label>
-        <div style="display: flex; gap: 8px; margin-top: 8px;">
-          <input id="outDirModal" readonly type="text" value={config.download_path} />
-          <button on:click={pickDir}>Browse</button>
         </div>
       </div>
 
@@ -2565,351 +2707,6 @@
       </div>
 
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p id="settings-tidal" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">TIDAL Premium</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Connect your TIDAL account via OAuth (recommended) or paste a session JSON blob directly.</p>
-
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
-          <input type="checkbox"
-            checked={config.tidal_enabled}
-            on:change={(e) => config.tidal_enabled = e.currentTarget.checked}
-            style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Enable TIDAL Premium</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the TIDAL account configuration block and validation flow.</p>
-          </div>
-        </label>
-
-        {#if config.tidal_enabled}
-          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
-
-            <!-- OAuth Login Section -->
-            <div style="margin-bottom: 16px; padding: 12px; background: rgba(29,185,222,0.06); border: 1px solid rgba(29,185,222,0.2); border-radius: 6px;">
-              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px; color: #1DB9DE;">🔐 OAuth Login (Recommended)</p>
-              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open TIDAL's login page in your browser. Antra will capture your session automatically — no manual copy-paste needed.</p>
-
-              {#if tidalOAuth.phase === 'idle' || tidalOAuth.phase === 'error'}
-                <button
-                  on:click={startTidalOAuth}
-                  style="padding: 6px 12px; font-size: 12px; background: rgba(29,185,222,0.15); border-color: rgba(29,185,222,0.4); color: #1DB9DE;"
-                >
-                  Login with TIDAL
-                </button>
-                {#if tidalOAuth.phase === 'error'}
-                  <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {tidalOAuth.message}</p>
-                  <button on:click={() => tidalOAuth = { phase: 'idle' }} style="font-size: 10px; padding: 3px 8px; margin-top: 6px; opacity: 0.6;">Reset</button>
-                {/if}
-
-              {:else if tidalOAuth.phase === 'starting'}
-                <p style="font-size: 11px; color: #94a3b8; margin: 0;">⏳ {tidalOAuth.message || 'Starting...'}</p>
-
-              {:else if tidalOAuth.phase === 'waiting_browser'}
-                <div style="margin-top: 4px;">
-                  <p style="font-size: 11px; color: #facc15; margin: 0 0 8px;">⏳ Waiting for you to approve in your browser...</p>
-                  {#if tidalOAuth.url}
-                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
-                      <button
-                        on:click={() => BrowserOpenURL(tidalOAuth.url)}
-                        style="padding: 5px 10px; font-size: 11px; background: rgba(29,185,222,0.2); border-color: rgba(29,185,222,0.4); color: #1DB9DE;"
-                      >
-                        Open TIDAL Login ↗
-                      </button>
-                      <code style="font-size: 11px; background: rgba(255,255,255,0.05); padding: 3px 8px; border-radius: 4px; color: #e2e8f0; word-break: break-all; flex: 1;">{tidalOAuth.url}</code>
-                    </div>
-                    {#if tidalOAuth.code}
-                      <p style="font-size: 11px; color: #94a3b8; margin: 6px 0 0;">Device code: <code style="color: #facc15;">{tidalOAuth.code}</code></p>
-                    {/if}
-                  {/if}
-                  <p style="font-size: 10px; color: #555; margin: 8px 0 0;">After you log in, Antra will automatically save your session. This window will update within seconds.</p>
-                </div>
-
-              {:else if tidalOAuth.phase === 'success'}
-                <div style="display: flex; align-items: center; gap: 8px;">
-                  <span style="font-size: 14px;">✅</span>
-                  <div>
-                    <p style="font-size: 12px; color: #86efac; margin: 0;">{tidalOAuth.message}</p>
-                    {#if tidalOAuth.displayName}
-                      <p style="font-size: 11px; color: #94a3b8; margin: 3px 0 0;">Account: {tidalOAuth.displayName}{tidalOAuth.countryCode ? ` (${tidalOAuth.countryCode})` : ''}</p>
-                    {/if}
-                  </div>
-                  <button on:click={() => tidalOAuth = { phase: 'idle' }} style="font-size: 10px; padding: 3px 8px; margin-left: auto; opacity: 0.6;">Re-login</button>
-                </div>
-              {/if}
-            </div>
-
-            <!-- Divider -->
-            <p style="font-size: 10px; color: #444; text-align: center; margin: 0 0 12px; letter-spacing: 0.08em;">— OR PASTE SESSION JSON MANUALLY —</p>
-
-            <label for="tidalAuthMode" style="font-size: 12px; opacity: 0.7;">Auth method</label>
-            <select id="tidalAuthMode" bind:value={config.tidal_auth_mode} style="width: 100%; box-sizing: border-box; margin-top: 6px;">
-              <option value="session_json">Session JSON (Recommended)</option>
-              <option value="manual_tokens">Manual tokens</option>
-            </select>
-
-            {#if config.tidal_auth_mode === 'session_json'}
-              <label for="tidalSessionJson" style="font-size: 12px; opacity: 0.7; margin-top: 12px; display: block;">Session JSON</label>
-              <textarea
-                id="tidalSessionJson"
-                bind:value={config.tidal_session_json}
-                on:paste={(e) => {
-                  e.preventDefault();
-                  const raw = e.clipboardData?.getData('text') ?? '';
-                  const cleaned = raw
-                    .replace(/[\r\n\t]/g, ' ')
-                    .replace(/[\u0000-\u001F\u007F]/g, '')
-                    .replace(/\s+/g, ' ')
-                    .trim();
-                  try {
-                    config.tidal_session_json = JSON.stringify(JSON.parse(cleaned));
-                  } catch {
-                    config.tidal_session_json = cleaned;
-                  }
-                }}
-                placeholder='&#123;"token_type":&#123;"data":"Bearer"&#125;,"session_id":&#123;"data":"..."&#125;,"access_token":&#123;"data":"..."&#125;,"refresh_token":&#123;"data":"..."&#125;,"is_pkce":&#123;"data":true&#125;&#125;'
-                style="width: 100%; min-height: 140px; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 11px;"
-              />
-            {:else}
-              <label for="tidalAccessToken" style="font-size: 12px; opacity: 0.7; margin-top: 12px; display: block;">Access token</label>
-              <input id="tidalAccessToken" type="password" bind:value={config.tidal_access_token} placeholder="Bearer access token" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-
-              <label for="tidalRefreshToken" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Refresh token</label>
-              <input id="tidalRefreshToken" type="password" bind:value={config.tidal_refresh_token} placeholder="Refresh token" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-
-              <label for="tidalSessionId" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Session ID</label>
-              <input id="tidalSessionId" type="text" bind:value={config.tidal_session_id} placeholder="Optional session id" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-
-              <div style="display: grid; grid-template-columns: 1fr 120px; gap: 8px; margin-top: 10px;">
-                <div>
-                  <label for="tidalTokenType" style="font-size: 12px; opacity: 0.7; display: block;">Token type</label>
-                  <input id="tidalTokenType" type="text" bind:value={config.tidal_token_type} placeholder="Bearer" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-                </div>
-                <div>
-                  <label for="tidalCountryCode" style="font-size: 12px; opacity: 0.7; display: block;">Country</label>
-                  <input id="tidalCountryCode" type="text" bind:value={config.tidal_country_code} placeholder="US" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-                </div>
-              </div>
-            {/if}
-
-            <div style="display: flex; align-items: center; gap: 10px; margin-top: 14px;">
-              <button on:click={validateTidalSettings} disabled={tidalValidationLoading} style="padding: 6px 10px; font-size: 12px;">
-                {#if tidalValidationLoading}Validating...{:else}Test TIDAL Connection{/if}
-              </button>
-              <span style="font-size: 11px; opacity: 0.65;">This saves Settings first, then checks the imported TIDAL session.</span>
-            </div>
-
-            {#if tidalValidationStatus}
-              <div style={`margin-top: 12px; padding: 10px 12px; border-radius: 6px; border: 1px solid ${tidalValidationStatus.ok ? 'rgba(16,185,129,0.3)' : 'rgba(239,68,68,0.3)'}; background: ${tidalValidationStatus.ok ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)'};`}>
-                <p style={`font-size: 12px; margin: 0; color: ${tidalValidationStatus.ok ? '#86efac' : '#fca5a5'};`}>
-                  {tidalValidationStatus.ok ? 'TIDAL connection looks valid.' : 'TIDAL validation failed.'}
-                </p>
-                <p style="font-size: 11px; margin: 6px 0 0; opacity: 0.75;">{tidalValidationStatus.message}</p>
-                {#if tidalValidationStatus.display_name}
-                  <p style="font-size: 11px; margin: 6px 0 0; opacity: 0.75;">Account: {tidalValidationStatus.display_name}{tidalValidationStatus.country_code ? ` (${tidalValidationStatus.country_code})` : ''}</p>
-                {/if}
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p id="settings-apple" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Apple Music</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Use your own Apple Music subscription for direct lossless downloads. Paste the web player tokens plus your Widevine device file path.</p>
-
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
-          <input
-            type="checkbox"
-            checked={config.apple_enabled}
-            on:change={(e) => config.apple_enabled = e.currentTarget.checked}
-            style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Enable Apple Music</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the direct Apple Music adapter. Songs download with your own subscription instead of shared mirrors.</p>
-          </div>
-        </label>
-
-        {#if config.apple_enabled}
-          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
-            <div style="margin-bottom: 16px; padding: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
-              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px;">Browser Session Login (Recommended)</p>
-              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open a browser window, sign in to Apple Music, and let Antra capture the session automatically.</p>
-              {#if appleLogin.phase === 'idle' || appleLogin.phase === 'error'}
-                <button on:click={startAppleLogin} style="padding: 6px 12px; font-size: 12px;">Login with Apple Music</button>
-                {#if appleLogin.phase === 'error'}
-                  <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {appleLogin.message}</p>
-                {/if}
-              {:else if appleLogin.phase === 'starting'}
-                <p style="font-size: 11px; color: #94a3b8; margin: 0;">⏳ {appleLogin.message}</p>
-              {:else if appleLogin.phase === 'success'}
-                <p style="font-size: 11px; color: #86efac; margin: 0;">✅ {appleLogin.message}</p>
-              {/if}
-            </div>
-
-            <label for="appleAuthorizationToken" style="font-size: 12px; opacity: 0.7;">Authorization token</label>
-            <input id="appleAuthorizationToken" type="password" bind:value={config.apple_authorization_token} placeholder="Bearer eyJ..." style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-
-            <label for="appleMusicUserToken" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Music user token</label>
-            <input id="appleMusicUserToken" type="password" bind:value={config.apple_music_user_token} placeholder="Music-User-Token" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-
-            <div style="display: grid; grid-template-columns: 120px 1fr; gap: 8px; margin-top: 10px;">
-              <div>
-                <label for="appleStorefront" style="font-size: 12px; opacity: 0.7; display: block;">Storefront</label>
-                <input id="appleStorefront" type="text" bind:value={config.apple_storefront} placeholder="us" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-              </div>
-              <div>
-                <label for="appleWvdPath" style="font-size: 12px; opacity: 0.7; display: block;">Widevine device path</label>
-                <input id="appleWvdPath" type="text" bind:value={config.apple_wvd_path} placeholder="C:\\path\\to\\android_l3.wvd" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-              </div>
-            </div>
-
-            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">The browser login fills the tokens automatically. You still need a valid <code>.wvd</code> device file path for decryption.</p>
-          </div>
-        {/if}
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p id="settings-amazon" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Amazon Music</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Use your own Amazon Music subscription for direct FLAC downloads. Paste the extracted credentials JSON from your browser session.</p>
-
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
-          <input
-            type="checkbox"
-            checked={config.amazon_enabled}
-            on:change={(e) => config.amazon_enabled = e.currentTarget.checked}
-            style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Enable Amazon Music</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Turns on the direct Amazon adapter. The JSON must include your session tokens plus a <code>wvd_path</code>.</p>
-          </div>
-        </label>
-
-        {#if config.amazon_enabled}
-          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
-            <div style="margin-bottom: 16px; padding: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px;">
-              <p style="font-size: 12px; font-weight: 600; margin: 0 0 6px;">Browser Session Login (Recommended)</p>
-              <p style="font-size: 11px; color: #888; margin: 0 0 10px;">Open a browser window, sign in to Amazon Music, and let Antra capture the session automatically.</p>
-
-              {#if amazonLogin.phase === 'idle' || amazonLogin.phase === 'error'}
-                {@const sessionInfo = amazonSessionInfo()}
-                {#if sessionInfo && amazonLogin.phase === 'idle'}
-                  <!-- Session already saved — show status instead of login button -->
-                  <div style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; background:rgba(34,197,94,0.08); border:1px solid rgba(34,197,94,0.25); border-radius:6px; margin-bottom:10px;">
-                    <span style="font-size:13px; flex-shrink:0;">✅</span>
-                    <div>
-                      <p style="font-size:11px; color:#86efac; margin:0 0 2px; font-weight:600;">Session active</p>
-                      <p style="font-size:10px; color:#555; margin:0;">Captured {sessionInfo.capturedAt} · {sessionInfo.expiresNote}</p>
-                    </div>
-                  </div>
-                  <button on:click={startAmazonLogin} style="padding: 5px 10px; font-size: 11px; opacity:0.7;">↻ Re-login</button>
-                {:else}
-                  {#if !config.amazon_wvd_path}
-                    <div style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; background:rgba(250,204,21,0.08); border:1px solid rgba(250,204,21,0.25); border-radius:6px; margin-bottom:10px;">
-                      <span style="font-size:13px; flex-shrink:0;">⚠️</span>
-                      <p style="font-size:11px; color:#facc15; margin:0; line-height:1.5;">Set your <strong>Widevine device path</strong> below before starting the browser login — it's required for downloads.</p>
-                    </div>
-                  {/if}
-                  <button on:click={startAmazonLogin} style="padding: 6px 12px; font-size: 12px;">Browser Session Login</button>
-                  {#if amazonLogin.phase === 'error'}
-                    <p style="font-size: 11px; color: #fca5a5; margin: 8px 0 0;">✖ {amazonLogin.message}</p>
-                  {/if}
-                {/if}
-              {:else if amazonLogin.phase === 'starting'}
-                <div style="display:flex; align-items:center; gap:10px;">
-                  <p style="font-size: 11px; color: #94a3b8; margin: 0; flex:1;">⏳ {amazonLogin.message}</p>
-                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:3px 10px; font-size:11px; opacity:0.6;">Cancel</button>
-                </div>
-              {:else if amazonLogin.phase === 'waiting_for_user'}
-                <p style="font-size: 11px; color: #94a3b8; margin: 0 0 10px;">{amazonLogin.message}</p>
-                <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-                  <button
-                    on:click={async () => { amazonLogin = { phase: 'capturing', message: 'Reading your browser session…' }; try { await ConfirmAmazonLogin(); } catch(e) { amazonLogin = { phase: 'error', message: String(e) }; } }}
-                    style="padding: 6px 14px; font-size: 12px; background: #16a34a; border-color: #15803d;"
-                  >
-                    ✓ I'm Signed In
-                  </button>
-                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:5px 12px; font-size:11px; opacity:0.6;">Cancel</button>
-                </div>
-              {:else if amazonLogin.phase === 'capturing'}
-                <div style="display:flex; align-items:center; gap:10px;">
-                  <p style="font-size: 11px; color: #94a3b8; margin: 0; flex:1;">⏳ {amazonLogin.message}</p>
-                  <button on:click={() => { amazonLogin = { phase: 'idle' }; config.amazon_enabled = false; }} style="padding:3px 10px; font-size:11px; opacity:0.6;">Cancel</button>
-                </div>
-              {:else if amazonLogin.phase === 'success'}
-                <p style="font-size: 11px; color: #86efac; margin: 0;">✅ {amazonLogin.message}</p>
-                {#if amazonLogin.detail}
-                  <p style="font-size: 11px; color: #facc15; margin: 6px 0 0;">{amazonLogin.detail}</p>
-                {/if}
-              {/if}
-            </div>
-
-            <label for="amazonWvdPath" style="font-size: 12px; opacity: 0.7;">Widevine device path</label>
-            <input
-              id="amazonWvdPath"
-              type="text"
-              bind:value={config.amazon_wvd_path}
-              placeholder="C:\\path\\to\\android_l3.wvd"
-              style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;"
-            />
-
-            <p style="font-size: 10px; color: #444; text-align: center; margin: 12px 0; letter-spacing: 0.08em;">— ADVANCED / FALLBACK JSON —</p>
-
-            <label for="amazonDirectCredsJson" style="font-size: 12px; opacity: 0.7;">Credentials JSON</label>
-            <textarea
-              id="amazonDirectCredsJson"
-              bind:value={config.amazon_direct_creds_json}
-              placeholder={`{"cookie":"...","authorization":"Bearer ...","csrf_token":"...","csrf_rnd":"...","csrf_ts":"...","customer_id":"...","device_id":"...","session_id":"...","wvd_path":"C:\\path\\to\\android_l3.wvd"}`}
-              style="width: 100%; min-height: 140px; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 11px;"
-            />
-            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">The browser login fills the session JSON automatically. Amazon sessions typically last <strong>~24 hours</strong> — re-login when downloads start failing.</p>
-          </div>
-        {/if}
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p id="settings-qobuz" style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Qobuz</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Enable direct Qobuz FLAC downloads with your own account. Antra will try TIDAL first, then Qobuz, then Soulseek.</p>
-
-        <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 12px;">
-          <input
-            type="checkbox"
-            checked={config.qobuz_enabled}
-            on:change={(e) => config.qobuz_enabled = e.currentTarget.checked}
-            style="margin-top: 2px;" />
-          <div>
-            <span style="font-weight: 500;">Enable Qobuz</span>
-            <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Uses your Qobuz account for direct FLAC downloads. Email/password is the simplest setup.</p>
-          </div>
-        </label>
-
-        {#if config.qobuz_enabled}
-          <div style="margin-top: 12px; padding: 12px; background: rgba(255,255,255,0.03); border-radius: 8px; border: 1px solid rgba(255,255,255,0.06);">
-            <label for="qobuzEmail" style="font-size: 12px; opacity: 0.7;">Qobuz Email</label>
-            <input id="qobuzEmail" type="text" bind:value={config.qobuz_email} placeholder="you@example.com" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-
-            <label for="qobuzPassword" style="font-size: 12px; opacity: 0.7; margin-top: 10px; display: block;">Qobuz Password</label>
-            <input id="qobuzPassword" type="password" bind:value={config.qobuz_password} placeholder="Your Qobuz password" style="width: 100%; box-sizing: border-box; margin-top: 6px;" />
-
-            <p style="font-size: 10px; color: #444; text-align: center; margin: 12px 0; letter-spacing: 0.08em;">— OPTIONAL ADVANCED FIELDS —</p>
-
-            <label for="qobuzUserAuthToken" style="font-size: 12px; opacity: 0.7;">User auth token</label>
-            <input id="qobuzUserAuthToken" type="password" bind:value={config.qobuz_user_auth_token} placeholder="Optional existing Qobuz user_auth_token" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px;">
-              <div>
-                <label for="qobuzAppId" style="font-size: 12px; opacity: 0.7; display: block;">App ID</label>
-                <input id="qobuzAppId" type="text" bind:value={config.qobuz_app_id} placeholder="285473059" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-              </div>
-              <div>
-                <label for="qobuzAppSecret" style="font-size: 12px; opacity: 0.7; display: block;">App Secret</label>
-                <input id="qobuzAppSecret" type="password" bind:value={config.qobuz_app_secret} placeholder="Optional" style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;" />
-              </div>
-            </div>
-
-            <p style="font-size: 11px; color: #555; margin: 10px 0 0;">If App ID / App Secret are left alone, Antra will try to refresh Qobuz app credentials automatically when needed.</p>
-          </div>
-        {/if}
-      </div>
-
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
         <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Spotify Podcasts</p>
         <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Paste your Spotify account cookie to enable podcast episode and show downloads. Episodes are saved to <code>Podcasts/Show Name/</code> inside your music folder.</p>
 
@@ -2936,7 +2733,151 @@
     </div>
 
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.4</p>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.5</p>
+    </div>
+  </div>
+</div>
+{/if}
+
+<!-- ── Folder & Library Settings Modal ───────────────────────────────────── -->
+{#if showFolderSettings}
+<div class="modal-overlay" on:click={() => { saveSettings(); showFolderSettings = false; }}>
+  <div class="modal-content" on:click|stopPropagation style="max-height: 88vh; display: flex; flex-direction: column;">
+    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,204,0.2); padding-bottom: 16px; margin-bottom: 16px; flex-shrink: 0;">
+      <h3 style="margin:0; color:var(--accent-color);">📁 Folder Structure</h3>
+      <button on:click={() => { saveSettings(); showFolderSettings = false; }} style="padding: 4px 8px; font-size: 12px;">Save & Close</button>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
+
+      <!-- Music Folder -->
+      <div class="field">
+        <label for="outDirFolder">Music Library Folder</label>
+        <p style="font-size: 11px; color: #555; margin: 4px 0 8px;">Navidrome / Jellyfin compatible — point this at your media server's music directory.</p>
+        <div style="display: flex; gap: 8px; margin-top: 4px;">
+          <input id="outDirFolder" readonly type="text" value={config.download_path} />
+          <button on:click={pickDir}>Browse</button>
+        </div>
+      </div>
+
+      <!-- Library Mode -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Library Mode</p>
+        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="smart_dedup" bind:group={config.library_mode} style="margin-top: 2px;" />
+            <div>
+              Smart Dedup <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Default — skip if already in library anywhere)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Saves storage. If a track was downloaded as part of a Best Of, it won't be re-downloaded for the studio album.</p>
+            </div>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="full_albums" bind:group={config.library_mode} style="margin-top: 2px;" />
+            <div>
+              Full Albums <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">(Each album complete — allows cross-album duplicates)</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Every album folder is always complete. A track on both a studio album and a compilation will exist in both folders.</p>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      <!-- Folder Structure -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Library Layout</p>
+        <p style="font-size: 11px; color: #555; margin: 6px 0 0;">
+          Albums, playlists, and single-track links now have separate layout rules. The filename style below still controls whether files are saved as
+          <code>101 - Title</code>, <code>Title</code>, or <code>Artist - Title</code>.
+        </p>
+
+        <div style="display: flex; flex-direction: column; gap: 16px; margin-top: 12px;">
+          <div class="settings-section">
+            <div class="settings-section-title">Albums</div>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="standard" bind:group={config.album_folder_structure} style="margin-top: 2px;" />
+              <div>
+                Artist / Album
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/...</code> Best for Navidrome, Jellyfin, and Plex.</p>
+              </div>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="flat" bind:group={config.album_folder_structure} style="margin-top: 2px;" />
+              <div>
+                Album only
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Album (Year)/...</code> No artist wrapper folder.</p>
+              </div>
+            </label>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">Playlists</div>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="standard" bind:group={config.playlist_folder_structure} style="margin-top: 2px;" />
+              <div>
+                Playlists folder
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Playlists/Playlist Name/...</code> Keeps playlist copies grouped together.</p>
+              </div>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="flat" bind:group={config.playlist_folder_structure} style="margin-top: 2px;" />
+              <div>
+                Root folder
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Playlist Name/...</code> Stores playlist folders directly in your library root.</p>
+              </div>
+            </label>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">Single Track Links</div>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="album_numbered" bind:group={config.single_track_structure} style="margin-top: 2px;" />
+              <div>
+                Album folder, numbered
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/101 - Title</code> Single links start at <code>101</code> instead of reusing the original album track number.</p>
+              </div>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="album" bind:group={config.single_track_structure} style="margin-top: 2px;" />
+              <div>
+                Album folder, no forced numbering
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/Title</code> Good if you want single links to still live with the album.</p>
+              </div>
+            </label>
+            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+              <input type="radio" value="file" bind:group={config.single_track_structure} style="margin-top: 2px;" />
+              <div>
+                Standalone file
+                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Title</code> or <code>Artist - Title</code> directly in the library root, depending on the filename format you choose below.</p>
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Filename Format -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Filename Format</p>
+        <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="default" bind:group={config.filename_format} />
+            <div>Default <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">01 - Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_only" bind:group={config.filename_format} />
+            <div>Title only <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="artist_title" bind:group={config.filename_format} />
+            <div>Artist – Title <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist - Title.flac</span></div>
+          </label>
+          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="title_artist" bind:group={config.filename_format} />
+            <div>Title – Artist <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title - Artist.flac</span></div>
+          </label>
+        </div>
+      </div>
+
+    </div>
+    <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
+      <button style="width: 100%;" on:click={() => { saveSettings(); showFolderSettings = false; }}>Save & Close</button>
     </div>
   </div>
 </div>
@@ -3114,10 +3055,17 @@
           <img src="/icons/apple-music.png" alt="Apple Music" style="width:26px; height:26px; object-fit:contain;" />
         {:else if healthPopoverSource === 'amazon'}
           <img src="/icons/amazon-music.jpg" alt="Amazon Music" style="width:26px; height:26px; object-fit:contain; border-radius:4px;" />
-        {:else if healthPopoverSource === 'dab'}
+        {:else if healthPopoverSource === 'qobuz'}
           <img src="/icons/qobuz.png" alt="Qobuz" style="width:26px; height:26px; object-fit:contain;" />
+        {:else if healthPopoverSource === 'deezer'}
+          <img src="/icons/deezer.webp" alt="Deezer" style="width:26px; height:26px; object-fit:contain;" />
         {/if}
-        <span style="font-size:14px; font-weight:600; color:{activeSrc?.text ?? '#e2e8f0'};">{activeSrc?.label ?? ''}</span>
+        <div style="display:flex; flex-direction:column; gap:2px;">
+          <span style="font-size:14px; font-weight:600; color:{activeSrc?.text ?? '#e2e8f0'};">{activeSrc?.label ?? ''}</span>
+          {#if healthPopoverSource === 'apple'}
+            <span style="font-size:11px; color:#6b7280;">AAC / MP3 only</span>
+          {/if}
+        </div>
       </div>
       <button on:click={() => showHealthPopover = false} style="padding:4px 8px; font-size:12px;">✕</button>
     </div>
@@ -3346,11 +3294,6 @@
     overflow-y: auto;
     padding-top: 48px;
     padding-bottom: 48px;
-  }
-  .logo pre {
-    color: var(--accent-color);
-    font-weight: bold;
-    text-align: center;
   }
   .logo p {
     text-align: center;
@@ -4058,6 +4001,104 @@
   }
   .sponsor-toast-close:hover { color: #888; }
 
+  /* ── Access key reminder toast ───────────────────────────────────────────── */
+  .key-reminder-toast {
+    position: fixed;
+    width: 320px;
+    background: rgba(8, 14, 12, 0.97);
+    border: 1px solid rgba(0, 255, 204, 0.28);
+    border-radius: 12px;
+    padding: 14px 14px 14px 12px;
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    z-index: 250;
+    box-shadow:
+      0 0 0 1px rgba(0, 255, 204, 0.12),
+      0 8px 32px rgba(0, 0, 0, 0.65),
+      0 0 24px rgba(0, 255, 204, 0.08);
+    backdrop-filter: blur(18px);
+    cursor: pointer;
+    animation: key-toast-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+    transition: box-shadow 0.2s, border-color 0.2s;
+    transform-origin: top right;
+  }
+  .key-reminder-toast:hover {
+    border-color: rgba(0, 255, 204, 0.5);
+    box-shadow:
+      0 0 0 1px rgba(0, 255, 204, 0.25),
+      0 10px 36px rgba(0, 0, 0, 0.7),
+      0 0 32px rgba(0, 255, 204, 0.14);
+  }
+  .key-reminder-toast.leaving {
+    animation: key-toast-out 0.45s cubic-bezier(0.55, 0, 1, 0.45) both;
+  }
+  @keyframes key-toast-in {
+    from { opacity: 0; transform: translate(18px, -20px) scale(0.7); }
+    to   { opacity: 1; transform: translate(0, 0) scale(1); }
+  }
+  @keyframes key-toast-out {
+    from { opacity: 1; transform: translate(0, 0) scale(1); }
+    to   { opacity: 0; transform: translate(18px, -20px) scale(0.28); }
+  }
+
+  .key-reminder-icon {
+    font-size: 22px;
+    flex-shrink: 0;
+    margin-top: 1px;
+    filter: drop-shadow(0 0 6px rgba(0, 255, 204, 0.4));
+  }
+
+  .key-reminder-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .key-reminder-title {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent-color);
+    line-height: 1.2;
+    letter-spacing: 0.01em;
+  }
+
+  .key-reminder-text {
+    margin: 0;
+    font-size: 11px;
+    color: #6b7280;
+    line-height: 1.55;
+  }
+
+  .key-reminder-cta {
+    margin-top: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgba(0, 255, 204, 0.7);
+    letter-spacing: 0.03em;
+    transition: color 0.15s;
+  }
+  .key-reminder-toast:hover .key-reminder-cta {
+    color: var(--accent-color);
+  }
+
+  .key-reminder-close {
+    flex-shrink: 0;
+    background: transparent;
+    border: none;
+    color: #444;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0;
+    cursor: pointer;
+    margin-top: -2px;
+    transition: color 0.15s;
+  }
+  .key-reminder-close:hover { color: #888; }
+
   /* ── Ko-fi icon hover tooltip ────────────────────────────────────────────── */
   .kofi-wrap {
     position: relative;
@@ -4178,9 +4219,21 @@
 
   .format-selector {
     display: flex;
+    flex-direction: column;
+    gap: 3px;
+    align-items: flex-end;
+    margin-left: auto;
+  }
+  .format-main-row {
+    display: flex;
     gap: 4px;
     align-items: center;
-    margin-left: auto;
+  }
+  .format-sub-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    padding-right: 1px;
   }
 
   .format-pill {
@@ -4198,6 +4251,9 @@
   }
   .format-pill:hover { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.7); }
   .format-pill.active { background: rgba(0,255,204,0.12); border-color: var(--accent-color); color: var(--accent-color); }
+  .format-pill--sub { font-size: 9px; padding: 2px 6px; opacity: 0.75; }
+  .format-pill--sub:hover { opacity: 1; }
+  .format-pill--sub.active { opacity: 1; }
 
   .health-chip {
     display: inline-flex;

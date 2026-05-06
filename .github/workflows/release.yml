@@ -291,27 +291,20 @@ jobs:
           body: |
             ## What's New
 
-            - **Spotify Metadata Fixed** — built-in TOTP-based token generation goes directly to Spotify's own API, eliminating reliance on third-party proxies that were offline ([#2](https://github.com/anandprtp/Antra/issues/2), [#9](https://github.com/anandprtp/Antra/issues/9))
-            - **Amazon Music Fixed** — album and track fetching rewritten to parse schema.org JSON-LD, replacing the broken web-component scraper ([#6](https://github.com/anandprtp/Antra/issues/6))
-            - **Correct Amazon ASINs** — ASINs now sourced directly from Amazon Music URLs; Odesli runs before the amazon.com scraper, preventing wrong track matches ([#10](https://github.com/anandprtp/Antra/issues/10))
-            - **Faster Downloads** — Amazon 404 errors no longer trigger 3 retries; skipped instantly ([#10](https://github.com/anandprtp/Antra/issues/10))
-            - **Version Label** — app version is now shown in the settings panel
+            - **Animated Logo** — new circuit-board "A" logo with orbiting service icons (Spotify, Apple Music, Amazon, Tidal, Deezer, and more) on the welcome screen
+            - **Streamlined Setup** — the first-run screen now shows only the folder picker; everything else lives in dedicated panels
+            - **Folder Structure Panel** — new 📁 nav button opens Library Mode, Folder Structure, and Filename Format settings
+            - **Settings Focused** — ⚙️ settings trimmed to API key, failed-track retries, and sources
+            - **New Source Adapters** — Deezer, Tidal, and Qobuz mirror adapters; YouTube via yt-dlp
+            - **Core Engine Improvements** — resolver, organiser, tagger, and transcoder improvements across the board
             - **Community** — join us on [Telegram](https://t.me/antraaverse) · support on [Ko-fi](https://ko-fi.com/antraverse)
-
-            ## Bug Fixes
-
-            - Fixed Spotify metadata fetching when no credentials are configured — SpotFetch proxies were all down, now uses direct TOTP token + Spotify partner API as primary path
-            - Added multi-mirror failover pool for SpotFetch with instant skip on DNS failures
-            - Fixed Amazon Music album pages returning "Could not find track listing" after Amazon dropped their web-component elements
-            - Fixed wrong Amazon ASINs being matched via amazon.com product scraper (e.g. old CD pressings)
-            - Fixed Amazon source retrying 3× on 404 errors before falling through to the next source
 
             ## Downloads
 
-            [![Windows](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.2/Antra.exe?display_name=true&logo=windows&label=Windows&style=for-the-badge&color=0078D6)](https://github.com/anandprtp/Antra/releases/download/v1.1.2/Antra.exe)
-            [![macOS Apple Silicon](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.2/Antra-macOS.dmg?display_name=true&logo=apple&label=macOS+Apple+Silicon&style=for-the-badge&color=111111)](https://github.com/anandprtp/Antra/releases/download/v1.1.2/Antra-macOS.dmg)
-            [![macOS Intel](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.2/Antra-macOS-Intel.dmg?display_name=true&logo=apple&label=macOS+Intel&style=for-the-badge&color=555555)](https://github.com/anandprtp/Antra/releases/download/v1.1.2/Antra-macOS-Intel.dmg)
-            [![Linux](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.2/Antra-Linux.AppImage?display_name=true&logo=linux&label=Linux&style=for-the-badge&color=FCC624&logoColor=black)](https://github.com/anandprtp/Antra/releases/download/v1.1.2/Antra-Linux.AppImage)
+            [![Windows](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra.exe?display_name=true&logo=windows&label=Windows&style=for-the-badge&color=0078D6)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra.exe)
+            [![macOS Apple Silicon](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-macOS.dmg?display_name=true&logo=apple&label=macOS+Apple+Silicon&style=for-the-badge&color=111111)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-macOS.dmg)
+            [![macOS Intel](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-macOS-Intel.dmg?display_name=true&logo=apple&label=macOS+Intel&style=for-the-badge&color=555555)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-macOS-Intel.dmg)
+            [![Linux](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-Linux.AppImage?display_name=true&logo=linux&label=Linux&style=for-the-badge&color=FCC624&logoColor=black)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-Linux.AppImage)
 
             ## Files
 

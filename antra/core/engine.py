@@ -41,6 +41,26 @@ def _is_mount_lost_error(exc: BaseException) -> bool:
     return isinstance(exc, OSError) and exc.errno in _MOUNT_LOST_ERRNOS
 
 
+def _is_server_error(exc: BaseException) -> bool:
+    """Return True if the exception looks like a remote server 5xx failure.
+
+    Used by the circuit breaker to distinguish between "track not found / auth
+    issue" (which should not trip the breaker) and "the mirror server itself is
+    down / returning 500" (which should rate-limit the adapter globally after
+    3 consecutive failures so subsequent tracks skip it immediately).
+    """
+    msg = str(exc).lower()
+    # Catch explicit HTTP status codes (500, 502, 503, 504, 507…)
+    import re as _re
+    if _re.search(r"\b5\d{2}\b", msg):
+        return True
+    # Catch phrased server errors from mirror adapters
+    return any(kw in msg for kw in (
+        "server error", "internal error", "all mirrors failed",
+        "service unavailable", "bad gateway",
+    ))
+
+
 @dataclass
 class EngineConfig:
     max_retries: int = 3
@@ -48,7 +68,7 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     output_format: str = "source"
-    max_workers: int = 2
+    max_workers: int = 1
 
 
 class DownloadEngine:
@@ -74,6 +94,11 @@ class DownloadEngine:
         # can abort immediately instead of producing per-track error messages.
         self._output_lost = threading.Event()
         self._output_lost_message: str = ""
+        # Per-adapter consecutive server-error counter (survives across tracks).
+        # When an adapter hits 3 consecutive 5xx failures it is rate-limited for
+        # 5 minutes so the resolver stops selecting it for subsequent tracks.
+        self._adapter_server_errors: dict[str, int] = {}
+        self._adapter_server_errors_lock = threading.Lock()
 
     def _signal_output_lost(self, exc: OSError) -> None:
         """Record the first mount-loss error so workers can abort fast."""
@@ -143,7 +168,10 @@ class DownloadEngine:
         return self.transcoder.needs_conversion(file_path, output_format)
 
     def _requires_lossless_output(self) -> bool:
-        return self.cfg.output_format in {"flac", "lossless", "alac"}
+        return self.cfg.output_format in {"flac", "lossless", "alac", "lossless-16", "lossless-24", "alac-16", "alac-24"}
+
+    def _is_lossy_output_mode(self) -> bool:
+        return self.cfg.output_format in {"mp3", "aac", "m4a"}
 
     @staticmethod
     def _probe_duration_seconds(file_path: str) -> float | None:
@@ -163,12 +191,14 @@ class DownloadEngine:
 
     @staticmethod
     def _probe_duration_seconds_with_ffprobe(file_path: str) -> float | None:
-        if not shutil.which("ffprobe"):
+        from antra.utils.runtime import get_ffprobe_exe
+        ffprobe = get_ffprobe_exe() or shutil.which("ffprobe")
+        if not ffprobe:
             return None
         try:
             result = subprocess.run(
                 [
-                    "ffprobe",
+                    ffprobe,
                     "-v",
                     "error",
                     "-show_entries",
@@ -192,33 +222,60 @@ class DownloadEngine:
 
     @classmethod
     def _is_truncated_download(cls, file_path: str, expected_duration_ms: int | None) -> bool:
+        return cls._get_truncation_reason(file_path, expected_duration_ms) is not None
+
+    @classmethod
+    def _get_truncation_reason(
+        cls,
+        file_path: str,
+        expected_duration_ms: int | None,
+        result_duration_ms: int | None = None,
+    ) -> str | None:
         if not expected_duration_ms or expected_duration_ms < 60000:
-            return False
+            return None
+
+        # Lossy formats (mp3, aac, m4a with opus/aac) from Amazon are often
+        # a different edit or preview version — skip the duration check entirely.
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext in {".mp3", ".aac"}:
+            # For lossy output, only run the FLAC size check (which is a no-op
+            # for non-FLAC files). Duration mismatches on lossy files are almost
+            # always version differences, not truncated downloads.
+            return cls._get_flac_truncation_reason(file_path)
+
         actual_seconds = cls._probe_duration_seconds(file_path)
         if actual_seconds is None:
-            return False
+            return None
         expected_seconds = expected_duration_ms / 1000.0
 
-        # Original duration-based check (unchanged)
+        # If the source result reported its own duration and the file matches it,
+        # the download is complete — the track metadata duration (e.g. from Spotify)
+        # may differ because it's a different version (radio edit, preview, etc.).
+        if result_duration_ms and result_duration_ms >= 60000:
+            result_seconds = result_duration_ms / 1000.0
+            if abs(actual_seconds - result_seconds) <= result_seconds * 0.05 + 5:
+                # File matches the source's own declared duration — not truncated.
+                return cls._get_flac_truncation_reason(file_path)
+
+        # Duration-based truncation check for lossless files
         if (
             actual_seconds < expected_seconds * 0.8
             and (expected_seconds - actual_seconds) >= 20
         ):
-            return True
+            return (
+                f"duration mismatch: got {actual_seconds:.1f}s "
+                f"but expected {expected_seconds:.1f}s"
+            )
 
         # Secondary file-size check for FLAC files.
-        # FLAC headers declare total samples upfront, so Mutagen reports the
-        # *intended* duration even when the stream was cut short mid-download.
-        # This catches those cases by comparing actual file size against a
-        # conservative minimum estimate derived from the header's own
-        # bit_depth / sample_rate.
-        if cls._is_truncated_flac_by_size(file_path):
-            return True
+        return cls._get_flac_truncation_reason(file_path)
 
-        return False
+    @classmethod
+    def _is_truncated_flac_by_size(cls, file_path: str) -> bool:
+        return cls._get_flac_truncation_reason(file_path) is not None
 
     @staticmethod
-    def _is_truncated_flac_by_size(file_path: str) -> bool:
+    def _get_flac_truncation_reason(file_path: str) -> str | None:
         """
         Detect truncated FLAC downloads by comparing actual file size against
         the minimum expected size based on the FLAC header's own metadata.
@@ -227,19 +284,20 @@ class DownloadEngine:
         reports the full *intended* duration even when the file was truncated
         mid-stream.  This check catches those cases.
 
-        Only runs on .flac files.  Uses a very conservative ratio threshold
-        of 0.25 — real FLAC files never compress below ~0.35x of raw PCM,
-        while truncated files typically show 0.15–0.26x.
+        Only runs on .flac files. Small hi-res acoustic masters can compress
+        much harder than a fixed size floor suggests, so we treat a low
+        size-to-PCM ratio as suspicious and confirm it with a real decode
+        probe before declaring the file truncated.
         """
         if not file_path.lower().endswith(".flac"):
-            return False
+            return None
 
         try:
             from mutagen.flac import FLAC as FLACFile
 
             audio = FLACFile(file_path)
             if not audio or not audio.info:
-                return False
+                return None
 
             bits = getattr(audio.info, "bits_per_sample", None)
             rate = getattr(audio.info, "sample_rate", None)
@@ -247,29 +305,64 @@ class DownloadEngine:
             length = getattr(audio.info, "length", None)
 
             if not all((bits, rate, channels, length)):
-                return False
+                return None
             if length < 60:
-                return False  # Don't flag short tracks
+                return None  # Don't flag short tracks
 
             actual_size = os.path.getsize(file_path)
             # Raw PCM size for the declared duration
             raw_pcm_bytes = length * rate * channels * (bits / 8)
             # FLAC typically compresses to 50-70% of raw.
-            # Use 0.25 as our floor — anything below this is definitely truncated.
-            # (Even the most silence-heavy FLAC only compresses to ~35%.)
+            # Use 0.25 as a suspicion threshold only. Some valid sparse masters
+            # can dip below this, especially 24-bit/96kHz acoustic material.
             min_expected_bytes = raw_pcm_bytes * 0.25
 
             if actual_size < min_expected_bytes:
                 ratio = actual_size / raw_pcm_bytes if raw_pcm_bytes > 0 else 0
                 logger.debug(
                     f"[Engine] FLAC size check: {file_path} is {actual_size / (1024*1024):.1f}MB "
-                    f"but expected ≥{min_expected_bytes / (1024*1024):.1f}MB "
-                    f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s)"
+                    f"vs suspicious floor {min_expected_bytes / (1024*1024):.1f}MB "
+                    f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s) — running decode probe"
                 )
-                return True
+                if DownloadEngine._fails_flac_decode_probe(file_path):
+                    return (
+                        f"suspicious FLAC failed decode probe "
+                        f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s)"
+                    )
 
         except Exception as e:
             logger.debug(f"[Engine] FLAC size check failed: {e}")
+
+        return None
+
+    @staticmethod
+    def _fails_flac_decode_probe(file_path: str) -> bool:
+        """Return True when ffmpeg cannot fully decode the FLAC cleanly."""
+        try:
+            from antra.utils.runtime import get_ffmpeg_exe
+
+            ffmpeg = get_ffmpeg_exe() or shutil.which("ffmpeg")
+            if not ffmpeg:
+                logger.debug("[Engine] FLAC decode probe skipped — ffmpeg unavailable")
+                return False
+
+            result = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", file_path, "-f", "null", "-"],
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except Exception as e:
+            logger.debug(f"[Engine] FLAC decode probe failed to run: {e}")
+            return False
+
+        stderr = (result.stderr or "").strip()
+        if result.returncode != 0 or stderr:
+            logger.debug(
+                f"[Engine] FLAC decode probe failed for {file_path}: "
+                f"exit={result.returncode} stderr={stderr[-300:]}"
+            )
+            return True
 
         return False
 
@@ -365,20 +458,30 @@ class DownloadEngine:
                     rate_limited_adapters.clear()
                     continue
 
-                self.organizer.mark_failed(track, last_error or "no_source")
+                user_error = last_error or "No matching source found"
+                if (
+                    getattr(track, "amazon_asin", None)
+                    and self._is_lossy_output_mode()
+                    and "amazon" in excluded_adapters
+                ):
+                    user_error = (
+                        "Amazon could not provide a playable file for this track, "
+                        "and no safe YouTube fallback match was found."
+                    )
+                self.organizer.mark_failed(track, user_error)
                 self._emit(
                     EngineEventType.TRACK_FAILED,
                     track=track,
                     track_index=track_index,
                     track_total=track_total,
                     source=last_source,
-                    error=last_error or "No matching source found",
+                    error=user_error,
                 )
                 return DownloadResult(
                     track=track,
                     status=DownloadStatus.FAILED,
                     source_used=last_source,
-                    error_message=last_error or "No matching source found",
+                    error_message=user_error,
                     attempt_count=self.cfg.max_retries,
                 )
 
@@ -442,13 +545,37 @@ class DownloadEngine:
                             f"  \U0001f501 [Retry {attempt}] [{track_index}/{track_total}] {track.title} ({source_quality})"
                         )
                     candidate_path = adapter.download(result, output_base)
+                    # Probe actual duration before transcoding — used as the
+                    # authoritative reference for the truncation check below.
+                    # Amazon OPUS streams may be a different edit than the
+                    # Spotify metadata suggests; probing before conversion
+                    # gives us the true source duration.
+                    _pre_transcode_duration_s = self._probe_duration_seconds(candidate_path)
+                    source_duration_ms: int | None = (
+                        int(_pre_transcode_duration_s * 1000)
+                        if _pre_transcode_duration_s is not None else None
+                    )
                     if self._should_convert_output(candidate_path, self.cfg.output_format):
                         logger.info(f"  [FMT]  Converting to {self.cfg.output_format}: {track.title}")
-                        candidate_path = self.transcoder.convert(candidate_path, self.cfg.output_format)
-                    if self._is_truncated_download(candidate_path, track.duration_ms):
+                        try:
+                            candidate_path = self.transcoder.convert(candidate_path, self.cfg.output_format)
+                        except (KeyError, ValueError) as conv_err:
+                            # Unsupported format string (e.g. 'lossless-24' in old binary) —
+                            # keep the file as-is rather than crashing the whole engine.
+                            logger.warning(
+                                f"  [FMT]  Format conversion skipped ({conv_err}) — "
+                                f"keeping source file: {candidate_path}"
+                            )
+                    truncation_reason = self._get_truncation_reason(
+                        candidate_path,
+                        track.duration_ms,
+                        result_duration_ms=source_duration_ms,
+                    )
+                    if truncation_reason is not None:
                         self._discard_file(candidate_path)
                         raise RuntimeError(
-                            f"[{adapter.name}] Download appears truncated for {track.title}"
+                            f"[{adapter.name}] Download appears truncated for {track.title} "
+                            f"({truncation_reason})"
                         )
                     file_path = candidate_path
                     break
@@ -574,7 +701,34 @@ class DownloadEngine:
 
             if should_exclude:
                 excluded_adapters.add(adapter.name)
-                logger.info(f"  [NEXT]  {adapter.name} failed after retries, trying next source...")
+                if (
+                    adapter.name == "amazon"
+                    and getattr(track, "amazon_asin", None)
+                    and self._is_lossy_output_mode()
+                ):
+                    logger.info("  [NEXT]  Amazon could not provide a usable file — trying YouTube fallback...")
+                else:
+                    logger.info(f"  [NEXT]  {adapter.name} failed after retries, trying next source...")
+                # Circuit breaker: if the failure looks like a server-side 5xx
+                # (not a missing track or auth issue), count consecutive failures.
+                # After 3 in a row, rate-limit the adapter globally for 5 minutes
+                # so it is skipped for all subsequent tracks in this session.
+                if final_error is not None and _is_server_error(final_error):
+                    with self._adapter_server_errors_lock:
+                        count = self._adapter_server_errors.get(adapter.name, 0) + 1
+                        self._adapter_server_errors[adapter.name] = count
+                    if count >= 3:
+                        logger.warning(
+                            f"  [CIRCUIT]  {adapter.name} has failed with server errors "
+                            f"{count} times — marking unavailable for 5 minutes."
+                        )
+                        self.resolver._mark_rate_limited(adapter.name, cooldown_seconds=300)
+                        with self._adapter_server_errors_lock:
+                            self._adapter_server_errors[adapter.name] = 0
+                else:
+                    # Non-server-error failure (404, auth, no match) resets the counter.
+                    with self._adapter_server_errors_lock:
+                        self._adapter_server_errors.pop(adapter.name, None)
             else:
                 logger.info(f"  [NEXT]  {adapter.name} candidate failed, trying another match from the same source...")
 

@@ -38,7 +38,7 @@ _ITUNES_LOOKUP = "https://itunes.apple.com/lookup"
 _ITUNES_SEARCH = "https://itunes.apple.com/search"
 
 # ── Apple Music Catalog API ───────────────────────────────────────────────────
-_AM_CATALOG = "https://api.music.apple.com/v1/catalog/{storefront}"
+_AM_CATALOG = "https://amp-api.music.apple.com/v1/catalog/{storefront}"
 
 REQUEST_TIMEOUT = 15
 MAX_PLAYLIST_PAGES = 20   # safety cap at 500 tracks (25 per page)
@@ -141,13 +141,14 @@ class AppleFetcher:
                 resp = self._session.get(
                     f"{_AM_CATALOG.format(storefront=storefront)}/songs/{track_id}",
                     headers={"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"},
+                    params={"extend": "audioTraits"},
                     timeout=REQUEST_TIMEOUT,
                 )
                 if resp.ok:
                     data = resp.json().get("data", [])
                     if data:
                         logger.debug(f"[Apple] Song {track_id} fetched via Catalog API")
-                        return self._catalog_item_to_metadata(data[0].get("attributes", {}))
+                        return self._catalog_item_to_metadata(data[0].get("attributes", {}), track_id=data[0].get("id") or track_id)
             except Exception as e:
                 logger.debug(f"[Apple] Catalog API song fetch failed: {e}")
 
@@ -176,7 +177,10 @@ class AppleFetcher:
             logger.warning(f"[Apple] No song found for track ID {track_id}")
             return None
 
-        return self._item_to_metadata(songs[0])
+        meta = self._item_to_metadata(songs[0])
+        if meta and track_id:
+            meta.apple_music_id = str(track_id)
+        return meta
 
     # ── Album ─────────────────────────────────────────────────────────────────
 
@@ -188,7 +192,7 @@ class AppleFetcher:
                 resp = self._session.get(
                     f"{_AM_CATALOG.format(storefront=storefront)}/albums/{album_id}",
                     headers={"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"},
-                    params={"include": "tracks"},
+                    params={"include": "tracks", "extend": "audioTraits"},
                     timeout=REQUEST_TIMEOUT,
                 )
                 if resp.ok:
@@ -204,7 +208,7 @@ class AppleFetcher:
                         track_relationships = album_data[0].get("relationships", {}).get("tracks", {}).get("data", [])
                         tracks = []
                         for t in track_relationships:
-                            meta = self._catalog_item_to_metadata(t.get("attributes", {}))
+                            meta = self._catalog_item_to_metadata(t.get("attributes", {}), track_id=t.get("id"))
                             if meta:
                                 if upc and not meta.upc:
                                     meta.upc = upc
@@ -439,7 +443,7 @@ class AppleFetcher:
 
             for item in items:
                 attrs = item.get("attributes", {})
-                meta = self._catalog_item_to_metadata(attrs)
+                meta = self._catalog_item_to_metadata(attrs, track_id=item.get("id"))
                 if meta:
                     meta.playlist_name = playlist_name
                     meta.playlist_position = len(tracks) + 1
@@ -449,7 +453,7 @@ class AppleFetcher:
 
             # Pagination
             next_url = data.get("next")
-            url = f"https://api.music.apple.com{next_url}" if next_url else None
+            url = f"https://amp-api.music.apple.com{next_url}" if next_url else None
             page += 1
             if url:
                 time.sleep(0.2)  # polite pacing
@@ -579,6 +583,14 @@ class AppleFetcher:
             # will use title+artist+duration matching instead.
             isrc = item.get("isrc") or None
 
+            # iTunes returns trackExplicitness: "explicit", "cleaned", or "notExplicit"
+            track_explicitness = item.get("trackExplicitness", "")
+            is_explicit: Optional[bool] = (
+                True if track_explicitness == "explicit"
+                else False if track_explicitness in ("cleaned", "notExplicit")
+                else None
+            )
+
             return TrackMetadata(
                 title=title,
                 artists=self._split_artists(artist),
@@ -591,12 +603,14 @@ class AppleFetcher:
                 release_date=release_raw or None,
                 release_year=release_year,
                 artwork_url=artwork_url,
+                apple_music_id=track_id if track_id else None,
+                is_explicit=is_explicit,
             )
         except Exception as e:
             logger.debug(f"[Apple] Failed to parse iTunes item: {e}")
             return None
 
-    def _catalog_item_to_metadata(self, attrs: dict) -> Optional[TrackMetadata]:
+    def _catalog_item_to_metadata(self, attrs: dict, track_id: Optional[str] = None) -> Optional[TrackMetadata]:
         """Convert an Apple Music Catalog API track attributes dict to TrackMetadata."""
         try:
             title  = attrs.get("name", "")
@@ -649,6 +663,7 @@ class AppleFetcher:
                 genres=genres,
                 audio_traits=audio_traits,
                 is_explicit=is_explicit,
+                apple_music_id=str(track_id) if track_id else None,
             )
         except Exception as e:
             logger.debug(f"[Apple] Failed to parse catalog item: {e}")

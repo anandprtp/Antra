@@ -110,6 +110,10 @@ class FileTagger:
         date_str = track.release_date or (str(track.release_year) if track.release_year else None)
         if date_str:
             audio["date"] = date_str
+            # Also write YEAR (4-digit) — Windows Media Player reads YEAR, not DATE
+            year_str = date_str[:4] if len(date_str) >= 4 and date_str[:4].isdigit() else None
+            if year_str:
+                audio["year"] = year_str
         if track.track_number:
             tn = str(track.track_number)
             if track.total_tracks:
@@ -274,7 +278,23 @@ class FileTagger:
 
     @staticmethod
     def _write_lyrics_sidecars(file_path: str, track: TrackMetadata):
-        """Writes .lrc and .txt sidecar files for external players."""
+        """
+        Writes .lrc and .txt sidecar files for external players.
+
+        Skipped for formats that already carry lyrics in their tags:
+          - FLAC  → SYNCEDLYRICS / LYRICS VorbisComment tags
+          - MP3   → SYLT (synced) / USLT (plain) ID3 frames
+          - M4A   → ©lyr atom
+        For any other extension (e.g. .ogg, .opus) sidecars are still written.
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # These formats have embedded lyrics written by embed_lyrics(); no sidecar needed.
+        _EMBEDDED_FORMATS = {".flac", ".mp3", ".m4a", ".mp4", ".aac"}
+
+        if ext in _EMBEDDED_FORMATS:
+            return
+
         base, _ = os.path.splitext(file_path)
 
         if track.synced_lyrics:

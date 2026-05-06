@@ -84,6 +84,9 @@ amazon-music.jpg
 apple_logo.png
 qobuz_icon.png
 tidal_logo_icon_147227.webp
+/deezer-logo-coeur-1920x1181.webp
+/Antra_newlogo.png
+/Antra Logo Animation.html
 
 # Temp debug/scratchpad files
 artist_embed_data.json
@@ -93,6 +96,12 @@ fail.log
 ci_log.txt
 ci_log2.txt
 antra.log
+test_error.txt
+test_out.txt
+test_output.txt
+
+# Scratch / one-off test scripts
+antra/test_format.py
 
 # Duplicate / draft docs
 "README - Copy.md"

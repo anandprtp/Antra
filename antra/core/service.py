@@ -3,6 +3,7 @@ Reusable application service for CLI and future desktop frontends.
 """
 import logging
 import json
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
@@ -22,13 +23,14 @@ from antra.core.models import (
 )
 from antra.core.resolver import SourceResolver
 from antra.core.spotify import SpotifyClient
+from antra.utils.matching import duration_close, score_similarity
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "dab", "qobuz", "soulseek", "jiosaavn")
-OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3")
+SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "dab", "qobuz", "deezer", "soulseek", "youtube", "jiosaavn")
+OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3", "lossless-16", "lossless-24", "alac-16", "alac-24")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
 SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
 LEGACY_SOURCE_PREFERENCE_ALIASES = {
@@ -80,19 +82,22 @@ def _parse_enabled_sources(value) -> set[str]:
     return {str(item).strip().lower() for item in raw_items if str(item).strip()}
 
 
-def _merge_amazon_direct_creds_json(raw_json: str, wvd_path: str) -> str:
+def _merge_amazon_direct_creds_json(raw_json: str, wvd_path: str, country_code: str = "us") -> str:
     raw_json = (raw_json or "").strip()
     if not raw_json:
         return ""
-    if not (wvd_path or "").strip():
-        return raw_json
     try:
         payload = json.loads(raw_json)
     except Exception:
         return raw_json
     if not isinstance(payload, dict):
         return raw_json
-    payload["wvd_path"] = (wvd_path or "").strip()
+    if (wvd_path or "").strip():
+        payload["wvd_path"] = (wvd_path or "").strip()
+    # Inject country_code so _DirectAmazonClient._get_marketplace() picks the right
+    # marketplaceId/territoryId for the DMLS API. Only set if not already present.
+    if country_code and not payload.get("country_code"):
+        payload["country_code"] = country_code.strip().lower()
     try:
         return json.dumps(payload)
     except Exception:
@@ -179,11 +184,11 @@ class AntraService:
         if not normalized or normalized == "auto":
             return adapters
         if normalized == "soulseek":
-            preferred_order = ["soulseek", "apple", "hifi", "jiosaavn"]
+            preferred_order = ["soulseek", "apple", "hifi", "youtube", "jiosaavn"]
             by_name = {adapter.name: adapter for adapter in adapters}
             return [by_name[name] for name in preferred_order if name in by_name]
         if normalized == "priority-2":
-            allowed = {"hifi", "amazon", "apple", "dab", "soulseek", "jiosaavn"}
+            allowed = {"hifi", "amazon", "apple", "dab", "soulseek", "youtube", "jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         if normalized == "priority-3":
             allowed = {"jiosaavn"}
@@ -205,7 +210,15 @@ class AntraService:
         enabled_sources = _parse_enabled_sources(getattr(cfg, "sources_enabled", ""))
 
         def source_group_enabled(name: str) -> bool:
-            return not enabled_sources or name in enabled_sources
+            if not enabled_sources or name in enabled_sources:
+                return True
+            # Backward compatibility: existing installs may have a persisted
+            # allow-list from before YouTube existed. Treat YouTube as part of
+            # the lossy fallback family so it comes online automatically for
+            # those users without requiring a Settings reset.
+            if name == "youtube" and "jiosaavn" in enabled_sources:
+                return True
+            return False
 
         manifest = None
         try:
@@ -261,6 +274,65 @@ class AntraService:
                     )
             except Exception as e:
                 logger.warning(f"Soulseek adapter failed to initialize: {e}")
+
+        # ── Self-hosted mirror servers (priority 1 = 24-bit, priority 3 = 16-bit) ──
+        # URLs come from env vars first, then from the private manifest "mirrors" block.
+        # The API key comes from ANTRA_API_KEY env var, or from the manifest "api_key" field.
+        # Users only need to set ANTRA_ENDPOINT_MANIFEST_URL — the manifest delivers
+        # both the server URLs and the API key in one fetch.
+
+        def _mirror_url(env_key: str, manifest_attr: str) -> str:
+            """Env var takes precedence; manifest fills in when env var is blank."""
+            from_env = (getattr(cfg, env_key, "") or "").strip()
+            if from_env:
+                return from_env
+            if manifest is not None:
+                return (getattr(manifest, manifest_attr, "") or "").strip()
+            return ""
+
+        # API key: env var > manifest field
+        api_key = (getattr(cfg, "antra_api_key", "") or "").strip()
+        if not api_key and manifest is not None:
+            api_key = (getattr(manifest, "api_key", "") or "").strip()
+
+        tidal_mirror_url = _mirror_url("tidal_mirror_url", "mirror_tidal")
+        if source_group_enabled("tidal_mirror") and tidal_mirror_url:
+            try:
+                from antra.sources.tidal_mirror import TidalMirrorAdapter
+                adapter = TidalMirrorAdapter(mirror_url=tidal_mirror_url, api_key=api_key)
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] Tidal mirror adapter enabled")
+                else:
+                    logger.warning("[Sources] Tidal mirror unreachable")
+            except Exception as e:
+                logger.warning("Tidal mirror adapter failed to initialize: %s", e)
+
+        qobuz_mirror_url = _mirror_url("qobuz_mirror_url", "mirror_qobuz")
+        if source_group_enabled("qobuz_mirror") and qobuz_mirror_url:
+            try:
+                from antra.sources.qobuz_mirror import QobuzMirrorAdapter
+                adapter = QobuzMirrorAdapter(mirror_url=qobuz_mirror_url, api_key=api_key)
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] Qobuz mirror adapter enabled")
+                else:
+                    logger.warning("[Sources] Qobuz mirror unreachable")
+            except Exception as e:
+                logger.warning("Qobuz mirror adapter failed to initialize: %s", e)
+
+        deezer_mirror_url = _mirror_url("deezer_mirror_url", "mirror_deezer")
+        if source_group_enabled("deezer_mirror") and deezer_mirror_url:
+            try:
+                from antra.sources.deezer_mirror import DeezerMirrorAdapter
+                adapter = DeezerMirrorAdapter(mirror_url=deezer_mirror_url, api_key=api_key)
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] Deezer mirror adapter enabled")
+                else:
+                    logger.warning("[Sources] Deezer mirror unreachable")
+            except Exception as e:
+                logger.warning("Deezer mirror adapter failed to initialize: %s", e)
 
         # Tidal Premium (session/token-backed preferred; email/password kept as legacy fallback)
         tidal_session_ready = bool(
@@ -324,21 +396,52 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Qobuz adapter failed to initialize: {e}")
 
+        if source_group_enabled("deezer") and (getattr(cfg, "deezer_arl_token", "") or "").strip():
+            try:
+                from antra.sources.deezer import DeezerAdapter
+
+                adapter = DeezerAdapter(
+                    arl_token=getattr(cfg, "deezer_arl_token", ""),
+                    bf_secret=getattr(cfg, "deezer_bf_secret", "g4el58wc0zvf9na1"),
+                )
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] Deezer adapter enabled")
+            except Exception as e:
+                logger.warning(f"Deezer adapter failed to initialize: {e}")
+
         apple_direct_ready = bool(
             (getattr(cfg, "apple_authorization_token", "") or "").strip()
             and (getattr(cfg, "apple_music_user_token", "") or "").strip()
             and (getattr(cfg, "apple_wvd_path", "") or "").strip()
         )
         apple_mirrors = list(getattr(cfg, "apple_mirrors", None) or [])
+        mirror_apple_url = ""
         if not apple_mirrors and manifest is not None:
             apple_mirrors = list(getattr(manifest, "apple", []) or [])
-        if source_group_enabled("apple") and getattr(cfg, "apple_enabled", False):
+            mirror_apple_url = (getattr(manifest, "mirror_apple", "") or "").strip().rstrip("/")
+        env_apple_mirror = (getattr(cfg, "apple_mirror_url", "") or "").strip().rstrip("/")
+        if env_apple_mirror:
+            mirror_apple_url = env_apple_mirror
+        if mirror_apple_url and mirror_apple_url not in apple_mirrors:
+            apple_mirrors = [mirror_apple_url] + apple_mirrors
+        apple_should_enable = (
+            source_group_enabled("apple")
+            and (
+                getattr(cfg, "apple_enabled", False)
+                or apple_direct_ready
+                or bool(apple_mirrors)
+            )
+        )
+        if apple_should_enable:
             try:
                 from antra.sources.apple import AppleAdapter
 
                 adapter = AppleAdapter(
                     mirrors=apple_mirrors,
+                    preferred_output_format=cfg.output_format,
                     api_key=getattr(cfg, "odesli_api_key", "") or None,
+                    mirror_api_key=api_key,
                     authorization_token=getattr(cfg, "apple_authorization_token", ""),
                     music_user_token=getattr(cfg, "apple_music_user_token", ""),
                     storefront=getattr(cfg, "apple_storefront", "us"),
@@ -354,12 +457,30 @@ class AntraService:
         amazon_direct_creds_json = _merge_amazon_direct_creds_json(
             getattr(cfg, "amazon_direct_creds_json", ""),
             getattr(cfg, "amazon_wvd_path", ""),
+            country_code=getattr(cfg, "amazon_region", "us"),
         )
         amazon_direct_ready = bool(amazon_direct_creds_json.strip())
         amazon_mirrors = list(getattr(cfg, "amazon_mirrors", None) or [])
+        # Pull mirror URL from manifest if not set in env/config
+        mirror_amazon_url = ""
+        if manifest is not None:
+            mirror_amazon_url = (getattr(manifest, "mirror_amazon", "") or "").strip().rstrip("/")
+        # Also check env var override
+        env_amazon_mirror = (getattr(cfg, "amazon_mirror_url", "") or "").strip().rstrip("/")
+        if env_amazon_mirror:
+            mirror_amazon_url = env_amazon_mirror
         if not amazon_mirrors and manifest is not None:
             amazon_mirrors = list(getattr(manifest, "amazon", []) or [])
-        if source_group_enabled("amazon") and getattr(cfg, "amazon_enabled", False):
+        # Add the private mirror server to the front of the pool if available
+        if mirror_amazon_url and mirror_amazon_url not in amazon_mirrors:
+            amazon_mirrors = [mirror_amazon_url] + amazon_mirrors
+        # Enable Amazon adapter when: explicitly enabled in Settings, OR a mirror URL
+        # is available from the manifest (user doesn't need to toggle Settings)
+        amazon_should_enable = (
+            source_group_enabled("amazon")
+            and (getattr(cfg, "amazon_enabled", False) or bool(mirror_amazon_url) or bool(amazon_mirrors))
+        )
+        if amazon_should_enable:
             try:
                 from antra.sources.amazon import AmazonAdapter
 
@@ -367,6 +488,8 @@ class AntraService:
                     mirrors=amazon_mirrors,
                     api_key=getattr(cfg, "odesli_api_key", "") or None,
                     direct_creds_json=amazon_direct_creds_json,
+                    mirror_api_key=api_key,
+                    preferred_output_format=cfg.output_format,
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -375,8 +498,38 @@ class AntraService:
             except Exception as e:
                 logger.warning(f"Amazon adapter failed to initialize: {e}")
 
+        # YouTube / yt-dlp — strict lossy fallback when preferred sources fail.
+        if source_group_enabled("youtube"):
+            try:
+                from antra.sources.youtube import YouTubeAdapter
+
+                adapter = YouTubeAdapter()
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] YouTube adapter enabled (strict lossy fallback)")
+            except Exception as e:
+                logger.warning(f"YouTube adapter failed to initialize: {e}")
+
+        # JioSaavn — no credentials needed, always available as last-resort fallback
+        # Only used when output_format allows lossy (mp3/aac/source) — the engine
+        # skips it automatically when lossless-only mode is active.
+        if source_group_enabled("jiosaavn"):
+            try:
+                from antra.sources.jiosaavn import JioSaavnAdapter
+
+                jiosaavn_quality = getattr(cfg, "jiosaavn_quality", "320") or "320"
+                adapter = JioSaavnAdapter(quality=str(jiosaavn_quality))
+                if adapter.is_available():
+                    adapters.append(adapter)
+                    logger.info("[OK] JioSaavn adapter enabled (lossy fallback)")
+            except Exception as e:
+                logger.warning(f"JioSaavn adapter failed to initialize: {e}")
+
         by_name = {adapter.name: adapter for adapter in adapters}
-        ordered = [by_name[name] for name in ("tidal", "apple", "amazon", "soulseek", "qobuz") if name in by_name]
+        ordered = [by_name[name] for name in (
+            "apple", "tidal_mirror", "qobuz_mirror", "amazon", "tidal",
+            "soulseek", "qobuz", "deezer_mirror", "deezer", "youtube", "jiosaavn",
+        ) if name in by_name]
         if ordered:
             logger.info(f"[Sources] Active download chain: {', '.join(adapter.name for adapter in ordered)}")
         else:
@@ -461,25 +614,45 @@ class AntraService:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
 
+        from antra.core.external_music_fetcher import is_deezer_url, is_qobuz_url, is_tidal_url
+
         # Handle Apple Music URLs
         if "music.apple.com" in playlist:
             tracks = self._fetch_apple_tracks(playlist, cfg)
+            self._apply_request_kind(tracks, playlist)
+            self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
+            try:
+                tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
+            except Exception as e:
+                logger.debug(f"[Service] Apple Spotify hydration failed: {e}")
 
         # Handle SoundCloud URLs
         elif "soundcloud.com" in playlist:
             tracks = self._fetch_soundcloud_tracks(playlist, cfg)
+            self._apply_request_kind(tracks, playlist)
 
         # Handle Amazon Music URLs
         elif "music.amazon." in playlist:
             tracks = self._fetch_amazon_music_tracks(playlist, cfg)
+            self._apply_request_kind(tracks, playlist)
+            self._apply_source_intent(tracks, service="amazon", rule="exclusive")
             enrich_album_data = getattr(cfg, "enrich_album_data", False) if enrich_override is None else enrich_override
             if enrich_album_data:
                 try:
                     spotify = self._make_spotify_client(cfg)
                     logger.info("Enriching Amazon tracks with Spotify metadata...")
+                    original_tracks = list(tracks)
                     tracks = spotify.batch_enrich_album_data(tracks)
+                    tracks = self._preserve_track_identity(original_tracks, tracks)
                 except Exception as e:
                     logger.debug(f"[Service] Spotify hydration failed: {e}")
+
+        # Handle TIDAL / Qobuz / Deezer metadata URLs
+        elif is_tidal_url(playlist) or is_qobuz_url(playlist) or is_deezer_url(playlist):
+            tracks = self._fetch_external_music_tracks(playlist, cfg)
+            self._apply_request_kind(tracks, playlist)
+            if is_deezer_url(playlist):
+                self._apply_source_intent(tracks, service="deezer", rule="exclusive")
 
         else:
             # Try authenticated Spotify client first.
@@ -503,10 +676,197 @@ class AntraService:
                 else:
                     raise
 
+            self._apply_request_kind(tracks, playlist)
+
+        # Note: ISRC enrichment removed — text search on Qobuz/Tidal mirrors
+        # works without ISRCs. Enrichment was causing 15s+ delays due to
+        # Spotify anonymous token rate limiting (429 on every run).
+
+        # Fill missing release_year via iTunes Search (free, no auth).
+        # Only fires for tracks that still have no year after the fetch above.
+        # Single-track Spotify URLs often miss the year when Spotify auth is
+        # not configured and the public page scraper can't extract it.
+        tracks = self._fill_missing_years(tracks, cfg)
+
         return self._stamp_disc_totals(tracks)
 
-    def enrich_tracks_for_download(
+    @staticmethod
+    def _apply_source_intent(
+        tracks: list[TrackMetadata],
+        *,
+        service: str,
+        rule: str,
+    ) -> None:
+        for track in tracks:
+            track.source_service = service
+            track.source_rule = rule
+
+    @staticmethod
+    def _infer_request_kind(url: str) -> Optional[str]:
+        parsed = urlparse(url or "")
+        path = parsed.path.lower()
+        if "/playlist/" in path or "/playlists/" in path or "/sets/" in path:
+            return "playlist"
+        if "/track/" in path or "/tracks/" in path or "/song/" in path:
+            return "track"
+        if "/album/" in path or "/albums/" in path:
+            query = parse_qs(parsed.query or "")
+            if "i" in query and query["i"]:
+                return "track"
+            return "album"
+        return None
+
+    @classmethod
+    def _apply_request_kind(cls, tracks: list[TrackMetadata], url: str) -> None:
+        request_kind = cls._infer_request_kind(url)
+        if not request_kind:
+            return
+        for track in tracks:
+            if not track.request_kind:
+                track.request_kind = request_kind
+
+    def _fill_missing_years(self, tracks: list[TrackMetadata], cfg: Config) -> list[TrackMetadata]:
+        """
+        For any track still missing release_year after the metadata fetch,
+        attempt to fill it via iTunes Search API (free, no auth required).
+
+        Only fires when at least one track is missing the year — skipped
+        entirely for fully-enriched track lists so there is zero overhead
+        for normal playlist downloads.
+        """
+        missing = [t for t in tracks if not t.release_year]
+        if not missing:
+            return tracks
+
+        try:
+            spotify = self._make_spotify_client(cfg)
+            for track in missing:
+                try:
+                    spotify.enrich_public_track_metadata(track)
+                except Exception as e:
+                    logger.debug("[Service] Year fill failed for '%s': %s", track.title, e)
+        except Exception as e:
+            logger.debug("[Service] Year fill skipped: %s", e)
+
+        return tracks
+
+    @staticmethod
+    def _preserve_track_identity(
+        original_tracks: list[TrackMetadata],
+        enriched_tracks: list[TrackMetadata],
+    ) -> list[TrackMetadata]:
+        if len(original_tracks) != len(enriched_tracks):
+            return enriched_tracks
+        for original, enriched in zip(original_tracks, enriched_tracks):
+            enriched.amazon_asin = original.amazon_asin or enriched.amazon_asin
+            enriched.apple_music_id = original.apple_music_id or enriched.apple_music_id
+            enriched.deezer_track_id = original.deezer_track_id or enriched.deezer_track_id
+            enriched.source_service = original.source_service or enriched.source_service
+            enriched.source_rule = original.source_rule or enriched.source_rule
+            enriched.request_kind = original.request_kind or enriched.request_kind
+            enriched.spotify_url = original.spotify_url or enriched.spotify_url
+            enriched.duration_ms = original.duration_ms or enriched.duration_ms
+            enriched.isrc = original.isrc or enriched.isrc
+            enriched.release_date = original.release_date or enriched.release_date
+            enriched.release_year = original.release_year or enriched.release_year
+            enriched.artwork_url = original.artwork_url or enriched.artwork_url
+            enriched.album = original.album or enriched.album
+            enriched.album_artists = original.album_artists or enriched.album_artists
+            enriched.audio_traits = original.audio_traits or enriched.audio_traits
+            if original.is_explicit is not None:
+                enriched.is_explicit = original.is_explicit
+        return enriched_tracks
+
+    def _enrich_apple_tracks_with_spotify_metadata(
         self,
+        tracks: list[TrackMetadata],
+        cfg: Config,
+    ) -> list[TrackMetadata]:
+        if not tracks:
+            return tracks
+
+        spotify = self._make_spotify_client(cfg)
+        logger.info("Enriching Apple tracks with Spotify metadata...")
+
+        hydrated_tracks: list[TrackMetadata] = []
+        for track in tracks:
+            hydrated_tracks.append(
+                self._hydrate_track_from_spotify_search(track, spotify)
+            )
+
+        if not any(track.spotify_id for track in hydrated_tracks):
+            return hydrated_tracks
+
+        original_tracks = [replace(track) for track in hydrated_tracks]
+        hydrated_tracks = spotify.batch_enrich_album_data(hydrated_tracks)
+        return self._preserve_track_identity(original_tracks, hydrated_tracks)
+
+    def _hydrate_track_from_spotify_search(
+        self,
+        track: TrackMetadata,
+        spotify: SpotifyClient,
+    ) -> TrackMetadata:
+        query_candidates = [
+            f'track:"{track.title}" artist:"{track.primary_artist}"',
+            f"{track.title} {track.primary_artist}",
+        ]
+        candidate: Optional[TrackMetadata] = None
+        for query in query_candidates:
+            result = spotify.search_track(query)
+            if self._spotify_candidate_matches_track(track, result):
+                candidate = result
+                break
+
+        if candidate is None:
+            return track
+
+        merged = replace(track)
+        if candidate.artists:
+            merged.artists = candidate.artists
+        if candidate.album_artists:
+            merged.album_artists = candidate.album_artists
+        merged.spotify_id = candidate.spotify_id or merged.spotify_id
+        merged.album_id = candidate.album_id or merged.album_id
+        merged.isrc = candidate.isrc or merged.isrc
+        merged.track_number = candidate.track_number or merged.track_number
+        merged.disc_number = candidate.disc_number or merged.disc_number
+        merged.total_tracks = candidate.total_tracks or merged.total_tracks
+        merged.release_date = candidate.release_date or merged.release_date
+        merged.release_year = candidate.release_year or merged.release_year
+        merged.artwork_url = candidate.artwork_url or merged.artwork_url
+        if candidate.is_explicit is not None:
+            merged.is_explicit = candidate.is_explicit
+        if candidate.genres:
+            merged.genres = candidate.genres
+        return merged
+
+    @staticmethod
+    def _spotify_candidate_matches_track(
+        track: TrackMetadata,
+        candidate: Optional[TrackMetadata],
+    ) -> bool:
+        if candidate is None:
+            return False
+
+        similarity = score_similarity(
+            query_title=track.title,
+            query_artists=track.artists,
+            result_title=candidate.title,
+            result_artist=", ".join(candidate.artists),
+        )
+        if similarity < 0.72:
+            return False
+
+        if track.duration_ms and candidate.duration_ms:
+            if not duration_close(track.duration_ms / 1000, candidate.duration_ms / 1000, tolerance=8):
+                return False
+
+        if track.is_explicit is True and candidate.is_explicit is False:
+            return False
+
+        return True
+
+    def enrich_tracks_for_download(        self,
         tracks: list[TrackMetadata],
         playlist: str,
         options: Optional[RuntimeOptions] = None,
@@ -520,10 +880,13 @@ class AntraService:
             if "music.amazon." in playlist:
                 spotify = self._make_spotify_client(cfg)
                 logger.info("Enriching Amazon tracks with Spotify metadata...")
+                original_tracks = list(tracks)
                 tracks = spotify.batch_enrich_album_data(tracks)
+                tracks = self._preserve_track_identity(original_tracks, tracks)
+            elif "music.apple.com" in playlist:
+                tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
             elif not (
-                "music.apple.com" in playlist
-                or "soundcloud.com" in playlist
+                "soundcloud.com" in playlist
             ):
                 spotify = self._make_spotify_client(cfg)
                 logger.info("Enriching tracks with album metadata...")
@@ -553,6 +916,15 @@ class AntraService:
             )
         client_id = getattr(cfg, "soundcloud_client_id", "") or None
         return SoundCloudFetcher(client_id=client_id).fetch(url)
+
+    def _fetch_external_music_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+        try:
+            from antra.core.external_music_fetcher import ExternalMusicFetcher
+        except ImportError:
+            raise RuntimeError(
+                "TIDAL/Qobuz/Deezer playlist fetching is not available in this distribution."
+            )
+        return ExternalMusicFetcher(cfg).fetch(url)
 
     def _fetch_spotfetch_tracks(
         self, url: str, cfg: Config, spotify: Optional[SpotifyClient] = None
@@ -894,6 +1266,9 @@ class AntraService:
                 cfg.output_dir,
                 full_albums=full_albums,
                 folder_structure=getattr(cfg, "folder_structure", "standard"),
+                album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
             )
 
@@ -909,7 +1284,7 @@ class AntraService:
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
             output_format=cfg.output_format,
-            max_workers=2,
+            max_workers=1,
         )
 
         return DownloadEngine(

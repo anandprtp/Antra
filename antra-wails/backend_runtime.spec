@@ -47,6 +47,10 @@ hiddenimports = (
         "antra.core.amazon_music_fetcher",
         "antra.core.spotfetch_fetcher",
         "antra.core.apple_fetcher",
+        # Mirror server adapters
+        "antra.sources.tidal_mirror",
+        "antra.sources.qobuz_mirror",
+        "antra.sources.deezer_mirror",
     ]
 )
 

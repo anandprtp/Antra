@@ -59,6 +59,8 @@ class _DirectAppleClient:
         self._mut = music_user_token.strip()
         self._storefront = (storefront or "us").strip()
         self._wvd_path = wvd_path.strip()
+        self._session = requests.Session()
+        self._session.trust_env = False
 
     def is_configured(self) -> bool:
         return bool(self._auth and self._mut and self._wvd_path)
@@ -86,7 +88,7 @@ class _DirectAppleClient:
         }
 
     def _get_webplayback(self, track_id: str) -> dict:
-        r = requests.post(
+        r = self._session.post(
             self._WEBPLAYBACK_URL,
             json={"salableAdamId": str(track_id), "language": "en-US"},
             headers=self._play_headers(),
@@ -105,7 +107,7 @@ class _DirectAppleClient:
         return song_list[0]
 
     def get_catalog_song(self, track_id: str) -> dict:
-        r = requests.get(
+        r = self._session.get(
             f"{self._CATALOG_BASE}/{self._storefront}/songs/{track_id}",
             headers=self._amp_headers(),
             params={"extend": "extendedAssetUrls", "include": "albums", "platform": "web", "l": "en-US"},
@@ -122,7 +124,7 @@ class _DirectAppleClient:
         return data[0]
 
     def lookup_track_by_isrc(self, isrc: str) -> Optional[dict]:
-        r = requests.get(
+        r = self._session.get(
             f"{self._CATALOG_BASE}/{self._storefront}/songs",
             headers=self._amp_headers(),
             params={
@@ -155,7 +157,7 @@ class _DirectAppleClient:
 
     def search_text_track(self, title: str, artist: str = "") -> Optional[dict]:
         term = f"{title} {artist}".strip()
-        r = requests.get(
+        r = self._session.get(
             "https://itunes.apple.com/search",
             params={"term": term, "entity": "song", "media": "music", "limit": 10},
             headers={
@@ -280,7 +282,7 @@ class _DirectAppleClient:
             if not best_candidate or best_candidate == current_url:
                 return current_url, current_text
 
-            next_r = requests.get(best_candidate, timeout=15)
+            next_r = self._session.get(best_candidate, timeout=15)
             next_r.raise_for_status()
             current_url = best_candidate
             current_text = next_r.text
@@ -370,7 +372,7 @@ class _DirectAppleClient:
                 "isLibrary": False,
                 "user-initiated": True,
             }
-            r = requests.post(self._LICENSE_URL, json=body, headers=self._play_headers(), timeout=20)
+            r = self._session.post(self._LICENSE_URL, json=body, headers=self._play_headers(), timeout=20)
             if r.status_code == 401:
                 raise RuntimeError("[Apple-Direct] License rejected (401) — token expired")
             if r.status_code == 403:
@@ -394,7 +396,7 @@ class _DirectAppleClient:
         Raises RuntimeError with a descriptive message on any failure.
         """
         # 1. Catalog lookup — quality metadata
-        r = requests.get(
+        r = self._session.get(
             f"{self._CATALOG_BASE}/{self._storefront}/songs/{track_id}",
             headers=self._amp_headers(),
             params={"extend": "extendedAssetUrls", "include": "albums", "platform": "web", "l": "en-US"},
@@ -428,7 +430,7 @@ class _DirectAppleClient:
         if not asset_url:
             raise RuntimeError(f"[Apple-Direct] No URL in selected asset for track {track_id}")
 
-        master_r = requests.get(asset_url, timeout=15)
+        master_r = self._session.get(asset_url, timeout=15)
         master_r.raise_for_status()
         playlist_text = master_r.text
 
@@ -500,30 +502,35 @@ if sys.platform == "win32":
 
 class AppleAdapter(BaseSourceAdapter):
     """
-    Apple Music adapter — downloads AAC (~256kbps) via WebPlayback API + Widevine CENC.
+    Apple Music adapter.
 
-    NOTE: Apple's WebPlayback API only serves AAC to web clients. Real ALAC streams
-    require FairPlay DRM (skd:// protocol) which cannot be decrypted with pywidevine.
-    This adapter is always_lossy=True and is skipped in lossless/ALAC/FLAC mode.
-    It is only used as a fallback when the output format is AAC or MP3.
+    When the mirror API is available, this can download Apple lossless ALAC.
+    Direct-account fallback may still return AAC depending on the available path.
     """
 
     name = "apple"
-    always_lossy = True  # WebPlayback API serves AAC only — never lossless
+    always_lossy = True  # Apple only used in AAC mode; skipped entirely in lossless mode
 
     def __init__(
         self,
         mirrors: list[str],
+        preferred_output_format: str = "source",
         api_key: Optional[str] = None,
+        mirror_api_key: Optional[str] = None,
         authorization_token: str = "",
         music_user_token: str = "",
         storefront: str = "us",
         wvd_path: str = "",
     ):
         self._session = requests.Session()
+        self._session.trust_env = False
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         })
+        self._preferred_output_format = (preferred_output_format or "source").lower()
+        self._prefer_lossy_download = self._preferred_output_format in {"aac", "mp3", "m4a"}
+        if mirror_api_key:
+            self._session.headers["X-API-Key"] = mirror_api_key
         self._odesli = OdesliEnricher(api_key=api_key)
         self._apple_fetcher = AppleFetcher()
         self.priority = 2
@@ -628,13 +635,28 @@ class AppleAdapter(BaseSourceAdapter):
 
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         apple_id = None
-        bit_depth = 16
-        sample_rate = 44100
+        bit_depth: Optional[int] = None
+        sample_rate: Optional[int] = None
         isrc_match = False
+        track_traits = [str(trait).lower() for trait in (getattr(track, "audio_traits", None) or [])]
+
+        # Preserve quality information already discovered from the Apple URL itself.
+        if "hi-res-lossless" in track_traits:
+            bit_depth = 24
+            sample_rate = 96000
+        elif "lossless" in track_traits:
+            bit_depth = 16
+            sample_rate = 44100
+
+        # Fast path: Apple Music ID is already known (track came from an Apple Music URL).
+        if getattr(track, "apple_music_id", None):
+            apple_id = track.apple_music_id
+            isrc_match = True
+            logger.info(f"[Apple] Using known Apple Music ID {apple_id} for '{track.title}'")
 
         # Prefer direct account lookup when available so Apple downloads work
         # without a mirror dependency.
-        if self._direct and self._direct.is_configured() and track.isrc:
+        if not apple_id and self._direct and self._direct.is_configured() and track.isrc:
             try:
                 song = self._direct.lookup_track_by_isrc(track.isrc)
                 if song:
@@ -648,9 +670,9 @@ class AppleAdapter(BaseSourceAdapter):
                         bit_depth = 16
                         sample_rate = 44100
                     isrc_match = True
-                    logger.debug(f"[Apple-Direct] Resolved {track.isrc} to Apple Music ID: {apple_id}")
+                    logger.info(f"[Apple-Direct] Resolved {track.isrc} → Apple Music ID: {apple_id}")
             except Exception as e:
-                logger.debug(f"[Apple-Direct] ISRC search failed: {e}")
+                logger.warning(f"[Apple-Direct] ISRC search failed: {e}")
 
         # Try exact match using ISRC via API proxy
         if not apple_id and track.isrc:
@@ -662,15 +684,23 @@ class AppleAdapter(BaseSourceAdapter):
                     apple_id = data.get("track_id")
                     bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
                     isrc_match = True
-                    logger.debug(f"[Apple] Resolved {track.isrc} to Apple Music ID: {apple_id}")
+                    logger.info(f"[Apple] Resolved {track.isrc} → Apple Music ID: {apple_id}")
+                else:
+                    logger.warning(f"[Apple] ISRC mirror lookup HTTP {r.status_code} for {track.isrc}")
             except Exception as e:
-                logger.debug(f"[Apple] ISRC proxy search failed: {e}")
+                logger.warning(f"[Apple] ISRC proxy search failed: {e}")
 
         # Fallback to Odesli
         if not apple_id:
-            logger.debug(f"[Apple] Resolving ID via Odesli: {track.title}")
-            platform_ids = self._odesli.resolve(track)
-            apple_id = platform_ids.get("appleMusic")
+            try:
+                platform_ids = self._odesli.resolve(track)
+                apple_id = platform_ids.get("appleMusic")
+                if apple_id:
+                    logger.info(f"[Apple] Odesli resolved Apple Music ID: {apple_id} for '{track.title}'")
+                else:
+                    logger.warning(f"[Apple] Odesli found no Apple Music ID for '{track.title}'")
+            except Exception as e:
+                logger.warning(f"[Apple] Odesli resolution failed: {e}")
 
         # Direct text search works without mirrors and gives us a track ID
         # for the WebPlayback downloader to use.
@@ -679,9 +709,9 @@ class AppleAdapter(BaseSourceAdapter):
                 song = self._direct.search_text_track(track.title, track.primary_artist)
                 if song:
                     apple_id = str(song.get("trackId") or "")
-                    logger.debug(f"[Apple-Direct] Text search found track_id={apple_id} for '{track.title}'")
+                    logger.info(f"[Apple-Direct] Text search found track_id={apple_id} for '{track.title}'")
             except Exception as e:
-                logger.debug(f"[Apple-Direct] Text search failed: {e}")
+                logger.warning(f"[Apple-Direct] Text search failed: {e}")
 
         # Final fallback: text search via proxy (for tracks without ISRCs when Odesli fails)
         if not apple_id:
@@ -696,16 +726,18 @@ class AppleAdapter(BaseSourceAdapter):
                     data = r.json()
                     apple_id = data.get("track_id")
                     bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
-                    logger.debug(f"[Apple] Text search found track_id={apple_id} for '{track.title}'")
+                    logger.info(f"[Apple] Text search found track_id={apple_id} for '{track.title}'")
+                else:
+                    logger.warning(f"[Apple] Text search HTTP {r.status_code} for '{track.title}'")
             except Exception as e:
-                logger.debug(f"[Apple] Text search fallback failed: {e}")
+                logger.warning(f"[Apple] Text search fallback failed: {e}")
 
         if not apple_id:
-            logger.debug(f"[Apple] No Apple Music ID found for '{track.title}'")
+            logger.warning(f"[Apple] No Apple Music ID found for '{track.title}' — skipping")
             return None
 
         # Check the catalog for hi-res traits if we don't already know the quality
-        if apple_id and bit_depth < 24:
+        if apple_id and (bit_depth or 0) < 24:
             try:
                 if self._direct and self._direct.is_configured():
                     song = self._direct.get_catalog_song(str(apple_id))
@@ -713,20 +745,40 @@ class AppleAdapter(BaseSourceAdapter):
                     if "hi-res-lossless" in traits:
                         logger.debug(f"[Apple-Direct] Catalog confirmed hi-res lossless for Apple Music ID {apple_id}")
                         bit_depth = 24
-                        if sample_rate < 48000:
+                        if (sample_rate or 0) < 48000:
                             sample_rate = 96000
-                    elif "lossless" in traits and sample_rate < 44100:
-                        sample_rate = 44100
+                    elif "lossless" in traits:
+                        if bit_depth is None or bit_depth < 16:
+                            bit_depth = 16
+                        if (sample_rate or 0) < 44100:
+                            sample_rate = 44100
                 else:
                     # _fetch_song queries the Catalog API via developer token (no Widevine overhead)
                     meta = self._apple_fetcher._fetch_song(str(apple_id))
-                    if meta and "hi-res-lossless" in (meta.audio_traits or []):
+                    traits = (meta.audio_traits or []) if meta else []
+                    if "hi-res-lossless" in traits:
                         logger.debug(f"[Apple] Catalog confirmed hi-res lossless for Apple Music ID {apple_id}")
                         bit_depth = 24
-                        if sample_rate < 48000:
-                            sample_rate = 96000 # Default assumption for hi-res if unknown
+                        if (sample_rate or 0) < 48000:
+                            sample_rate = 96000  # Default assumption for hi-res if unknown
+                    elif "lossless" in traits:
+                        if bit_depth is None or bit_depth < 16:
+                            bit_depth = 16
+                        if (sample_rate or 0) < 44100:
+                            sample_rate = 44100
             except Exception as e:
                 logger.debug(f"[Apple] Failed to check catalog for hi-res traits: {e}")
+
+        if self._prefer_lossy_download:
+            is_lossless = False
+            audio_format = AudioFormat.AAC
+            bit_depth = None
+            sample_rate = None
+            quality_kbps = 256
+        else:
+            is_lossless = bool(bit_depth and bit_depth >= 16)
+            audio_format = AudioFormat.ALAC if is_lossless else AudioFormat.AAC
+            quality_kbps = None if is_lossless else 256
 
         return SearchResult(
             source="apple",
@@ -734,11 +786,11 @@ class AppleAdapter(BaseSourceAdapter):
             artists=track.artists,
             album=track.album,
             duration_ms=track.duration_ms,
-            audio_format=AudioFormat.AAC,
-            quality_kbps=256,  # WebPlayback API serves ~256kbps AAC (flavor 28:ctrp256)
-            is_lossless=False,
-            bit_depth=None,
-            sample_rate_hz=None,
+            audio_format=audio_format,
+            quality_kbps=quality_kbps,
+            is_lossless=is_lossless,
+            bit_depth=bit_depth,
+            sample_rate_hz=sample_rate,
             download_url=None,
             stream_id=str(apple_id),
             similarity_score=1.0,
@@ -746,6 +798,9 @@ class AppleAdapter(BaseSourceAdapter):
         )
 
     def _apply_quality_from_data(self, result: SearchResult, data: dict) -> None:
+        if self._prefer_lossy_download:
+            self._apply_lossy_metadata(result)
+            return
         quality = str(data.get("quality") or "").upper()
         if quality == "HIRES_LOSSLESS":
             result.bit_depth = 24
@@ -759,6 +814,14 @@ class AppleAdapter(BaseSourceAdapter):
                 result.sample_rate_hz = int(data["sampleRate"])
             except (ValueError, TypeError):
                 pass
+
+    @staticmethod
+    def _apply_lossy_metadata(result: SearchResult) -> None:
+        result.audio_format = AudioFormat.AAC
+        result.quality_kbps = 256
+        result.is_lossless = False
+        result.bit_depth = None
+        result.sample_rate_hz = None
 
     def download(self, result: SearchResult, output_path: str) -> str:
         track_id = result.stream_id
@@ -810,7 +873,11 @@ class AppleAdapter(BaseSourceAdapter):
                             f"(track_id={track_id}, retry {rate_attempt}/{len(_APPLE_429_RETRY_DELAYS) + 1})"
                         )
                         time.sleep(retry_delay)
-                    resp = self._api_get(api_url, timeout=20)
+                    resp = self._api_get(
+                        api_url,
+                        params={"prefer_lossy": "true"} if self._prefer_lossy_download else None,
+                        timeout=20,
+                    )
                     if resp.status_code != 429:
                         break
                 if resp is None:
@@ -888,8 +955,9 @@ class AppleAdapter(BaseSourceAdapter):
 
         # Apple Music uses CENC (ISO-23001-7) encryption.
         # Try ffmpeg -decryption_key first (requires a full ffmpeg build).
-        # If that option is not available (essentials build), fall back to Python
-        # segment-by-segment download + AES-CTR decryption.
+        # Apple CDN URLs may not be accessible to ffmpeg directly (missing headers),
+        # so fall back to Python segment-by-segment download + AES-CTR decryption
+        # on any input-open failure, not just missing -decryption_key option.
         logger.debug("[Apple] Attempting download via ffmpeg -decryption_key...")
         result = subprocess.run(
             [
@@ -897,6 +965,7 @@ class AppleAdapter(BaseSourceAdapter):
                 "-decryption_key", decryption_key_hex.strip(),
                 "-allowed_extensions", "ALL",
                 "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nAccept: */*\r\n",
                 "-i", variant_url,
                 "-c", "copy",
                 final_path,
@@ -911,8 +980,17 @@ class AppleAdapter(BaseSourceAdapter):
             return final_path
 
         stderr = result.stderr.decode("utf-8", errors="ignore")
-        if "decryption_key" in stderr and ("not found" in stderr.lower() or "Option" in stderr):
-            logger.debug("[Apple] ffmpeg -decryption_key unavailable (essentials build), using Python CENC fallback...")
+        # Fall back to Python download+decrypt if ffmpeg can't handle it:
+        # - missing -decryption_key option (essentials build)
+        # - can't open the Apple CDN URL (headers/auth issue)
+        needs_python_fallback = (
+            ("decryption_key" in stderr and ("not found" in stderr.lower() or "Option" in stderr))
+            or "Invalid argument" in stderr
+            or "Error opening input" in stderr
+            or "No such file or directory" in stderr
+        )
+        if needs_python_fallback:
+            logger.info("[Apple] ffmpeg couldn't open stream — using Python CENC fallback...")
             return self._download_and_decrypt_cenc_hls(
                 variant_url, decryption_key_hex, final_path, expected_codec
             )
@@ -981,7 +1059,7 @@ class AppleAdapter(BaseSourceAdapter):
                 # All segments (and init) are byte ranges of one MP4 file — download it whole.
                 mp4_url = seg_urls_only[0]
                 logger.debug(f"[Apple] BYTERANGE playlist — downloading full MP4 from {mp4_url}")
-                r = requests.get(mp4_url, timeout=300)
+                r = self._session.get(mp4_url, timeout=300)
                 r.raise_for_status()
                 with open(enc_path, "wb") as f:
                     f.write(r.content)
@@ -994,7 +1072,7 @@ class AppleAdapter(BaseSourceAdapter):
                         if init_byterange:
                             ln, off = init_byterange
                             hdr["Range"] = f"bytes={off}-{off+ln-1}"
-                        r = requests.get(init_url, headers=hdr, timeout=30)
+                        r = self._session.get(init_url, headers=hdr, timeout=30)
                         r.raise_for_status()
                         f.write(r.content)
                     for seg_url, byterange in seg_entries:
@@ -1002,7 +1080,7 @@ class AppleAdapter(BaseSourceAdapter):
                         if byterange:
                             ln, off = byterange
                             hdr["Range"] = f"bytes={off}-{off+ln-1}"
-                        r = requests.get(seg_url, headers=hdr, timeout=60)
+                        r = self._session.get(seg_url, headers=hdr, timeout=60)
                         r.raise_for_status()
                         f.write(r.content)
 
@@ -1360,12 +1438,31 @@ class AppleAdapter(BaseSourceAdapter):
         info = getattr(audio, "info", None)
         codec = str(getattr(info, "codec", "") or "").lower()
         bitrate = getattr(info, "bitrate", None)
+        bits_per_sample = getattr(info, "bits_per_sample", None)
+        sample_rate = getattr(info, "sample_rate", None)
 
         if expected_codec == "alac":
-            if "alac" not in codec:
-                raise RuntimeError(
-                    f"[Apple] Downloaded file is not ALAC (codec={codec or 'unknown'}, bitrate={bitrate})"
+            if "alac" in codec:
+                return
+            # Apple-decrypted lossless files can still surface as mp4a via Mutagen
+            # even when the container carries lossless sample metadata.
+            losslessish = (
+                bits_per_sample in (16, 24, 32)
+                or (bitrate in (None, 0) and sample_rate and sample_rate >= 44100)
+            )
+            if codec in ("mp4a", "mp4a.40.2", "mp4a.40.5", "") and losslessish:
+                logger.warning(
+                    "[Apple] Mutagen reported codec=%r for a lossless Apple file; accepting due to bits_per_sample=%r sample_rate=%r bitrate=%r",
+                    codec or "unknown",
+                    bits_per_sample,
+                    sample_rate,
+                    bitrate,
                 )
+                return
+            raise RuntimeError(
+                "[Apple] Downloaded file is not ALAC "
+                f"(codec={codec or 'unknown'}, bitrate={bitrate}, bits_per_sample={bits_per_sample}, sample_rate={sample_rate})"
+            )
         elif expected_codec == "aac":
             # Accept mp4a, aac, or enca (enca = still-encrypted container, treated as AAC)
             if codec and "alac" in codec:

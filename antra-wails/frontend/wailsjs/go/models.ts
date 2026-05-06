@@ -10,12 +10,15 @@ export namespace main {
 	    amazon_enabled: boolean;
 	    amazon_direct_creds_json?: string;
 	    amazon_wvd_path?: string;
+	    amazon_region?: string;
 	    qobuz_enabled: boolean;
 	    qobuz_email?: string;
 	    qobuz_password?: string;
 	    qobuz_app_id?: string;
 	    qobuz_app_secret?: string;
 	    qobuz_user_auth_token?: string;
+	    deezer_arl_token?: string;
+	    deezer_bf_secret?: string;
 	    soulseek_enabled: boolean;
 	    soulseek_username?: string;
 	    soulseek_password?: string;
@@ -27,6 +30,9 @@ export namespace main {
 	    library_mode?: string;
 	    prefer_explicit?: boolean;
 	    folder_structure?: string;
+	    album_folder_structure?: string;
+	    playlist_folder_structure?: string;
+	    single_track_structure?: string;
 	    filename_format?: string;
 	    spotify_sp_dc?: string;
 	    tidal_enabled: boolean;
@@ -37,6 +43,7 @@ export namespace main {
 	    tidal_session_id?: string;
 	    tidal_token_type?: string;
 	    tidal_country_code?: string;
+	    antra_api_key?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -53,12 +60,15 @@ export namespace main {
 	        this.amazon_enabled = source["amazon_enabled"];
 	        this.amazon_direct_creds_json = source["amazon_direct_creds_json"];
 	        this.amazon_wvd_path = source["amazon_wvd_path"];
+	        this.amazon_region = source["amazon_region"];
 	        this.qobuz_enabled = source["qobuz_enabled"];
 	        this.qobuz_email = source["qobuz_email"];
 	        this.qobuz_password = source["qobuz_password"];
 	        this.qobuz_app_id = source["qobuz_app_id"];
 	        this.qobuz_app_secret = source["qobuz_app_secret"];
 	        this.qobuz_user_auth_token = source["qobuz_user_auth_token"];
+	        this.deezer_arl_token = source["deezer_arl_token"];
+	        this.deezer_bf_secret = source["deezer_bf_secret"];
 	        this.soulseek_enabled = source["soulseek_enabled"];
 	        this.soulseek_username = source["soulseek_username"];
 	        this.soulseek_password = source["soulseek_password"];
@@ -70,6 +80,9 @@ export namespace main {
 	        this.library_mode = source["library_mode"];
 	        this.prefer_explicit = source["prefer_explicit"];
 	        this.folder_structure = source["folder_structure"];
+	        this.album_folder_structure = source["album_folder_structure"];
+	        this.playlist_folder_structure = source["playlist_folder_structure"];
+	        this.single_track_structure = source["single_track_structure"];
 	        this.filename_format = source["filename_format"];
 	        this.spotify_sp_dc = source["spotify_sp_dc"];
 	        this.tidal_enabled = source["tidal_enabled"];
@@ -80,6 +93,7 @@ export namespace main {
 	        this.tidal_session_id = source["tidal_session_id"];
 	        this.tidal_token_type = source["tidal_token_type"];
 	        this.tidal_country_code = source["tidal_country_code"];
+	        this.antra_api_key = source["antra_api_key"];
 	    }
 	}
 	export class HistoryItem {
@@ -110,6 +124,26 @@ export namespace main {
 	        this.skipped = source["skipped"];
 	        this.error = source["error"];
 	        this.sources = source["sources"];
+	    }
+	}
+	export class KeyGenResult {
+	    ok: boolean;
+	    key?: string;
+	    expires_at?: string;
+	    download_limit?: number;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new KeyGenResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.key = source["key"];
+	        this.expires_at = source["expires_at"];
+	        this.download_limit = source["download_limit"];
+	        this.error = source["error"];
 	    }
 	}
 

@@ -24,6 +24,7 @@ import requests as _requests
 
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 from antra.sources.base import BaseSourceAdapter
+from antra.sources.odesli import OdesliEnricher
 from antra.utils.matching import score_similarity, duration_close
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ class TidalAdapter(BaseSourceAdapter):
         self._mirrors: list[str] = [m.rstrip("/") for m in (mirrors or []) if m]
         # Failure counter per mirror; >= 3 = excluded, 99 = permanently excluded.
         self._mirror_failures: dict[str, int] = {}
+        self._odesli = OdesliEnricher()
 
     def is_available(self) -> bool:
         if self._mirrors:
@@ -165,9 +167,21 @@ class TidalAdapter(BaseSourceAdapter):
             logger.warning(f"[Tidal] {e}")
             return None
 
+        direct = self._search_by_platform_id(track, session)
+        if direct:
+            return direct
+
         query = f"{track.title} {track.primary_artist}"
         try:
             import tidalapi
+            logger.debug(
+                "[Tidal] Searching catalog query=%r title=%r artist=%r isrc=%r duration=%s",
+                query,
+                track.title,
+                track.primary_artist,
+                track.isrc,
+                track.duration_seconds,
+            )
             results = session.search(query, models=[tidalapi.Track], limit=10)
             tidal_tracks = results.get("tracks", [])
         except Exception as e:
@@ -176,8 +190,10 @@ class TidalAdapter(BaseSourceAdapter):
 
         best = None
         best_score = 0.0
+        candidate_count = 0
 
         for t in tidal_tracks:
+            candidate_count += 1
             artist_name = t.artist.name if hasattr(t, "artist") else ""
             score = score_similarity(
                 query_title=track.title,
@@ -207,28 +223,113 @@ class TidalAdapter(BaseSourceAdapter):
 
             if score > best_score:
                 best_score = score
-                best = SearchResult(
-                    source=self.name,
-                    title=t.name,
-                    artists=[artist_name],
-                    album=t.album.name if hasattr(t, "album") else None,
-                    duration_ms=int(t.duration * 1000) if hasattr(t, "duration") else None,
-                    audio_format=AudioFormat.FLAC,
-                    quality_kbps=None,
-                    is_lossless=True,
-                    bit_depth=bit_depth,
-                    sample_rate_hz=sample_rate,
-                    download_url=None,
-                    stream_id=str(t.id),
-                    similarity_score=score,
-                    isrc_match=isrc_match,
-                )
+                best = self._track_to_result(t, score=score, isrc_match=isrc_match)
 
         if best and best_score >= MIN_SIMILARITY:
-            logger.debug(f"[Tidal] Match score={best_score:.2f}: {best.title}")
+            logger.debug(
+                "[Tidal] Search accepted score=%.2f id=%s title=%r album=%r",
+                best_score,
+                best.stream_id,
+                best.title,
+                best.album,
+            )
             return best
 
+        if best:
+            logger.info(
+                "[Tidal] No acceptable search match for %r by %s "
+                "(query=%r candidates=%d best_score=%.2f best_id=%s best_title=%r best_album=%r isrc=%r)",
+                track.title,
+                track.artist_string,
+                query,
+                candidate_count,
+                best_score,
+                best.stream_id,
+                best.title,
+                best.album,
+                track.isrc,
+            )
+        else:
+            logger.info(
+                "[Tidal] Search returned no candidates for %r by %s (query=%r isrc=%r)",
+                track.title,
+                track.artist_string,
+                query,
+                track.isrc,
+            )
         return None
+
+    def _search_by_platform_id(self, track: TrackMetadata, session) -> Optional[SearchResult]:
+        """Resolve a cross-platform TIDAL ID first, bypassing fuzzy catalog search."""
+        if not (track.isrc or track.spotify_id):
+            return None
+        try:
+            platform_ids = self._odesli.resolve(track)
+        except Exception as e:
+            logger.debug(f"[Tidal] Platform ID resolution failed for '{track.title}': {e}")
+            return None
+
+        tidal_id = platform_ids.get("tidal")
+        if not tidal_id:
+            logger.debug(
+                "[Tidal] No TIDAL platform ID for %r (resolved=%s isrc=%r spotify_id=%r)",
+                track.title,
+                sorted(platform_ids.keys()),
+                track.isrc,
+                track.spotify_id,
+            )
+            return None
+
+        try:
+            tidal_track = session.track(int(tidal_id))
+            result = self._track_to_result(
+                tidal_track,
+                score=1.0,
+                isrc_match=bool(track.isrc and getattr(tidal_track, "isrc", "").upper() == track.isrc.upper()),
+            )
+            logger.info(
+                "[Tidal] Resolved platform ID for %r: tidal_id=%s title=%r album=%r",
+                track.title,
+                tidal_id,
+                result.title,
+                result.album,
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"[Tidal] TIDAL ID {tidal_id} resolved but could not be loaded: {e}")
+            return None
+
+    def _track_to_result(
+        self,
+        tidal_track,
+        *,
+        score: float,
+        isrc_match: bool = False,
+    ) -> SearchResult:
+        artist_name = tidal_track.artist.name if hasattr(tidal_track, "artist") else ""
+        audio_quality = getattr(tidal_track, "audio_quality", "")
+        is_hires = audio_quality in ("HI_RES", "HI_RES_LOSSLESS") or getattr(
+            tidal_track, "is_hi_res_lossless", False
+        )
+        bit_depth = 24 if is_hires else 16
+        sample_rate = 96000 if is_hires else 44100
+        return SearchResult(
+            source=self.name,
+            title=tidal_track.name,
+            artists=[artist_name] if artist_name else [],
+            album=tidal_track.album.name if hasattr(tidal_track, "album") else None,
+            duration_ms=int(tidal_track.duration * 1000) if hasattr(tidal_track, "duration") else None,
+            audio_format=AudioFormat.FLAC,
+            quality_kbps=None,
+            is_lossless=True,
+            bit_depth=bit_depth,
+            sample_rate_hz=sample_rate,
+            download_url=None,
+            stream_id=str(tidal_track.id),
+            similarity_score=score,
+            isrc_match=isrc_match,
+            is_explicit=getattr(tidal_track, "explicit", None),
+        )
 
     def _try_mirror_download(self, track_id: int, output_path: str) -> Optional[str]:
         """

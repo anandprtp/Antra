@@ -52,6 +52,13 @@ def score_similarity(
     if title_score >= 0.55 and composite < 0.35:
         return title_score * 0.75
 
+    # Hard cap: if the artist is clearly wrong (score < 0.45), cap the composite
+    # below LOSSLESS_ACCEPT_THRESHOLD (0.55) so a perfect title match on a
+    # common song title (e.g. "White Christmas") doesn't pull in the wrong artist.
+    # Only bypass this when the result has no artist info at all (empty string).
+    if best_artist_score < 0.45 and result_artist.strip():
+        return min(composite, 0.50)
+
     return composite
 
 

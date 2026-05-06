@@ -1161,6 +1161,27 @@ class SpotifyClient:
             except Exception as e:
                 logger.debug(f"[Spotify] Search failed for '{query}': {e}")
 
+        token = self._get_anonymous_access_token()
+        if token:
+            try:
+                resp = requests.get(
+                    "https://api.spotify.com/v1/search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "q": query,
+                        "type": "track",
+                        "limit": 1,
+                        "market": self._market or "US",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                tracks = resp.json().get("tracks", {}).get("items", [])
+                if tracks:
+                    return self._parse_track(tracks[0])
+            except Exception as e:
+                logger.debug(f"[Spotify] Anonymous track search failed for '{query}': {e}")
+
         # Fallback to iTunes Search API (100% public, no auth, good metadata)
         return self._search_track_itunes(query)
 
@@ -1873,6 +1894,43 @@ class SpotifyClient:
             logger.warning(f"Failed to enrich album data for {track.title}: {last_error}")
         return self.enrich_public_track_metadata(track)
 
+    def _batch_fetch_isrcs_anonymous(self, tracks: list[TrackMetadata]) -> None:
+        """Fetch ISRCs for tracks that are missing them using an anonymous Spotify token.
+
+        Uses the public /tracks endpoint (no credentials required) in batches of 50.
+        Mutates tracks in-place. Safe to call even when no Spotify credentials are set.
+        """
+        needing = [(i, t) for i, t in enumerate(tracks) if not t.isrc and t.spotify_id]
+        if not needing:
+            return
+        token = self._get_anonymous_access_token()
+        if not token:
+            return
+        import requests as _requests
+        spotify_ids = [t.spotify_id for _, t in needing]
+        isrc_map: dict[str, str] = {}
+        for start in range(0, len(spotify_ids), 50):
+            chunk = spotify_ids[start:start + 50]
+            try:
+                resp = _requests.get(
+                    "https://api.spotify.com/v1/tracks",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={"ids": ",".join(chunk), "market": self._market or "US"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                for t in (resp.json().get("tracks") or []):
+                    if t and t.get("id"):
+                        isrc = t.get("external_ids", {}).get("isrc")
+                        if isrc:
+                            isrc_map[t["id"]] = isrc
+            except Exception as e:
+                logger.debug(f"[Spotify] Anonymous ISRC batch fetch failed: {e}")
+        for i, track in needing:
+            isrc = isrc_map.get(track.spotify_id or "")
+            if isrc:
+                tracks[i].isrc = isrc
+
     def batch_enrich_album_data(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
         """Enrich album data for a list of tracks using batched /albums API calls.
 
@@ -1896,7 +1954,10 @@ class SpotifyClient:
         if self._oauth_sp and self._oauth_sp is not self.sp:
             clients.append(self._oauth_sp)
         if not clients:
-            return [self.enrich_public_track_metadata(track) for track in tracks]
+            enriched = [self.enrich_public_track_metadata(track) for track in tracks]
+            # Still try to fetch ISRCs via anonymous token even without credentials
+            self._batch_fetch_isrcs_anonymous(enriched)
+            return enriched
 
         chunk_size = 20
         for start in range(0, len(unique_ids), chunk_size):
@@ -1943,6 +2004,42 @@ class SpotifyClient:
                     tracks[i].release_date = release_date
                 if release_year and not tracks[i].release_year:
                     tracks[i].release_year = release_year
+
+        # Batch-fetch ISRCs for tracks that don't have one yet.
+        # The album_tracks endpoint returns simplified track objects without
+        # external_ids, so ISRCs must be fetched separately via /tracks (up to
+        # 50 IDs per call). Without ISRCs, the resolver falls back to fuzzy text
+        # matching which can return the wrong recording for non-Latin titles.
+        tracks_needing_isrc = [
+            (i, track) for i, track in enumerate(tracks)
+            if not track.isrc and track.spotify_id
+        ]
+        if tracks_needing_isrc:
+            spotify_ids = [track.spotify_id for _, track in tracks_needing_isrc]
+            isrc_map: dict[str, str] = {}
+            fetched_via_client = False
+            for start in range(0, len(spotify_ids), 50):
+                chunk = spotify_ids[start:start + 50]
+                for client in clients:
+                    try:
+                        result = client.tracks(chunk, market=self._market)
+                        for t in (result.get("tracks") or []):
+                            if t and t.get("id"):
+                                isrc = t.get("external_ids", {}).get("isrc")
+                                if isrc:
+                                    isrc_map[t["id"]] = isrc
+                        fetched_via_client = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"[Batch enrich] Failed to fetch ISRCs for track chunk: {e}")
+            if not fetched_via_client:
+                # All credentialed clients failed — try anonymous token as last resort
+                self._batch_fetch_isrcs_anonymous(tracks)
+                return tracks
+            for i, track in tracks_needing_isrc:
+                isrc = isrc_map.get(track.spotify_id or "")
+                if isrc:
+                    tracks[i].isrc = isrc
 
         # Fall back only when critical metadata is still missing.
         # Do not trigger per-track public lookups just because genres are empty:
