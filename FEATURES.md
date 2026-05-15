@@ -115,6 +115,18 @@ Antra builds an identity index of your library using ISRCs, track IDs, and norma
 
 ---
 
+## Local Library Import
+
+Already have a music collection? **Import Files** and **Import Folder** buttons below the URL bar move local audio into your library using the same structure, tagging, and deduplication as downloads.
+
+- **Reads existing tags first**: title, artist, album, ISRC, track/disc numbers, release date, and genres are pulled from FLAC/MP3/MP4 metadata. When tags are missing, Antra infers fields from the file path (e.g. `Artist - Title.flac`, or `Artist/Album/01 - Track.flac`).
+- **Deduplicated against your library**: imports run through the same ISRC + canonical-title index as downloads, so re-importing a folder that's already partly in your library skips the duplicates.
+- **Quality-aware replacement**: if you import a higher-quality version of a track you already own (FLAC vs MP3, 24-bit vs 16-bit, higher bitrate), Antra replaces the older file in place.
+- **Sidecar lyrics**: matching `.lrc` and `.txt` files next to each audio file are copied alongside.
+- **Supported formats**: FLAC, ALAC, MP3, M4A/MP4, AAC, WAV, AIFF, OGG, Opus.
+
+---
+
 ## Artist Discography Download
 
 Search for any artist by Spotify or Apple Music URL. Antra fetches their full discography and presents it grouped by release type.

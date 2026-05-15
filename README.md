@@ -50,7 +50,7 @@ Quality:  FLAC 24-bit · FLAC 16-bit · ALAC · AAC · MP3
 Output:   Auto-tagged · lyrics + artwork · Navidrome · Jellyfin · Plex ready
 ```
 
-> Spotify podcasts are supported too.
+> Spotify podcasts are supported too. Already have music? **Import Files** / **Import Folder** brings local audio into the same library structure.
 
 → **[Full feature guide](FEATURES.md)**
 

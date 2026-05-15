@@ -638,7 +638,7 @@
       `<span style="color:var(--accent-color)">${sep}</span>`,
       pad('Tracks added      : ', `<span style="color:#4ade80">${downloaded} / ${total}</span>`),
       pad('Already in library: ', `<span style="color:#facc15">${skipped}</span>`),
-      pad(summary.url === 'local import' ? 'Failed imports   : ' : 'Could not source  : ', `<span style="color:${failed > 0 ? 'var(--error-color)' : '#94a3b8'}">${failed}</span>`),
+      pad(summary.mode === 'local' ? 'Failed imports   : ' : 'Could not source  : ', `<span style="color:${failed > 0 ? 'var(--error-color)' : '#94a3b8'}">${failed}</span>`),
       ...(totalMb !== null ? [pad('Total size        : ', `<span style="color:#94a3b8">${totalMb} MB</span>`)] : []),
       ...(elapsed !== null ? [pad('Time taken        : ', `<span style="color:#94a3b8">${elapsed}s</span>`)] : []),
       `<span style="color:var(--accent-color)">${sep}</span>`,

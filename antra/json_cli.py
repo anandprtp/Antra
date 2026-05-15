@@ -2229,6 +2229,7 @@ def run_local_import(paths: list[str], cfg):
     elapsed = time.time() - start
     payload = {
         "type": "playlist_summary",
+        "mode": "local",
         "url": "local import",
         "title": "Local Import",
         "artwork_url": "",
