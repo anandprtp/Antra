@@ -44,6 +44,10 @@ export function PickAnalyzerFiles():Promise<Array<string>>;
 
 export function PickDirectory():Promise<string>;
 
+export function PickImportFiles():Promise<Array<string>>;
+
+export function PickImportFolder():Promise<string>;
+
 export function RequestAccessKey():Promise<main.KeyGenResult>;
 
 export function RetryTrackDownload(arg1:string):Promise<void>;
@@ -63,6 +67,8 @@ export function StartAmazonBrowserLogin():Promise<void>;
 export function StartAppleBrowserLogin():Promise<void>;
 
 export function StartDownload(arg1:Array<string>):Promise<void>;
+
+export function StartLocalImport(arg1:Array<string>):Promise<void>;
 
 export function StartTidalOAuthLogin():Promise<void>;
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, RequestAccessKey } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus } from '../wailsjs/go/main/App.js';
+  import { GetConfig, SaveConfig, PickDirectory, StartDownload, StartLocalImport, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, RequestAccessKey } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, PickImportFiles, PickImportFolder, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
   import AntraLogo from './AntraLogo.svelte';
@@ -638,7 +638,7 @@
       `<span style="color:var(--accent-color)">${sep}</span>`,
       pad('Tracks added      : ', `<span style="color:#4ade80">${downloaded} / ${total}</span>`),
       pad('Already in library: ', `<span style="color:#facc15">${skipped}</span>`),
-      pad('Could not source  : ', `<span style="color:${failed > 0 ? 'var(--error-color)' : '#94a3b8'}">${failed}</span>`),
+      pad(summary.url === 'local import' ? 'Failed imports   : ' : 'Could not source  : ', `<span style="color:${failed > 0 ? 'var(--error-color)' : '#94a3b8'}">${failed}</span>`),
       ...(totalMb !== null ? [pad('Total size        : ', `<span style="color:#94a3b8">${totalMb} MB</span>`)] : []),
       ...(elapsed !== null ? [pad('Time taken        : ', `<span style="color:#94a3b8">${elapsed}s</span>`)] : []),
       `<span style="color:var(--accent-color)">${sep}</span>`,
@@ -1427,6 +1427,52 @@
     }
   }
 
+  function resetLibraryProgress() {
+    logs = [];
+    trackOrder = [];
+    playlistTitle = '';
+    playlistArtwork = '';
+    playlistArtists = '';
+    playlistReleaseDate = '';
+    playlistContentType = '';
+    playlistQualityBadge = '';
+    playlistTotalDurationMs = 0;
+    playlistTotalTracks = 0;
+    Object.keys(activeTracks).forEach(clearTrackInterval);
+    activeTracks = {};
+    separatorMeta = {};
+    shouldAutoScroll = true;
+  }
+
+  async function startLocalImport(paths: string[]) {
+    if (!paths || paths.length === 0) return;
+    if (!config.download_path) {
+      alert("Please select your Music Library folder.");
+      return;
+    }
+
+    isDownloading = true;
+    resetLibraryProgress();
+    addLog('info', `━━━ Importing local music ━━━`);
+    addLog('info', `Copying files into your library structure...`);
+    try {
+      await StartLocalImport(paths);
+    } catch (err) {
+      addLog('error', `Local import error: ${err}`);
+      isDownloading = false;
+    }
+  }
+
+  async function pickLocalImportFiles() {
+    const paths = await PickImportFiles();
+    await startLocalImport(paths);
+  }
+
+  async function pickLocalImportFolder() {
+    const dir = await PickImportFolder();
+    if (dir) await startLocalImport([dir]);
+  }
+
   async function startDownload() {
     if (!inputUrl) return;
 
@@ -1448,20 +1494,7 @@
 
     if (otherUrls.length > 0) {
       isDownloading = true;
-      logs = [];
-      trackOrder = [];
-      playlistTitle = '';
-      playlistArtwork = '';
-      playlistArtists = '';
-      playlistReleaseDate = '';
-      playlistContentType = '';
-      playlistQualityBadge = '';
-      playlistTotalDurationMs = 0;
-      playlistTotalTracks = 0;
-      Object.keys(activeTracks).forEach(clearTrackInterval);
-      activeTracks = {};
-      separatorMeta = {};
-      shouldAutoScroll = true;
+      resetLibraryProgress();
       addLog('info', `━━━ Building your music library ━━━`);
       addLog('info', `Searching best available source (lossless prioritized)...`);
       inputUrl = '';
@@ -1959,6 +1992,10 @@
               Add to<br>Library
             </button>
           {/if}
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;">
+          <button on:click={pickLocalImportFiles} disabled={isDownloading} style="font-size:12px;padding:5px 12px;">Import Files</button>
+          <button on:click={pickLocalImportFolder} disabled={isDownloading} style="font-size:12px;padding:5px 12px;">Import Folder</button>
         </div>
       {/if}
 

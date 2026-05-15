@@ -18,12 +18,15 @@ var audioExtensions = map[string]bool{
 	".flac": true,
 	".mp3":  true,
 	".m4a":  true,
+	".mp4":  true,
 	".aac":  true,
 	".alac": true,
 	".wav":  true,
+	".wave": true,
 	".aiff": true,
 	".aif":  true,
 	".ogg":  true,
+	".opus": true,
 }
 
 // ScanFolder returns sorted audio file paths from a directory (non-recursive).
@@ -132,7 +135,7 @@ func (a *App) PickAnalyzerFiles() []string {
 	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 		Title: "Select Audio Files",
 		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.aac;*.alac;*.wav;*.aiff;*.aif;*.ogg"},
+			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.mp4;*.aac;*.alac;*.wav;*.wave;*.aiff;*.aif;*.ogg;*.opus"},
 		},
 	})
 	if err != nil || len(files) == 0 {
@@ -144,6 +147,36 @@ func (a *App) PickAnalyzerFiles() []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+// PickImportFiles opens a multi-file picker for local library imports.
+func (a *App) PickImportFiles() []string {
+	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Music Files to Import",
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.mp4;*.aac;*.alac;*.wav;*.wave;*.aiff;*.aif;*.ogg;*.opus"},
+		},
+	})
+	if err != nil || len(files) == 0 {
+		return []string{}
+	}
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = filepath.ToSlash(f)
+	}
+	sort.Strings(paths)
+	return paths
+}
+
+// PickImportFolder opens a folder picker for local library imports.
+func (a *App) PickImportFolder() string {
+	dir, err := wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Select Music Folder to Import",
+	})
+	if err != nil {
+		return ""
+	}
+	return filepath.ToSlash(dir)
 }
 
 // WriteFile writes raw bytes (base64-encoded) to a file path on disk.
