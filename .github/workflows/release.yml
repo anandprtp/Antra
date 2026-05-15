@@ -129,7 +129,7 @@ jobs:
           printf '[Desktop Entry]\nName=Antra\nExec=Antra\nIcon=Antra\nType=Application\nCategories=AudioVideo;Audio;\n' > AppDir/Antra.desktop
 
           # Icon
-          cp antra-wails/frontend/public/Antra_newlogo.png AppDir/Antra.png
+          cp antra-wails/frontend/src/assets/images/logo-universal.png AppDir/Antra.png
 
           # AppRun — lean launcher, relies on system webkit2gtk-4.1
           printf '#!/bin/bash\nexec "$(dirname "$(readlink -f "${0}")")/usr/bin/Antra" "$@"\n' > AppDir/AppRun
