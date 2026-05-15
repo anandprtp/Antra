@@ -2184,11 +2184,14 @@ def run_local_import(paths: list[str], cfg):
         return
 
     tracks = []
+    parse_errors: list = []
     for path in files:
         try:
             tracks.append(track_metadata_from_file(path))
-        except Exception:
+            parse_errors.append(None)
+        except Exception as exc:
             tracks.append(fallback_track_metadata(path))
+            parse_errors.append(str(exc))
 
     print(json.dumps({
         "type": "playlist_loaded",
@@ -2222,7 +2225,7 @@ def run_local_import(paths: list[str], cfg):
         lyrics_fetcher=lyrics_fetcher,
         tag_imports=True,
     )
-    summary = importer.import_files(files)
+    summary = importer.import_files(files, tracks=tracks, parse_errors=parse_errors)
     elapsed = time.time() - start
     payload = {
         "type": "playlist_summary",

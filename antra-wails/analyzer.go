@@ -129,11 +129,9 @@ func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 	return result
 }
 
-// PickAnalyzerFiles opens a multi-file picker filtered to audio files.
-func (a *App) PickAnalyzerFiles() []string {
-	// Wails OpenMultipleFilesDialog expects a slice of FileFilter
+func (a *App) pickAudioFiles(title string) []string {
 	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
-		Title: "Select Audio Files",
+		Title: title,
 		Filters: []wailsRuntime.FileFilter{
 			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.mp4;*.aac;*.alac;*.wav;*.wave;*.aiff;*.aif;*.ogg;*.opus"},
 		},
@@ -149,23 +147,14 @@ func (a *App) PickAnalyzerFiles() []string {
 	return paths
 }
 
+// PickAnalyzerFiles opens a multi-file picker filtered to audio files.
+func (a *App) PickAnalyzerFiles() []string {
+	return a.pickAudioFiles("Select Audio Files")
+}
+
 // PickImportFiles opens a multi-file picker for local library imports.
 func (a *App) PickImportFiles() []string {
-	files, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
-		Title: "Select Music Files to Import",
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "Audio Files", Pattern: "*.flac;*.mp3;*.m4a;*.mp4;*.aac;*.alac;*.wav;*.wave;*.aiff;*.aif;*.ogg;*.opus"},
-		},
-	})
-	if err != nil || len(files) == 0 {
-		return []string{}
-	}
-	paths := make([]string, len(files))
-	for i, f := range files {
-		paths[i] = filepath.ToSlash(f)
-	}
-	sort.Strings(paths)
-	return paths
+	return a.pickAudioFiles("Select Music Files to Import")
 }
 
 // PickImportFolder opens a folder picker for local library imports.

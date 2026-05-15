@@ -25,9 +25,6 @@ from antra.utils.tagger import FileTagger
 
 logger = logging.getLogger(__name__)
 
-LOCAL_IMPORT_AUDIO_EXTENSIONS = tuple(
-    sorted(set(SUPPORTED_AUDIO_EXTENSIONS) | {".wav", ".wave", ".aiff", ".aif", ".ogg"})
-)
 SIDECAR_EXTENSIONS = (".lrc", ".txt")
 LOSSLESS_EXTENSIONS = {".flac", ".alac", ".wav", ".wave", ".aiff", ".aif"}
 LOSSY_EXTENSIONS = {".mp3", ".aac", ".m4a", ".mp4", ".opus", ".ogg"}
@@ -76,14 +73,25 @@ class LocalMusicImporter:
         self.lyrics_fetcher = lyrics_fetcher
         self.tagger = FileTagger() if tag_imports else None
 
-    def import_paths(self, paths: list[str]) -> LocalImportSummary:
-        return self.import_files(self.discover_audio_files(paths))
-
-    def import_files(self, files: list[Path]) -> LocalImportSummary:
+    def import_files(
+        self,
+        files: list[Path],
+        *,
+        tracks: Optional[list[TrackMetadata]] = None,
+        parse_errors: Optional[list[Optional[str]]] = None,
+    ) -> LocalImportSummary:
         summary = LocalImportSummary(total=len(files))
 
         for index, path in enumerate(files, start=1):
-            result = self.import_file(path, track_index=index, track_total=len(files))
+            track = tracks[index - 1] if tracks else None
+            parse_error = parse_errors[index - 1] if parse_errors else None
+            result = self.import_file(
+                path,
+                track_index=index,
+                track_total=len(files),
+                track=track,
+                parse_error=parse_error,
+            )
             summary.results.append(result)
             if result.status == DownloadStatus.COMPLETED:
                 summary.imported += 1
@@ -101,27 +109,33 @@ class LocalMusicImporter:
         path: Path,
         track_index: Optional[int] = None,
         track_total: Optional[int] = None,
+        track: Optional[TrackMetadata] = None,
+        parse_error: Optional[str] = None,
     ) -> DownloadResult:
-        try:
-            track = track_metadata_from_file(path)
-            self._sanitize_metadata(track)
-        except Exception as exc:
-            track = fallback_track_metadata(path)
-            self._sanitize_metadata(track)
+        if track is None:
+            try:
+                track = track_metadata_from_file(path)
+            except Exception as exc:
+                track = fallback_track_metadata(path)
+                parse_error = str(exc)
+
+        self._sanitize_metadata(track)
+
+        if parse_error:
             self._emit(
                 EngineEventType.TRACK_FAILED,
                 track=track,
                 track_index=track_index,
                 track_total=track_total,
                 source="local",
-                error=str(exc),
+                error=parse_error,
             )
             return DownloadResult(
                 track=track,
                 status=DownloadStatus.FAILED,
                 file_path=str(path),
                 source_used="local",
-                error_message=str(exc),
+                error_message=parse_error,
             )
 
         self._emit(
@@ -264,7 +278,7 @@ class LocalMusicImporter:
                 try:
                     if not path.is_file():
                         continue
-                    if path.suffix.lower() not in LOCAL_IMPORT_AUDIO_EXTENSIONS:
+                    if path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
                         continue
                     resolved = str(path.resolve())
                 except OSError:
@@ -600,9 +614,8 @@ def clean_tag_list(values: list[str]) -> list[str]:
     for value in values:
         if value is None:
             continue
-        parts = [str(value).strip()]
-        if len(parts) == 1 and ";" in parts[0]:
-            parts = [part.strip() for part in parts[0].split(";")]
+        stripped = str(value).strip()
+        parts = [p.strip() for p in stripped.split(";")] if ";" in stripped else [stripped]
         for part in parts:
             if part and part not in cleaned:
                 cleaned.append(part)
