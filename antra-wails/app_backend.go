@@ -297,7 +297,20 @@ func (a *App) CancelDownload() {
 // StartDownload starts the Python backend process and streams output
 func (a *App) StartDownload(playlists []string) error {
 	wailsRuntime.LogInfof(a.ctx, "Starting download for: %v", playlists)
+	return a.startLibraryBackend(playlists)
+}
 
+// StartLocalImport starts the Python backend in local import mode and streams output.
+func (a *App) StartLocalImport(paths []string) error {
+	wailsRuntime.LogInfof(a.ctx, "Starting local import for: %v", paths)
+	if len(paths) == 0 {
+		return fmt.Errorf("no local files or folders selected")
+	}
+	args := append([]string{"--import-local"}, paths...)
+	return a.startLibraryBackend(args)
+}
+
+func (a *App) startLibraryBackend(cliArgs []string) error {
 	if cancel, cmd := a.detachActiveDownload(); cancel != nil || cmd != nil {
 		if cancel != nil {
 			cancel()
@@ -313,7 +326,7 @@ func (a *App) StartDownload(playlists []string) error {
 
 	ctx, cancel := context.WithCancel(a.ctx)
 
-	command, args, workDir, env, err := a.resolveBackendCommand(playlists)
+	command, args, workDir, env, err := a.resolveBackendCommand(cliArgs)
 	if err != nil {
 		cancel()
 		wailsRuntime.LogErrorf(a.ctx, err.Error())

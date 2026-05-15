@@ -86,6 +86,14 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
+export function PickImportFiles() {
+  return window['go']['main']['App']['PickImportFiles']();
+}
+
+export function PickImportFolder() {
+  return window['go']['main']['App']['PickImportFolder']();
+}
+
 export function RequestAccessKey() {
   return window['go']['main']['App']['RequestAccessKey']();
 }
@@ -124,6 +132,10 @@ export function StartAppleBrowserLogin() {
 
 export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
+}
+
+export function StartLocalImport(arg1) {
+  return window['go']['main']['App']['StartLocalImport'](arg1);
 }
 
 export function StartTidalOAuthLogin() {

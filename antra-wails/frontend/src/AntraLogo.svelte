@@ -30,7 +30,7 @@
 
   let angles: number[]  = SERVICES.map((_, i) => -Math.PI / 2 + (2 * Math.PI * i) / NUM);
   let activeIdx         = 0;
-  let activeLabel       = SERVICES[0].label;
+  let activeLabel: Service['label'] = SERVICES[0].label;
   let labelOpacity      = 1;
   let startTs: number | null = null;
   let raf: number;

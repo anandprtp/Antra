@@ -2148,6 +2148,106 @@ def _run_amazon_browser_login(cfg, config_path):
         "message": _message,
     }), flush=True)
 
+
+def run_local_import(paths: list[str], cfg):
+    from datetime import datetime
+    from antra.utils.local_importer import (
+        LocalMusicImporter,
+        fallback_track_metadata,
+        track_metadata_from_file,
+    )
+    from antra.utils.lyrics import LyricsFetcher
+    from antra.utils.organizer import LibraryOrganizer
+
+    start = time.time()
+    try:
+        organizer = LibraryOrganizer(
+            cfg.output_dir,
+            full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
+            folder_structure=getattr(cfg, "folder_structure", "standard"),
+            album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
+            filename_format=getattr(cfg, "filename_format", "default"),
+        )
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
+        print(json.dumps({"type": "done"}), flush=True)
+        return
+
+    files = LocalMusicImporter.discover_audio_files(paths)
+    print(json.dumps({"type": "log", "level": "info", "message": f"Preparing local import for {len(files)} file(s)"}), flush=True)
+
+    if not files:
+        print(json.dumps({"type": "log", "level": "error", "message": "No supported local audio files found"}), flush=True)
+        print(json.dumps({"type": "done"}), flush=True)
+        return
+
+    tracks = []
+    parse_errors: list = []
+    for path in files:
+        try:
+            tracks.append(track_metadata_from_file(path))
+            parse_errors.append(None)
+        except Exception as exc:
+            tracks.append(fallback_track_metadata(path))
+            parse_errors.append(str(exc))
+
+    print(json.dumps({
+        "type": "playlist_loaded",
+        "title": "Local Import",
+        "artwork_url": "",
+        "content_type": "LOCAL",
+        "artists_string": f"{len(files)} file(s)",
+        "release_date": "",
+        "quality_badge": "LOCAL",
+        "track_count": len(tracks),
+        "tracks": [
+            {
+                "artist": t.artist_string,
+                "title": t.title,
+                "duration_ms": t.duration_ms or 0,
+            }
+            for t in tracks
+        ],
+    }), flush=True)
+
+    lyrics_fetcher = None
+    if getattr(cfg, "fetch_lyrics", True):
+        lyrics_fetcher = LyricsFetcher(
+            musixmatch_api_key=getattr(cfg, "musixmatch_api_key", "") or None,
+            genius_api_key=getattr(cfg, "genius_api_key", "") or None,
+        )
+
+    importer = LocalMusicImporter(
+        organizer,
+        event_callback=emit_event,
+        lyrics_fetcher=lyrics_fetcher,
+        tag_imports=True,
+    )
+    summary = importer.import_files(files, tracks=tracks, parse_errors=parse_errors)
+    elapsed = time.time() - start
+    payload = {
+        "type": "playlist_summary",
+        "mode": "local",
+        "url": "local import",
+        "title": "Local Import",
+        "artwork_url": "",
+        "total": summary.total,
+        "downloaded": summary.imported,
+        "failed": summary.failed,
+        "skipped": summary.skipped,
+        "error": None,
+        "sources": {"local": summary.imported} if summary.imported else {},
+        "date": datetime.now().isoformat(),
+        "total_mb": round(summary.total_bytes / (1024 * 1024), 1),
+        "elapsed_seconds": round(elapsed),
+    }
+    print(json.dumps({"type": "library_update", "tracks_added": summary.imported, "url": "local import"}), flush=True)
+    print(json.dumps(payload), flush=True)
+    print(json.dumps({"type": "done"}), flush=True)
+
+
 def main():
 
     _start_time = time.time()
@@ -2186,6 +2286,8 @@ def main():
                         help="Open a browser and capture the Apple Music session automatically")
     parser.add_argument("--amazon-browser-login", action="store_true",
                         help="Open a browser and capture the Amazon Music session automatically")
+    parser.add_argument("--import-local", nargs="+", metavar="PATH",
+                        help="Import local audio files or folders into the configured library and exit")
     args = parser.parse_args()
 
     ensure_runtime_environment()
@@ -2436,6 +2538,12 @@ def main():
 
             if "prefer_explicit" in settings:
                 os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
+            if "fetch_lyrics" in settings:
+                os.environ["FETCH_LYRICS"] = "true" if settings["fetch_lyrics"] else "false"
+            if settings.get("musixmatch_api_key"):
+                os.environ["MUSIXMATCH_API_KEY"] = settings["musixmatch_api_key"]
+            if settings.get("genius_api_key"):
+                os.environ["GENIUS_API_KEY"] = settings["genius_api_key"]
 
             # API key for self-hosted mirror servers
             if settings.get("antra_api_key") is not None:
@@ -2467,6 +2575,10 @@ def main():
     if args.amazon_browser_login:
         _run_amazon_browser_login(cfg, args.config)
         sys.exit(0)
+
+    if args.import_local:
+        run_local_import(args.import_local, cfg)
+        return
 
     print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Album layout: {getattr(cfg, 'album_folder_structure', cfg.folder_structure)} | Playlist layout: {getattr(cfg, 'playlist_folder_structure', cfg.folder_structure)} | Single layout: {getattr(cfg, 'single_track_structure', 'album_numbered')} | Output format: {cfg.output_format}"}))
 

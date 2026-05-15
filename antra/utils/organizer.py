@@ -20,7 +20,21 @@ logger = logging.getLogger(__name__)
 STATE_FILE = ".antra_state.json"
 TRACK_KEY_PREFIX = "TRACK:"
 FAILED_PREFIX = "FAILED:"
-SUPPORTED_AUDIO_EXTENSIONS = (".flac", ".mp3", ".aac", ".m4a", ".mp4", ".opus")
+SUPPORTED_AUDIO_EXTENSIONS = (
+    ".flac",
+    ".mp3",
+    ".aac",
+    ".alac",
+    ".m4a",
+    ".mp4",
+    ".opus",
+    ".wav",
+    ".wave",
+    ".aiff",
+    ".aif",
+    ".ogg",
+)
+ISRC_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$", re.IGNORECASE)
 
 
 class LibraryOrganizer:
@@ -236,8 +250,9 @@ class LibraryOrganizer:
 
     def _track_identity_keys(self, track: TrackMetadata) -> list[str]:
         keys: list[str] = []
-        if track.isrc:
-            keys.append(f"isrc:{track.isrc.strip().lower()}")
+        isrc = self._normalize_isrc(track.isrc)
+        if isrc:
+            keys.append(f"isrc:{isrc}")
         if track.spotify_id:
             keys.append(f"spotify:{track.spotify_id.strip()}")
 
@@ -373,8 +388,9 @@ class LibraryOrganizer:
         spotify_id: Optional[str],
     ) -> list[str]:
         keys: list[str] = []
-        if isrc:
-            keys.append(f"isrc:{isrc.strip().lower()}")
+        normalized_isrc = self._normalize_isrc(isrc)
+        if normalized_isrc:
+            keys.append(f"isrc:{normalized_isrc}")
         if spotify_id:
             keys.append(f"spotify:{spotify_id.strip()}")
 
@@ -449,6 +465,15 @@ class LibraryOrganizer:
         value = re.sub(r"\s+", " ", value)
         value = re.sub(r"[^a-z0-9 ]+", "", value)
         return value.strip()
+
+    @staticmethod
+    def _normalize_isrc(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        normalized = re.sub(r"[^A-Za-z0-9]", "", value).upper()
+        if not ISRC_PATTERN.match(normalized):
+            return ""
+        return normalized.lower()
 
     @staticmethod
     def _artists_canonical_key(artists: list[str]) -> str:
