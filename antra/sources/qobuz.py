@@ -33,12 +33,21 @@ class QobuzAdapter(BaseSourceAdapter):
 
     BASE_URL = "https://www.qobuz.com/api.json/0.2"
 
-    def __init__(self, email: str = "", password: str = "", app_id: str = "", app_secret: str = "", user_auth_token: str = ""):
+    def __init__(
+        self,
+        email: str = "",
+        password: str = "",
+        app_id: str = "",
+        app_secret: str = "",
+        user_auth_token: str = "",
+        preferred_output_format: str = "source",
+    ):
         self.email = email
         self.password = password
         self.app_id = app_id or _STALE_APP_ID
         self.app_secret = app_secret
         self._user_auth_token: Optional[str] = user_auth_token or None
+        self._preferred_output_format = (preferred_output_format or "source").lower()
         self._creds_refreshed = False  # guard: only auto-refresh once per session
         self._session = requests.Session()
         self._session.headers.update({
@@ -48,6 +57,9 @@ class QobuzAdapter(BaseSourceAdapter):
 
     def is_available(self) -> bool:
         return bool((self.email and self.password) or self._user_auth_token)
+
+    def _requires_strict_24bit(self) -> bool:
+        return self._preferred_output_format in {"lossless-24", "alac-24"}
 
     def _refresh_credentials(self) -> bool:
         """
@@ -256,6 +268,7 @@ class QobuzAdapter(BaseSourceAdapter):
             else:
                 sample_rate = int(sample_rate)
             bit_depth = int(bit_depth)
+            source_meta = _extract_qobuz_source_metadata(item, album)
             return SearchResult(
                 source=self.name,
                 title=item.get("title", ""),
@@ -272,6 +285,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 similarity_score=1.0 if isrc_match else 0.0,
                 isrc_match=isrc_match,
                 is_explicit=item.get("parental_warning") if isinstance(item.get("parental_warning"), bool) else None,
+                source_metadata=source_meta,
             )
         except Exception:
             return None
@@ -299,7 +313,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 },
             )
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 400:
+            if e.response.status_code == 400 and not self._requires_strict_24bit():
                 # Fallback to 16-bit FLAC if 24-bit was strictly not available (different to credential 400!)
                 format_id = 6
                 ts = str(int(time.time()))
@@ -334,3 +348,48 @@ class QobuzAdapter(BaseSourceAdapter):
                 for chunk in r.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
+
+
+def _extract_qobuz_source_metadata(item: dict, album: dict) -> dict:
+    """Extract rich metadata from a Qobuz API track/album response."""
+    meta: dict = {}
+    isrc = (item.get("isrc") or "").strip()
+    if isrc:
+        meta["isrc"] = isrc
+    if isinstance(item.get("parental_warning"), bool):
+        meta["is_explicit"] = item["parental_warning"]
+    rd = album.get("release_date_original") or album.get("release_date") or ""
+    if rd:
+        meta["release_date"] = rd[:10] if len(rd) >= 10 else rd
+        try:
+            meta["release_year"] = int(rd[:4])
+        except (ValueError, TypeError):
+            pass
+    genre_obj = album.get("genre") or item.get("genre") or {}
+    if isinstance(genre_obj, dict):
+        gn = genre_obj.get("name")
+        if gn:
+            meta["genres"] = [str(gn)]
+    elif isinstance(genre_obj, str):
+        meta["genres"] = [genre_obj]
+    lbl_obj = (album.get("label") or {} if isinstance(album.get("label"), dict) else {})
+    lbl_name = (
+        lbl_obj.get("name")
+        or (album.get("label") if isinstance(album.get("label"), str) else None)
+    )
+    if lbl_name:
+        meta["label"] = str(lbl_name)
+    comp_obj = item.get("composer") or {}
+    if isinstance(comp_obj, dict):
+        cn = comp_obj.get("name")
+        if cn:
+            meta["composer"] = str(cn)
+    img = album.get("image") or {}
+    if isinstance(img, dict):
+        art = img.get("large") or img.get("medium") or img.get("small")
+        if art:
+            meta["artwork_url"] = art
+    upc = album.get("upc") or album.get("barcode") or ""
+    if upc:
+        meta["upc"] = str(upc)
+    return meta

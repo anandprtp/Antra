@@ -3,6 +3,7 @@ Reusable application service for CLI and future desktop frontends.
 """
 import logging
 import json
+import os
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
@@ -11,7 +12,7 @@ from antra.core.config import Config, load_config
 from antra.core.control import DownloadController
 from antra.core.engine import DownloadEngine, EngineConfig
 from antra.core.events import EngineEvent
-from antra.core.spotify import SpotifyResourceError
+from antra.core.spotify import SpotifyAvailabilityError, SpotifyResourceError
 from antra.core.models import (
     BulkDownloadProgress,
     BulkDownloadReport,
@@ -139,6 +140,27 @@ def describe_output_format(value: Optional[str]) -> str:
     return labels.get(normalized, normalized)
 
 
+_GIST_MIRRORS_URL = "https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw/mirrors.txt"
+
+
+def _fetch_gist_apple_mirror(cfg) -> str:
+    """Fetch the Apple mirror URL from mirrors.txt on the Gist."""
+    try:
+        import requests as _r
+        resp = _r.get(_GIST_MIRRORS_URL, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("apple"):
+                url = data["apple"].strip().rstrip("/")
+                if url:
+                    logger.info("[Sources] Apple mirror URL loaded from Gist")
+                    return url
+        logger.debug("[Sources] Gist mirrors.txt returned HTTP %s or no apple key", resp.status_code)
+    except Exception as exc:
+        logger.debug("[Sources] Gist mirrors.txt fetch failed: %s", exc)
+    return ""
+
+
 @dataclass
 class RuntimeOptions:
     output_dir: Optional[str] = None
@@ -196,6 +218,23 @@ class AntraService:
         if normalized == "priority-4":
             allowed = {"jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
+        # Service group overrides: "tidal" (normalized to "hifi" via alias) includes all
+        # Tidal-backed adapters; "qobuz" and "deezer" include their mirror adapters.
+        # This makes the Download Source UI setting work correctly — selecting a service
+        # routes through all adapters backed by that service, not just the exact-named one.
+        if normalized == "hifi":
+            allowed = {"hifi", "tidal", "tidal_mirror"}
+            return [adapter for adapter in adapters if adapter.name in allowed]
+        if normalized == "qobuz":
+            allowed = {"qobuz", "qobuz_mirror", "dab"}
+            return [adapter for adapter in adapters if adapter.name in allowed]
+        if normalized == "deezer":
+            allowed = {"deezer", "deezer_mirror"}
+            return [adapter for adapter in adapters if adapter.name in allowed]
+        if normalized == "apple":
+            return [adapter for adapter in adapters if adapter.name == "apple"]
+        if normalized == "amazon":
+            return [adapter for adapter in adapters if adapter.name == "amazon"]
         return [adapter for adapter in adapters if adapter.name == normalized]
 
     @staticmethod
@@ -290,16 +329,27 @@ class AntraService:
                 return (getattr(manifest, manifest_attr, "") or "").strip()
             return ""
 
-        # API key: env var > manifest field
+        # Two separate key concepts:
+        # 1. api_key — the user's personal key (antra_api_key from config).
+        #    Used for: download quota / rate-limit enforcement, VPS metadata proxy.
+        # 2. mirror_api_key — the key accepted by the self-hosted mirror servers
+        #    (qobuz.*, tidal.*, amazon.*, apple.*). These servers only recognise the
+        #    key registered in the endpoint manifest, NOT the user's personal key.
+        #    Prefer the manifest key; fall back to the user key when no manifest.
         api_key = (getattr(cfg, "antra_api_key", "") or "").strip()
-        if not api_key and manifest is not None:
-            api_key = (getattr(manifest, "api_key", "") or "").strip()
+        manifest_key = ""
+        if manifest is not None:
+            manifest_key = (getattr(manifest, "api_key", "") or "").strip()
+        # Mirror adapter auth key — manifest key takes priority because mirror
+        # servers were registered with that key. User's personal key is a fallback
+        # only when no manifest is available (e.g. ANTRA_ENDPOINT_MANIFEST_URL unset).
+        mirror_api_key = manifest_key or api_key
 
         tidal_mirror_url = _mirror_url("tidal_mirror_url", "mirror_tidal")
         if source_group_enabled("tidal_mirror") and tidal_mirror_url:
             try:
                 from antra.sources.tidal_mirror import TidalMirrorAdapter
-                adapter = TidalMirrorAdapter(mirror_url=tidal_mirror_url, api_key=api_key)
+                adapter = TidalMirrorAdapter(mirror_url=tidal_mirror_url, api_key=mirror_api_key)
                 if adapter.is_available():
                     adapters.append(adapter)
                     logger.info("[OK] Tidal mirror adapter enabled")
@@ -312,7 +362,11 @@ class AntraService:
         if source_group_enabled("qobuz_mirror") and qobuz_mirror_url:
             try:
                 from antra.sources.qobuz_mirror import QobuzMirrorAdapter
-                adapter = QobuzMirrorAdapter(mirror_url=qobuz_mirror_url, api_key=api_key)
+                adapter = QobuzMirrorAdapter(
+                    mirror_url=qobuz_mirror_url,
+                    api_key=mirror_api_key,
+                    preferred_output_format=cfg.output_format,
+                )
                 if adapter.is_available():
                     adapters.append(adapter)
                     logger.info("[OK] Qobuz mirror adapter enabled")
@@ -325,7 +379,7 @@ class AntraService:
         if source_group_enabled("deezer_mirror") and deezer_mirror_url:
             try:
                 from antra.sources.deezer_mirror import DeezerMirrorAdapter
-                adapter = DeezerMirrorAdapter(mirror_url=deezer_mirror_url, api_key=api_key)
+                adapter = DeezerMirrorAdapter(mirror_url=deezer_mirror_url, api_key=mirror_api_key)
                 if adapter.is_available():
                     adapters.append(adapter)
                     logger.info("[OK] Deezer mirror adapter enabled")
@@ -389,6 +443,7 @@ class AntraService:
                     app_id=getattr(cfg, "qobuz_app_id", ""),
                     app_secret=getattr(cfg, "qobuz_app_secret", ""),
                     user_auth_token=getattr(cfg, "qobuz_user_auth_token", ""),
+                    preferred_output_format=cfg.output_format,
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -423,6 +478,8 @@ class AntraService:
         env_apple_mirror = (getattr(cfg, "apple_mirror_url", "") or "").strip().rstrip("/")
         if env_apple_mirror:
             mirror_apple_url = env_apple_mirror
+        if not mirror_apple_url:
+            mirror_apple_url = _fetch_gist_apple_mirror(cfg)
         if mirror_apple_url and mirror_apple_url not in apple_mirrors:
             apple_mirrors = [mirror_apple_url] + apple_mirrors
         apple_should_enable = (
@@ -441,7 +498,7 @@ class AntraService:
                     mirrors=apple_mirrors,
                     preferred_output_format=cfg.output_format,
                     api_key=getattr(cfg, "odesli_api_key", "") or None,
-                    mirror_api_key=api_key,
+                    mirror_api_key=mirror_api_key,
                     authorization_token=getattr(cfg, "apple_authorization_token", ""),
                     music_user_token=getattr(cfg, "apple_music_user_token", ""),
                     storefront=getattr(cfg, "apple_storefront", "us"),
@@ -488,7 +545,7 @@ class AntraService:
                     mirrors=amazon_mirrors,
                     api_key=getattr(cfg, "odesli_api_key", "") or None,
                     direct_creds_json=amazon_direct_creds_json,
-                    mirror_api_key=api_key,
+                    mirror_api_key=mirror_api_key,
                     preferred_output_format=cfg.output_format,
                 )
                 if adapter.is_available():
@@ -563,53 +620,223 @@ class AntraService:
 
     @staticmethod
     def _stamp_disc_totals(tracks: list[TrackMetadata]) -> list[TrackMetadata]:
-        """Compute total_discs per album and stamp it on each track.
+        """Normalize disc numbering, year, and track order across each album group.
 
-        Groups tracks by album_id (or album+artist as fallback), normalizes any
-        anomalous disc numbering into a clean 1..N sequence, then stamps the
-        total disc count back onto every track in the group.
+        Groups tracks by album_id (or album+artist as fallback), then:
 
-        Some upstream sources occasionally emit broken disc numbers like 29/39
-        for a normal 2-disc release. Normalizing here keeps the default file
-        naming stable across Spotify, Apple Music, Amazon, and any future source:
-        disc 1 -> 101/102..., disc 2 -> 201/202..., etc.
+        1. Normalizes release_year to the most common (mode) year across the group
+           so that all tracks in the same album land in the same folder — prevents
+           folder splitting when individual tracks carry different release dates
+           (common with compilation albums sourced from Apple Music).
+
+        2. Normalizes anomalous disc numbers (e.g. 29/39 → 1/2) and stamps
+           total_discs on every track so multi-disc filename prefixes work.
+
+        3. Renumbers track_number sequentially within each disc (1, 2, 3...).
+           Apple Music compilation albums often preserve each track's original
+           release track number which produces collisions and gaps in the
+           filename numbering — sequential renumbering fixes this.
         """
-        from collections import defaultdict
+        from collections import defaultdict, Counter
         album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
         for track in tracks:
-            key = track.album_id or f"{track.album}||{track.primary_artist}"
+            key = AntraService._album_group_key(track)
             album_groups[key].append(track)
 
+        reordered_tracks: list[TrackMetadata] = []
         for group in album_groups.values():
-            disc_numbers = [t.disc_number for t in group if t.disc_number is not None and t.disc_number > 0]
-            if not disc_numbers:
-                continue
-
-            unique_discs = sorted(set(disc_numbers))
-            expected = list(range(1, len(unique_discs) + 1))
-            if unique_discs != expected:
-                remap = {disc: index for index, disc in enumerate(unique_discs, start=1)}
-                logger.debug(
-                    "[Service] Normalizing disc numbers for album group %s: %s -> %s",
-                    group[0].album if group else "unknown",
-                    unique_discs,
-                    expected,
-                )
+            # ── 1. Year normalization ─────────────────────────────────
+            years = [t.release_year for t in group if t.release_year is not None]
+            if years:
+                mode_year = Counter(years).most_common(1)[0][0]
                 for track in group:
-                    if track.disc_number in remap:
-                        track.disc_number = remap[track.disc_number]
+                    if not track.release_year or track.release_year != mode_year:
+                        track.release_year = mode_year
+                        # Clear release_date if it disagrees with the mode year
+                        # so the tagger falls back to the normalized year.
+                        if track.release_date and len(track.release_date) >= 4:
+                            try:
+                                if int(track.release_date[:4]) != mode_year:
+                                    track.release_date = None
+                            except (ValueError, TypeError):
+                                pass
 
-            total = len(unique_discs)
-            for track in group:
-                track.total_discs = total
+            AntraService._infer_apple_album_disc_numbers_from_source_order(group)
 
-        return tracks
+            # ── 2. Disc normalization ─────────────────────────────────
+            disc_numbers = [t.disc_number for t in group if t.disc_number is not None and t.disc_number > 0]
+            hinted_totals = [t.total_discs for t in group if t.total_discs is not None and t.total_discs > 0]
+            hinted_total = Counter(hinted_totals).most_common(1)[0][0] if hinted_totals else None
+            if disc_numbers:
+                unique_discs = sorted(set(disc_numbers))
+                missing_disc_slots = any(t.disc_number is None or t.disc_number <= 0 for t in group)
+                contiguous_observed = unique_discs == list(range(unique_discs[0], unique_discs[-1] + 1))
+                infer_leading_disc = missing_disc_slots and contiguous_observed and unique_discs[0] > 1
+                if (
+                    hinted_total
+                    and hinted_total > 0
+                    and len(unique_discs) > hinted_total
+                    and unique_discs[0] == 1
+                    and contiguous_observed
+                ):
+                    logger.debug(
+                        "[Service] Collapsing overflow discs for album group %s: observed=%s hinted=%s",
+                        group[0].album if group else "unknown",
+                        unique_discs,
+                        hinted_total,
+                    )
+                    for track in group:
+                        if track.disc_number and track.disc_number > hinted_total:
+                            track.disc_number = hinted_total
+                    unique_discs = list(range(1, hinted_total + 1))
+                expected = list(range(1, len(unique_discs) + 1))
+                if unique_discs != expected and not infer_leading_disc:
+                    remap = {disc: index for index, disc in enumerate(unique_discs, start=1)}
+                    logger.debug(
+                        "[Service] Normalizing disc numbers for album group %s: %s -> %s",
+                        group[0].album if group else "unknown",
+                        unique_discs,
+                        expected,
+                    )
+                    for track in group:
+                        if track.disc_number in remap:
+                            track.disc_number = remap[track.disc_number]
+
+                total = unique_discs[-1] if infer_leading_disc else len(unique_discs)
+                if hinted_total and hinted_total > 0:
+                    total = hinted_total
+                for track in group:
+                    if total > 1 and (track.disc_number is None or track.disc_number <= 0):
+                        track.disc_number = 1
+                    track.total_discs = total
+
+            # ── 3. Sequential track renumbering per disc ─────────────
+            # Tracks are grouped by disc, preserving the original list order from
+            # the source API (which reflects the album tracklisting).  Apple Music
+            # compilations sometimes carry per-track track_number metadata that
+            # disagrees with the response order — trusting metadata over order can
+            # interleave bonus/alternate tracks with the standard edition listing.
+            disc_tracks: dict[int, list[TrackMetadata]] = {}
+            for t in group:
+                d = t.disc_number if t.disc_number and t.disc_number > 0 else 1
+                disc_tracks.setdefault(d, []).append(t)
+
+            original_order = {id(track): index for index, track in enumerate(group)}
+            ordered_group: list[TrackMetadata] = []
+            for disc, dt in disc_tracks.items():
+                if AntraService._disc_track_numbers_look_reliable(dt):
+                    dt = sorted(
+                        dt,
+                        key=lambda track: (
+                            track.track_number if track.track_number and track.track_number > 0 else 10**9,
+                            original_order[id(track)],
+                        ),
+                    )
+                for new_num, t in enumerate(dt, start=1):
+                    t.track_number = new_num
+                ordered_group.extend(dt)
+
+            if all((track.request_kind or "").lower() != "playlist" for track in group):
+                reordered_tracks.extend(ordered_group)
+            else:
+                reordered_tracks.extend(group)
+
+        return reordered_tracks if len(reordered_tracks) == len(tracks) else tracks
+
+    @staticmethod
+    def _album_group_key(track: TrackMetadata) -> str:
+        if (
+            (track.source_service or "").lower() == "apple"
+            and (track.request_kind or "").lower() == "album"
+        ):
+            album_id = (track.album_id or "").strip()
+            if album_id:
+                return f"apple_album::{album_id}"
+            album = (track.album or "").strip().lower()
+            album_artists = "||".join(
+                artist.strip().lower() for artist in (track.album_artists or []) if artist.strip()
+            )
+            year = str(track.release_year or "")
+            return f"apple_album_fallback::{album}::{album_artists}::{year}"
+        return track.album_id or f"{track.album}||{track.primary_artist}"
+
+    @staticmethod
+    def _infer_apple_album_disc_numbers_from_source_order(group: list[TrackMetadata]) -> None:
+        from collections import Counter
+
+        if not group:
+            return
+        if any((track.request_kind or "").lower() == "playlist" for track in group):
+            return
+        if not all((track.source_service or "").lower() == "apple" for track in group):
+            return
+
+        hinted_totals = [t.total_discs for t in group if t.total_discs is not None and t.total_discs > 0]
+        hinted_total = Counter(hinted_totals).most_common(1)[0][0] if hinted_totals else None
+
+        inferred_discs: list[int] = []
+        current_disc = 1
+        previous_track_number = 0
+        reset_count = 0
+
+        for track in group:
+            track_number = track.track_number
+            if track_number is None or track_number <= 0:
+                return
+            if previous_track_number and track_number <= previous_track_number:
+                if track_number > 3:
+                    return
+                current_disc += 1
+                reset_count += 1
+            inferred_discs.append(current_disc)
+            previous_track_number = track_number
+
+        inferred_total = current_disc
+        if inferred_total <= 1:
+            return
+        if hinted_total and inferred_total != hinted_total:
+            return
+        if reset_count != inferred_total - 1:
+            return
+
+        for disc in range(1, inferred_total + 1):
+            disc_numbers = [
+                track.track_number
+                for track, inferred_disc in zip(group, inferred_discs)
+                if inferred_disc == disc
+            ]
+            if not disc_numbers or disc_numbers[0] != 1:
+                return
+            if any(b <= a for a, b in zip(disc_numbers, disc_numbers[1:])):
+                return
+
+        logger.debug(
+            "[Service] Inferred Apple disc ordering from source order for album '%s': total_discs=%s",
+            group[0].album if group else "unknown",
+            inferred_total,
+        )
+        for track, inferred_disc in zip(group, inferred_discs):
+            track.disc_number = inferred_disc
+            track.total_discs = inferred_total
+
+    @staticmethod
+    def _disc_track_numbers_look_reliable(tracks: list[TrackMetadata]) -> bool:
+        numbers = [t.track_number for t in tracks if t.track_number and t.track_number > 0]
+        if len(numbers) < max(2, len(tracks) - 1):
+            return False
+        if len(set(numbers)) != len(numbers):
+            return False
+        if min(numbers) < 1:
+            return False
+        max_reasonable = max(len(tracks) + 2, int(len(tracks) * 1.5))
+        return max(numbers) <= max_reasonable
 
     def fetch_playlist_tracks(
         self,
         playlist: str,
         options: Optional[RuntimeOptions] = None,
         enrich_override: Optional[bool] = None,
+        page_callback=None,
     ) -> list[TrackMetadata]:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
@@ -618,13 +845,9 @@ class AntraService:
 
         # Handle Apple Music URLs
         if "music.apple.com" in playlist:
-            tracks = self._fetch_apple_tracks(playlist, cfg)
+            tracks = self._fetch_apple_tracks(playlist, cfg, page_callback=page_callback)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
-            try:
-                tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
-            except Exception as e:
-                logger.debug(f"[Service] Apple Spotify hydration failed: {e}")
 
         # Handle SoundCloud URLs
         elif "soundcloud.com" in playlist:
@@ -651,32 +874,57 @@ class AntraService:
         elif is_tidal_url(playlist) or is_qobuz_url(playlist) or is_deezer_url(playlist):
             tracks = self._fetch_external_music_tracks(playlist, cfg)
             self._apply_request_kind(tracks, playlist)
-            if is_deezer_url(playlist):
+            if is_tidal_url(playlist):
+                # TIDAL URL → only tidal_mirror + hifi (no Apple/Deezer/Amazon fallback).
+                # The user pasted a TIDAL link intentionally — respect the source.
+                self._apply_source_intent(tracks, service="tidal", rule="exclusive")
+            elif is_qobuz_url(playlist):
+                # Qobuz URL → prefer the Qobuz family first (qobuz_mirror, direct
+                # qobuz, DAB), but allow other hi-res sources afterward if Qobuz
+                # cannot produce a valid stream for the requested quality.
+                self._apply_source_intent(tracks, service="qobuz", rule="prefer_hires")
+            elif is_deezer_url(playlist):
                 self._apply_source_intent(tracks, service="deezer", rule="exclusive")
 
         else:
-            # Try authenticated Spotify client first.
-            # On auth failure → fall back to:
-            #   1. SpotFetch proxy (returns ISRC + full metadata)
-            #   2. Direct Spotify public-page scraping (no 3rd-party dependency)
-            spotify = self._make_spotify_client(cfg)
-            try:
-                tracks = self._fetch_tracks_with_client(spotify, playlist, cfg, enrich_override=enrich_override)
-            except SpotifyResourceError as e:
-                logger.debug(
-                    f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
-                )
-                tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
-            except Exception as e:
-                if _is_auth_error(e):
+            # Try VPS metadata proxy first — bypasses ISP throttling of Spotify APIs.
+            # Falls through silently if key not configured or proxy unreachable.
+            proxy_tracks = self._fetch_via_metadata_proxy(playlist, cfg)
+            if proxy_tracks:
+                tracks = proxy_tracks
+                self._apply_request_kind(tracks, playlist)
+                if page_callback:
+                    for end in range(
+                        self._METADATA_PROXY_PAGE_SIZE,
+                        len(tracks) + self._METADATA_PROXY_PAGE_SIZE,
+                        self._METADATA_PROXY_PAGE_SIZE,
+                    ):
+                        try:
+                            page_callback(list(tracks[:end]))
+                        except Exception:
+                            break
+            else:
+                # Direct Spotify fetch (slow from throttled regions, fast otherwise)
+                spotify = self._make_spotify_client(cfg)
+                try:
+                    tracks = self._fetch_tracks_with_client(spotify, playlist, cfg, enrich_override=enrich_override, page_callback=page_callback)
+                except SpotifyAvailabilityError:
+                    raise
+                except SpotifyResourceError as e:
                     logger.debug(
-                        "[Spotify] Auth not configured — trying SpotFetch proxy"
+                        f"[Spotify] Resource error ({e}) — trying SpotFetch proxy"
                     )
                     tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
-                else:
-                    raise
+                except Exception as e:
+                    if _is_auth_error(e):
+                        logger.debug(
+                            "[Spotify] Auth not configured — trying SpotFetch proxy"
+                        )
+                        tracks = self._fetch_spotfetch_tracks(playlist, cfg, spotify)
+                    else:
+                        raise
 
-            self._apply_request_kind(tracks, playlist)
+                self._apply_request_kind(tracks, playlist)
 
         # Note: ISRC enrichment removed — text search on Qobuz/Tidal mirrors
         # works without ISRCs. Enrichment was causing 15s+ delays due to
@@ -721,6 +969,8 @@ class AntraService:
         request_kind = cls._infer_request_kind(url)
         if not request_kind:
             return
+        if request_kind == "album" and len(tracks) == 1:
+            request_kind = "track"
         for track in tracks:
             if not track.request_kind:
                 track.request_kind = request_kind
@@ -736,6 +986,14 @@ class AntraService:
         """
         missing = [t for t in tracks if not t.release_year]
         if not missing:
+            return tracks
+
+        _MAX_YEAR_FILL = 50
+        if len(missing) > _MAX_YEAR_FILL:
+            logger.debug(
+                "[Service] Skipping year fill — %d tracks exceed cap of %d",
+                len(missing), _MAX_YEAR_FILL,
+            )
             return tracks
 
         try:
@@ -767,15 +1025,32 @@ class AntraService:
             enriched.spotify_url = original.spotify_url or enriched.spotify_url
             enriched.duration_ms = original.duration_ms or enriched.duration_ms
             enriched.isrc = original.isrc or enriched.isrc
-            enriched.release_date = original.release_date or enriched.release_date
-            enriched.release_year = original.release_year or enriched.release_year
             enriched.artwork_url = original.artwork_url or enriched.artwork_url
             enriched.album = original.album or enriched.album
             enriched.album_artists = original.album_artists or enriched.album_artists
             enriched.audio_traits = original.audio_traits or enriched.audio_traits
+            enriched.artists = original.artists or enriched.artists
+            if AntraService._should_preserve_source_album_metadata(original):
+                enriched.album_id = original.album_id or enriched.album_id
+                enriched.track_number = original.track_number or enriched.track_number
+                enriched.disc_number = original.disc_number or enriched.disc_number
+                enriched.total_tracks = original.total_tracks or enriched.total_tracks
+                enriched.total_discs = original.total_discs or enriched.total_discs
+                enriched.release_date = original.release_date or enriched.release_date
+                enriched.release_year = original.release_year or enriched.release_year
+            else:
+                enriched.release_date = original.release_date or enriched.release_date
+                enriched.release_year = original.release_year or enriched.release_year
             if original.is_explicit is not None:
                 enriched.is_explicit = original.is_explicit
         return enriched_tracks
+
+    @staticmethod
+    def _should_preserve_source_album_metadata(track: TrackMetadata) -> bool:
+        return (
+            (track.source_service or "").lower() == "apple"
+            and (track.request_kind or "").lower() == "album"
+        )
 
     def _enrich_apple_tracks_with_spotify_metadata(
         self,
@@ -785,19 +1060,38 @@ class AntraService:
         if not tracks:
             return tracks
 
-        spotify = self._make_spotify_client(cfg)
-        logger.info("Enriching Apple tracks with Spotify metadata...")
+        # Apple Catalog API already returns ISRCs for many albums — skip the
+        # per-track Spotify search entirely when the Apple metadata is already
+        # sufficiently complete. This avoids clobbering Apple-authored album
+        # sequencing/year data with fuzzy cross-service matches.
+        tracks_with_isrc = sum(1 for t in tracks if t.isrc)
+        if tracks_with_isrc >= len(tracks) * 0.8:
+            logger.info(
+                "Skipping Spotify enrichment — %d/%d Apple tracks already have ISRCs",
+                tracks_with_isrc,
+                len(tracks),
+            )
+            return tracks
 
+        spotify = self._make_spotify_client(cfg)
+        logger.info(
+            "Enriching %d Apple tracks (missing ISRCs) with Spotify metadata...",
+            len(tracks) - tracks_with_isrc,
+        )
+
+        original_tracks = [replace(track) for track in tracks]
         hydrated_tracks: list[TrackMetadata] = []
         for track in tracks:
-            hydrated_tracks.append(
-                self._hydrate_track_from_spotify_search(track, spotify)
-            )
+            if track.isrc:
+                hydrated_tracks.append(track)
+            else:
+                hydrated_tracks.append(
+                    self._hydrate_track_from_spotify_search(track, spotify)
+                )
 
         if not any(track.spotify_id for track in hydrated_tracks):
             return hydrated_tracks
 
-        original_tracks = [replace(track) for track in hydrated_tracks]
         hydrated_tracks = spotify.batch_enrich_album_data(hydrated_tracks)
         return self._preserve_track_identity(original_tracks, hydrated_tracks)
 
@@ -826,14 +1120,17 @@ class AntraService:
         if candidate.album_artists:
             merged.album_artists = candidate.album_artists
         merged.spotify_id = candidate.spotify_id or merged.spotify_id
-        merged.album_id = candidate.album_id or merged.album_id
         merged.isrc = candidate.isrc or merged.isrc
-        merged.track_number = candidate.track_number or merged.track_number
-        merged.disc_number = candidate.disc_number or merged.disc_number
-        merged.total_tracks = candidate.total_tracks or merged.total_tracks
-        merged.release_date = candidate.release_date or merged.release_date
-        merged.release_year = candidate.release_year or merged.release_year
-        merged.artwork_url = candidate.artwork_url or merged.artwork_url
+        if not self._should_preserve_source_album_metadata(track):
+            merged.album_id = candidate.album_id or merged.album_id
+            merged.track_number = candidate.track_number or merged.track_number
+            merged.disc_number = candidate.disc_number or merged.disc_number
+            merged.total_tracks = candidate.total_tracks or merged.total_tracks
+            merged.release_date = candidate.release_date or merged.release_date
+            merged.release_year = candidate.release_year or merged.release_year
+        # Never replace Apple's hi-res artwork (3000x3000) with Spotify's.
+        if not merged.artwork_url:
+            merged.artwork_url = candidate.artwork_url
         if candidate.is_explicit is not None:
             merged.is_explicit = candidate.is_explicit
         if candidate.genres:
@@ -873,7 +1170,11 @@ class AntraService:
     ) -> list[TrackMetadata]:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
-        if not getattr(cfg, "enrich_album_data", False) or not tracks:
+        # Skip enrichment for large playlists — batch_enrich_album_data calls
+        # _batch_fetch_isrcs_anonymous which makes O(N/50) requests to api.spotify.com
+        # (throttled from some regions). Resolver text-search handles matching without ISRCs.
+        _MAX_ENRICH = 200
+        if not getattr(cfg, "enrich_album_data", False) or not tracks or len(tracks) > _MAX_ENRICH:
             return self._stamp_disc_totals(tracks)
 
         try:
@@ -896,7 +1197,12 @@ class AntraService:
 
         return self._stamp_disc_totals(tracks)
 
-    def _fetch_apple_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
+    def _fetch_apple_tracks(
+        self,
+        url: str,
+        cfg: Config,
+        page_callback=None,
+    ) -> list[TrackMetadata]:
         try:
             from antra.core.apple_fetcher import AppleFetcher
         except ImportError:
@@ -905,7 +1211,7 @@ class AntraService:
             )
         developer_token = getattr(cfg, "apple_developer_token", "") or None
         fetcher = AppleFetcher(developer_token=developer_token)
-        return fetcher.fetch(url)
+        return fetcher.fetch(url, page_callback=page_callback)
 
     def _fetch_soundcloud_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:
@@ -930,12 +1236,31 @@ class AntraService:
         self, url: str, cfg: Config, spotify: Optional[SpotifyClient] = None
     ) -> list[TrackMetadata]:
         import re as _re
+        album_match = _re.search(r"spotify\.com/(?:intl-[a-z]+/)?album/([A-Za-z0-9]+)", url)
 
         # ── Attempt 1: SpotFetch proxy (has ISRC + full metadata) ─────────────
         try:
             from antra.core.spotfetch_fetcher import SpotFetchFetcher
             mirrors = getattr(cfg, "spotfetch_mirrors", None) or None
-            return SpotFetchFetcher(bases=mirrors).fetch(url)
+            tracks = SpotFetchFetcher(bases=mirrors).fetch(url)
+            if album_match:
+                if spotify is None:
+                    spotify = self._make_spotify_client(cfg)
+                full_album = spotify._fetch_full_album_data(album_match.group(1))
+                markets = spotify._extract_available_markets(full_album)
+                if markets:
+                    spotify._raise_if_album_unavailable(album_match.group(1), full_album, markets)
+                    available_in_market = spotify._album_available_in_market(markets)
+                    availability_note = spotify._format_availability_note(markets)
+                else:
+                    spotify._fetch_album_via_partner_api(album_match.group(1))
+                    available_in_market = True
+                    availability_note = f"Playable in current market ({spotify._current_market()})"
+                for track in tracks:
+                    track.available_markets = markets
+                    track.available_in_market = available_in_market
+                    track.availability_note = availability_note
+            return tracks
         except ImportError:
             pass
         except ValueError:
@@ -948,9 +1273,8 @@ class AntraService:
             spotify = self._make_spotify_client(cfg)
 
         # Album — partner GraphQL API (most reliable, full track listing)
-        m_album = _re.search(r"spotify\.com/(?:intl-[a-z]+/)?album/([A-Za-z0-9]+)", url)
-        if m_album:
-            album_id = m_album.group(1)
+        if album_match:
+            album_id = album_match.group(1)
             tracks = spotify._fetch_album_via_partner_api(album_id)
             if tracks:
                 logger.info("[Spotify] Used partner GraphQL API for album (no credentials)")
@@ -1035,22 +1359,131 @@ class AntraService:
         client._spotfetch_mirrors = getattr(cfg, "spotfetch_mirrors", None)
         return client
 
+    # Shared read-only key for the metadata proxy — embedded so the proxy works
+    # for all users without requiring individual API key configuration.
+    # This key is accepted ONLY by /api/spotify-metadata (not audio mirror endpoints).
+    _METADATA_PROXY_KEY = "mk_antra_metadata_v1_pub"
+    _METADATA_PROXY_PAGE_SIZE = 200
+
+    def _fetch_via_metadata_proxy(
+        self,
+        url: str,
+        cfg: Config,
+    ) -> Optional[list[TrackMetadata]]:
+        """Fetch Spotify metadata via VPS proxy to bypass ISP throttling of Spotify APIs.
+
+        Always tried — uses the user's `antra_api_key` if set, otherwise falls
+        back to the embedded shared metadata key. Returns None and falls through
+        to direct Spotify only when the proxy is unreachable or returns an error.
+        """
+        # User's own key takes priority; shared metadata key is the universal fallback
+        api_key = (getattr(cfg, "antra_api_key", "") or "").strip() or self._METADATA_PROXY_KEY
+
+        proxy_base = "https://antra.hoshi.cfd"
+        try:
+            # Use curl_cffi to impersonate a real browser — Cloudflare Bot Fight Mode
+            # blocks plain Python requests (wrong TLS fingerprint). curl_cffi is already
+            # bundled (added for podcast downloads).
+            try:
+                from curl_cffi import requests as _req
+                _curl_kwargs = {"impersonate": "chrome124"}
+            except ImportError:
+                import requests as _req
+                _curl_kwargs = {}
+            logger.debug("[Proxy] Fetching Spotify metadata via VPS (key=%s)...", api_key[:12])
+            resp = _req.get(
+                f"{proxy_base}/api/spotify-metadata",
+                params={"url": url},
+                headers={"X-API-Key": api_key},
+                timeout=60,
+                **_curl_kwargs,
+            )
+            if not resp.ok:
+                logger.warning(
+                    "[Proxy] VPS returned HTTP %s: %s — falling back to direct Spotify",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return None
+            try:
+                payload = resp.json()
+            except Exception as parse_err:
+                logger.warning("[Proxy] JSON parse failed: %s (body: %s)", parse_err, resp.text[:200])
+                return None
+            tracks_data = payload.get("tracks") or []
+            if not tracks_data:
+                logger.warning("[Proxy] VPS returned 0 tracks for URL: %s", url)
+                return None
+            result: list[TrackMetadata] = []
+            skipped = 0
+            for idx, t in enumerate(tracks_data):
+                try:
+                    result.append(TrackMetadata(
+                        title=t.get("title", ""),
+                        artists=t.get("artists") or [],
+                        album=t.get("album") or "",
+                        album_id=t.get("album_id") or None,
+                        artwork_url=t.get("artwork_url") or None,
+                        playlist_artwork_url=t.get("playlist_artwork_url") or None,
+                        playlist_name=t.get("playlist_name") or None,
+                        playlist_owner=t.get("playlist_owner") or None,
+                        release_year=t.get("release_year"),
+                        release_date=t.get("release_date") or None,
+                        isrc=t.get("isrc") or None,
+                        spotify_id=t.get("spotify_id") or None,
+                        track_number=t.get("track_number"),
+                        disc_number=t.get("disc_number"),
+                        duration_ms=t.get("duration_ms") or None,
+                        source_service=t.get("source_service") or None,
+                        source_rule=t.get("source_rule") or None,
+                        request_kind=t.get("request_kind") or None,
+                        is_explicit=t.get("is_explicit"),
+                        audio_traits=t.get("audio_traits") or [],
+                        album_artists=t.get("album_artists") or [],
+                    ))
+                except Exception as track_err:
+                    logger.warning("[Proxy] Track %d construction failed: %s (data: %s)", idx, track_err, str(t)[:200])
+                    skipped += 1
+            if not result:
+                logger.warning("[Proxy] All %d tracks failed construction (first error above)", len(tracks_data))
+                return None
+            if skipped:
+                logger.warning("[Proxy] %d/%d tracks skipped due to construction errors", skipped, len(tracks_data))
+            logger.debug("[Proxy] VPS returned %d tracks successfully", len(result))
+            return result
+        except Exception as e:
+            logger.warning("[Proxy] Metadata proxy failed with %s: %s", type(e).__name__, e)
+            return None
+
     def _fetch_tracks_with_client(
         self,
         spotify: SpotifyClient,
         playlist: str | SpotifyPlaylistSummary,
         cfg: Config,
         enrich_override: Optional[bool] = None,
+        page_callback=None,
     ) -> list[TrackMetadata]:
         if isinstance(playlist, SpotifyPlaylistSummary):
             tracks = spotify.get_library_selection_tracks(playlist)
         else:
-            tracks = spotify.get_playlist_tracks(playlist)
+            tracks = spotify.get_playlist_tracks(playlist, page_callback=page_callback)
 
         enrich_album_data = cfg.enrich_album_data if enrich_override is None else enrich_override
-        if enrich_album_data:
-            logger.info("Enriching tracks with album metadata...")
+        _MAX_BATCH_ENRICH = 200
+        has_credentials = spotify.sp is not None
+        if enrich_album_data and has_credentials and len(tracks) <= _MAX_BATCH_ENRICH:
+            logger.info("Enriching %d tracks with album metadata...", len(tracks))
             tracks = spotify.batch_enrich_album_data(tracks)
+        elif enrich_album_data and not has_credentials:
+            logger.info(
+                "Skipping album enrichment — no Spotify credentials configured "
+                "(resolver text-search handles matching)"
+            )
+        elif enrich_album_data and len(tracks) > _MAX_BATCH_ENRICH:
+            logger.info(
+                "Skipping album enrichment for %d tracks (cap is %d)",
+                len(tracks), _MAX_BATCH_ENRICH,
+            )
 
         return tracks
 
@@ -1254,11 +1687,15 @@ class AntraService:
         resolver_adapters = adapters
         if normalized_source_preference == "auto":
             resolver_adapters = sorted(adapters, key=lambda adapter: adapter.priority)
+        else:
+            filtered = AntraService._filter_adapters_by_source_preference(adapters, cfg.source_preference)
+            resolver_adapters = sorted(filtered, key=lambda adapter: adapter.priority) if filtered else adapters
         resolver = SourceResolver(
             resolver_adapters,
             preferred_output_format=cfg.output_format,
             preserve_input_order=preserve_input_order,
             prefer_explicit=getattr(cfg, "prefer_explicit", True),
+            strict_matching=getattr(cfg, "strict_matching", False),
         )
         if organizer is None:
             full_albums = getattr(cfg, "library_mode", "smart_dedup") == "full_albums"
@@ -1270,6 +1707,14 @@ class AntraService:
                 playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
                 single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
+                single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
+                album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
+                folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+                multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
+                track_number_padding=getattr(cfg, "track_number_padding", 2),
+                illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
+                whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
+                filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
             )
 
         lyrics_fetcher = None
@@ -1284,7 +1729,10 @@ class AntraService:
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
             output_format=cfg.output_format,
-            max_workers=1,
+            strict_matching=getattr(cfg, "strict_matching", False),
+            # ANTRA_MAX_WORKERS is set to 3 by the Go desktop layer when a
+            # supporter/admin key is detected; defaults to 1 for regular users.
+            max_workers=int(os.environ.get("ANTRA_MAX_WORKERS", "1")),
         )
 
         return DownloadEngine(

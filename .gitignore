@@ -107,4 +107,16 @@ antra/test_format.py
 "README - Copy.md"
 README\ -\ Copy.md
 CHANGELOG_v1.1.4.md
+CHANGELOG_v1.1.6.md
 PERSONAL_CREDS_FEATURE.md
+V116_RECOVERY.md
+
+# Web app (VPS-only — not part of the desktop release)
+Antra-Web/
+
+# Operational / internal docs
+context.md
+
+# Dev scratch
+engine_patch.py
+supporter_keys.xlsx

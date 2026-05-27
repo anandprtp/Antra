@@ -537,15 +537,19 @@ class ExternalMusicFetcher:
                 return result
         except Exception as e:
             err_str = str(e).lower()
-            # Only fall through to public API on auth/config errors — not on network errors
-            if not any(kw in err_str for kw in (
-                "empty", "not configured", "session", "login", "auth",
-                "token", "credential", "401", "403",
-            )):
+            # Re-raise only hard network/connectivity failures — everything else
+            # (auth errors, not-found, geo-restriction, token expiry, etc.) falls
+            # through to the VPS mirror which uses different country-code sessions
+            # and may be able to access the content where the local session can't.
+            is_network_error = any(kw in err_str for kw in (
+                "connection", "timeout", "network", "refused", "unreachable",
+                "name resolution", "ssl", "certificate",
+            ))
+            if is_network_error:
                 raise
-            logger.debug("[ExternalMusic] Tidal local session unavailable (%s) — trying public API", e)
+            logger.debug("[ExternalMusic] Tidal local session failed (%s) — trying VPS mirror", e)
 
-        # Fallback: public Tidal API (no auth required for metadata)
+        # Fallback: public Tidal API via VPS mirror (different country sessions)
         return self._fetch_tidal_public(kind, item_id)
 
     def _fetch_tidal_public(self, kind: str, item_id: str) -> list[TrackMetadata]:
@@ -554,9 +558,11 @@ class ExternalMusicFetcher:
 
         manifest = load_endpoint_manifest()
         mirror_url = (getattr(manifest, "mirror_tidal", "") or "").rstrip("/")
-        api_key = (getattr(manifest, "api_key", "") or "").strip()
+        # User's personal key takes priority (consistent with download path in service.py).
+        # Fall back to the manifest's shared key if the user hasn't set one.
+        api_key = (getattr(self.cfg, "antra_api_key", "") or "").strip()
         if not api_key:
-            api_key = (getattr(self.cfg, "antra_api_key", "") or "").strip()
+            api_key = (getattr(manifest, "api_key", "") or "").strip()
 
         if not mirror_url:
             raise RuntimeError(
@@ -575,7 +581,15 @@ class ExternalMusicFetcher:
                     headers=headers, timeout=20,
                 )
                 if r.status_code == 404:
-                    raise RuntimeError(f"Album {item_id} not found on Tidal")
+                    raise RuntimeError(
+                        f"Album {item_id} not found on Tidal — "
+                        "it may be geo-restricted or removed from the TIDAL catalogue"
+                    )
+                if r.status_code == 429:
+                    raise RuntimeError(
+                        f"Daily album metadata limit reached for album {item_id} — "
+                        "please try again tomorrow (limit resets at UTC midnight)"
+                    )
                 r.raise_for_status()
                 data = r.json()
 
@@ -597,6 +611,8 @@ class ExternalMusicFetcher:
                         (a if isinstance(a, str) else a.get("name", ""))
                         for a in raw_artists if a
                     ]
+                    raw_tid = t.get("track_id") or t.get("id")
+                    tidal_tid = str(raw_tid) if raw_tid else None
                     result.append(TrackMetadata(
                         title=t.get("title") or "",
                         artists=track_artists,
@@ -612,6 +628,8 @@ class ExternalMusicFetcher:
                         isrc=t.get("isrc") or None,
                         album_id=t.get("album_id") or str(item_id),
                         is_explicit=t.get("explicit"),
+                        tidal_track_id=tidal_tid,
+                        source_service="tidal",
                     ))
                 self._stamp_request_kind(result, "album")
                 return result
@@ -663,8 +681,21 @@ class ExternalMusicFetcher:
                 self._stamp_request_kind(tracks, "playlist")
                 return tracks
 
-        except RuntimeError:
-            raise
+        except RuntimeError as mirror_err:
+            # Mirror returned 404 — try scraping Tidal's web page directly
+            if kind not in ("album", "track"):
+                raise
+            logger.info(
+                "[Tidal] Mirror failed for %s %s — falling back to web page scrape",
+                kind, item_id,
+            )
+            try:
+                if kind == "album":
+                    return self._scrape_tidal_album_page(item_id)
+                return self._scrape_tidal_track_page(item_id)
+            except Exception as scrape_err:
+                logger.debug("[Tidal] Web page scrape also failed: %s", scrape_err)
+                raise mirror_err from scrape_err
         except Exception as e:
             raise RuntimeError(
                 f"Could not fetch Tidal metadata via mirror for {kind}/{item_id}. "
@@ -672,6 +703,204 @@ class ExternalMusicFetcher:
             ) from e
 
         raise ValueError(f"Unsupported TIDAL URL type: {kind}")
+
+    def _scrape_tidal_album_page(self, item_id: str) -> list[TrackMetadata]:
+        """Scrape Tidal's album web page for JSON-LD metadata as a fallback."""
+        from antra.core.amazon_music_fetcher import _parse_iso_duration
+
+        url = f"https://tidal.com/browse/album/{item_id}"
+        logger.info("[Tidal] Scraping album page: %s", url)
+        resp = self._session.get(url, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Album {item_id} not found on Tidal (web page returned {resp.status_code})")
+        html = resp.text
+
+        # Find JSON-LD blocks
+        jsonld_blocks = re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        album_data = None
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict) and data.get("@type") in ("MusicAlbum", "Album"):
+                    album_data = data
+                    break
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") in ("MusicAlbum", "Album"):
+                            album_data = item
+                            break
+            except Exception:
+                continue
+
+        if album_data is None:
+            raise RuntimeError(
+                f"Album {item_id} not found on Tidal — no JSON-LD metadata in page"
+            )
+
+        album_name = album_data.get("name", "")
+        album_artist_data = album_data.get("byArtist") or {}
+        album_artist = album_artist_data.get("name", "") if isinstance(album_artist_data, dict) else (
+            album_artist_data[0].get("name", "") if isinstance(album_artist_data, list) and album_artist_data
+            else str(album_artist_data) if album_artist_data else ""
+        )
+        album_artists = [album_artist] if album_artist else []
+
+        release_date = (album_data.get("datePublished") or "")[:10]
+        release_year = int(release_date[:4]) if release_date[:4].isdigit() else None
+
+        # Artwork from image field or Open Graph
+        artwork_url = None
+        image = album_data.get("image")
+        if isinstance(image, str) and image.startswith("http"):
+            artwork_url = image
+        elif isinstance(image, list):
+            for img in image:
+                if isinstance(img, str) and img.startswith("http"):
+                    artwork_url = img
+                    break
+                if isinstance(img, dict) and img.get("url", "").startswith("http"):
+                    artwork_url = img["url"]
+                    break
+        if not artwork_url:
+            og_img = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html)
+            if og_img:
+                artwork_url = og_img.group(1)
+
+        raw_tracks = album_data.get("track") or []
+        if not raw_tracks:
+            raise RuntimeError(
+                f"Album {item_id!r} has no tracks in JSON-LD — cannot proceed"
+            )
+
+        result = []
+        for item in raw_tracks:
+            if isinstance(item, dict) and item.get("@type") != "MusicRecording":
+                continue
+            if isinstance(item, dict) and not item.get("name"):
+                continue
+            title = item.get("name", "").strip() if isinstance(item, dict) else ""
+            if not title:
+                continue
+
+            track_artist_data = item.get("byArtist") if isinstance(item, dict) else None
+            track_artist = ""
+            if isinstance(track_artist_data, dict):
+                track_artist = track_artist_data.get("name", "")
+            elif isinstance(track_artist_data, list) and track_artist_data:
+                track_artist = track_artist_data[0].get("name", "") if isinstance(track_artist_data[0], dict) else ""
+
+            duration_iso = item.get("duration", "") if isinstance(item, dict) else ""
+            duration_ms = _parse_iso_duration(duration_iso)
+
+            position = item.get("position") if isinstance(item, dict) else None
+            track_num = int(position) if position and str(position).isdigit() else None
+
+            # Extract Tidal track ID from the JSON-LD url field (e.g. "https://tidal.com/track/12345678")
+            tidal_tid = None
+            track_url = item.get("url", "") if isinstance(item, dict) else ""
+            if track_url:
+                m = re.search(r"/track/(\d+)", track_url)
+                if m:
+                    tidal_tid = m.group(1)
+
+            result.append(TrackMetadata(
+                title=title,
+                artists=([track_artist] if track_artist else album_artists[:1]) or [],
+                album=album_name,
+                album_artists=album_artists,
+                artwork_url=artwork_url,
+                release_date=release_date or None,
+                release_year=release_year,
+                track_number=track_num,
+                total_tracks=len(raw_tracks),
+                duration_ms=duration_ms,
+                album_id=str(item_id),
+                tidal_track_id=tidal_tid,
+                source_service="tidal" if tidal_tid else None,
+            ))
+
+        if not result:
+            raise RuntimeError(
+                f"Album {item_id} — no valid tracks found in JSON-LD data"
+            )
+
+        self._stamp_request_kind(result, "album")
+        logger.info("[Tidal] Web scrape: parsed %d tracks for album %r", len(result), album_name)
+        return result
+
+    def _scrape_tidal_track_page(self, item_id: str) -> list[TrackMetadata]:
+        """Scrape Tidal's track web page for JSON-LD metadata as a fallback."""
+        from antra.core.amazon_music_fetcher import _parse_iso_duration
+
+        url = f"https://tidal.com/browse/track/{item_id}"
+        resp = self._session.get(url, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Track {item_id} not found on Tidal (web page returned {resp.status_code})")
+        html = resp.text
+
+        jsonld_blocks = re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html,
+            re.DOTALL | re.IGNORECASE,
+        )
+
+        track_data = None
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict) and data.get("@type") == "MusicRecording":
+                    track_data = data
+                    break
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and item.get("@type") == "MusicRecording":
+                            track_data = item
+                            break
+            except Exception:
+                continue
+
+        if not track_data:
+            raise RuntimeError(f"Track {item_id} not found on Tidal — no JSON-LD metadata in page")
+
+        track = TrackMetadata(
+            title=track_data.get("name", ""),
+            artists=self._tidal_scrape_artists(track_data),
+            album=(track_data.get("inAlbum") or {}).get("name", "") or "",
+            artwork_url=self._tidal_scrape_image(track_data),
+            duration_ms=_parse_iso_duration(track_data.get("duration", "")),
+            album_id=str(item_id),
+        )
+        self._stamp_request_kind([track], "track")
+        return [track]
+
+    @staticmethod
+    def _tidal_scrape_artists(data: dict) -> list[str]:
+        by_artist = data.get("byArtist") or []
+        if isinstance(by_artist, dict):
+            return [by_artist.get("name", "")]
+        if isinstance(by_artist, list):
+            return [a.get("name", "") for a in by_artist if isinstance(a, dict) and a.get("name")]
+        return []
+
+    @staticmethod
+    def _tidal_scrape_image(data: dict) -> Optional[str]:
+        image = data.get("image")
+        if isinstance(image, str) and image.startswith("http"):
+            return image
+        if isinstance(image, list):
+            for img in image:
+                if isinstance(img, str) and img.startswith("http"):
+                    return img
+                if isinstance(img, dict):
+                    url = img.get("url", "")
+                    if url.startswith("http"):
+                        return url
+        return None
 
     def _tidal_track_from_public(
         self,
@@ -723,6 +952,8 @@ class ExternalMusicFetcher:
             if cover:
                 artwork_url = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/1280x1280.jpg"
 
+        raw_id = data.get("id")
+        tidal_track_id = str(raw_id) if raw_id else None
         return TrackMetadata(
             title=data.get("title") or "",
             artists=artists,
@@ -742,6 +973,8 @@ class ExternalMusicFetcher:
             isrc=data.get("isrc") or None,
             album_id=str(album.get("id")) if album.get("id") else None,
             is_explicit=data.get("explicit"),
+            tidal_track_id=tidal_track_id,
+            source_service="tidal",
         )
 
     def _tidal_session(self):

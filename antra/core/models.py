@@ -2,7 +2,7 @@
 Core data models for Antra.
 """
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 from enum import Enum
 
 
@@ -50,14 +50,20 @@ class TrackMetadata:
     amazon_asin: Optional[str] = None  # Track ASIN when sourced from Amazon Music URL
     apple_music_id: Optional[str] = None  # Apple Music catalog track ID, set when input is an Apple Music URL
     deezer_track_id: Optional[str] = None  # Track ID when sourced from a Deezer URL
+    tidal_track_id: Optional[str] = None  # Tidal track ID when sourced from a Tidal URL
     upc: Optional[str] = None
     iswc: Optional[str] = None
     audio_traits: list[str] = field(default_factory=list)
     genres: list[str] = field(default_factory=list)
     album_artists: list[str] = field(default_factory=list)  # Album-level artists (e.g. ["PARTYNEXTDOOR", "Drake"] for joint albums)
+    composer: Optional[str] = None
+    label: Optional[str] = None  # Record label / publisher
     artwork_url: Optional[str] = None  # Highest res from Spotify
     playlist_artwork_url: Optional[str] = None  # Playlist-level cover (distinct from track album art)
     is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
+    available_markets: list[str] = field(default_factory=list)  # Spotify album markets from the full album object
+    available_in_market: Optional[bool] = None  # Availability of the album in cfg.spotify_market (or US fallback)
+    availability_note: Optional[str] = None  # Human-readable market restriction note
     lyrics: Optional[str] = None
     synced_lyrics: Optional[str] = None  # LRC format
 
@@ -93,6 +99,7 @@ class SearchResult:
     bit_depth: Optional[int] = None
     sample_rate_hz: Optional[int] = None
     is_explicit: Optional[bool] = None  # True = explicit, False = clean/edited, None = unknown
+    source_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def quality_label(self) -> str:

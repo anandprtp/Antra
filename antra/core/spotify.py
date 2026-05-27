@@ -38,6 +38,10 @@ class SpotifyResourceError(RuntimeError):
     """Raised when a Spotify resource cannot be fetched with the available token."""
 
 
+class SpotifyAvailabilityError(SpotifyResourceError):
+    """Raised when a Spotify resource exists but is unavailable in the active market."""
+
+
 _LOCALE_RE = re.compile(r"(spotify\.com/)intl-[a-z]+/")
 
 
@@ -346,13 +350,13 @@ class SpotifyClient:
     # Public entry point
     # ──────────────────────────────────────────────────────────────────────────
 
-    def get_playlist_tracks(self, url_or_id: str) -> list[TrackMetadata]:
+    def get_playlist_tracks(self, url_or_id: str, page_callback=None) -> list[TrackMetadata]:
         """Fetch tracks from any Spotify URL (playlist, album, track, artist)."""
         kind = _detect_type(url_or_id)
         logger.info(f"Fetching {kind}: {url_or_id}")
 
         if kind == "playlist":
-            return self._fetch_playlist(url_or_id)
+            return self._fetch_playlist(url_or_id, page_callback=page_callback)
         elif kind == "album":
             return self._fetch_album(url_or_id)
         elif kind == "track":
@@ -366,7 +370,7 @@ class SpotifyClient:
     # Fetchers per type
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _fetch_playlist(self, url_or_id: str) -> list[TrackMetadata]:
+    def _fetch_playlist(self, url_or_id: str, page_callback=None) -> list[TrackMetadata]:
         playlist_id = _strip_id(url_or_id, "playlist")
         tracks: list[TrackMetadata] = []
         limit = 100
@@ -377,7 +381,7 @@ class SpotifyClient:
         # playlists; fall back to the public embed scraper as a last resort.
         active_sp = self._resolve_playlist_client(playlist_id)
         if active_sp is None:
-            fallback_tracks = self._fetch_public_playlist_embed(playlist_id)
+            fallback_tracks = self._fetch_public_playlist_embed(playlist_id, page_callback=page_callback)
             if fallback_tracks:
                 logger.info("Using public embed fallback for playlist.")
                 return fallback_tracks
@@ -536,48 +540,57 @@ class SpotifyClient:
                 time.sleep(2 ** attempt)
         raise requests.RequestException(f"Failed to fetch {url} after 4 attempts")
 
-    def _fetch_public_playlist_embed(self, playlist_id: str) -> list[TrackMetadata]:
+    def _fetch_public_playlist_embed(self, playlist_id: str, page_callback=None) -> list[TrackMetadata]:
         """
         Fallback for public playlists when the Web API blocks playlist_items.
 
         Strategy:
-          1. Scrape the embed page to get the playlist title and the anonymous
-             access token embedded in the HTML __NEXT_DATA__.
-          2. Use the Spotify Web Player GraphQL API to fetch the full playlist
-             metadata (this bypasses the 100-track limit and doesn't require Premium).
+          1. Try TOTP token first (fast, ~10s). If it works, skip the embed page
+             scrape entirely — title/artwork are pulled from the GraphQL response.
+          2. Only scrape the embed page when TOTP fails (to get both token and metadata).
+          3. Use the Spotify partner GraphQL API to paginate all tracks (1000/request).
         """
-        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
-        
         try:
-            # ── Step 1: embed payload for Token & Title ───────────────────
-            embed_response = self._get_with_retry_public(embed_url)
-            data = self._extract_next_data(embed_response.text)
-            
-            entity = (
-                data.get("props", {})
-                    .get("pageProps", {})
-                    .get("state", {})
-                    .get("data", {})
-                    .get("entity", {})
-            )
-            playlist_title = entity.get("title") or entity.get("name") or "Unknown Playlist"
-            playlist_owner = entity.get("subtitle") or entity.get("owner", {}).get("name")
-            playlist_desc = entity.get("description")
-            # Extract playlist-level cover art from the embed entity
-            _entity_images = (
-                entity.get("coverArt", {}).get("sources", [])
-                or entity.get("images")
-                or entity.get("visuals", {}).get("headerImage", {}).get("sources", [])
-            )
+            # ── Step 1: get token — TOTP first (avoids slow embed scrape) ──
+            playlist_title = "Unknown Playlist"
+            playlist_owner: Optional[str] = None
+            playlist_desc: Optional[str] = None
             playlist_artwork: Optional[str] = None
-            if isinstance(_entity_images, list) and _entity_images:
-                first = _entity_images[0]
-                playlist_artwork = first.get("url") if isinstance(first, dict) else None
 
-            token = self._get_anonymous_access_token(playlist_id)
+            token = self._get_totp_access_token()
+
             if not token:
-                logger.warning(f"Could not extract token from embed page for {playlist_id}")
-                return []
+                # TOTP unavailable — fall back to embed page scrape for token + metadata
+                embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+                try:
+                    embed_response = self._get_with_retry_public(embed_url)
+                    data = self._extract_next_data(embed_response.text)
+                    entity = (
+                        data.get("props", {})
+                            .get("pageProps", {})
+                            .get("state", {})
+                            .get("data", {})
+                            .get("entity", {})
+                    )
+                    playlist_title = entity.get("title") or entity.get("name") or "Unknown Playlist"
+                    playlist_owner = entity.get("subtitle") or entity.get("owner", {}).get("name")
+                    playlist_desc = entity.get("description")
+                    _entity_images = (
+                        entity.get("coverArt", {}).get("sources", [])
+                        or entity.get("images")
+                        or entity.get("visuals", {}).get("headerImage", {}).get("sources", [])
+                    )
+                    if isinstance(_entity_images, list) and _entity_images:
+                        first = _entity_images[0]
+                        playlist_artwork = first.get("url") if isinstance(first, dict) else None
+                except Exception as e:
+                    logger.debug("[Spotify] Embed page scrape failed: %s", e)
+
+                # Try to extract token from the embed page data, or use TOTP fallback
+                token = self._get_anonymous_access_token(playlist_id)
+                if not token:
+                    logger.warning("Could not obtain anonymous token for playlist %s", playlist_id)
+                    return []
 
             # ── Step 2: GraphQL pagination for Full Metadata ──────────────
             tracks: list[TrackMetadata] = []
@@ -627,9 +640,23 @@ class SpotifyClient:
                     
                 data = resp.json()
                 playlist_data = data.get("data", {}).get("playlistV2", {})
+
+                # Extract playlist name/artwork from GraphQL on first page (TOTP path skips embed)
+                if not tracks:
+                    if playlist_title == "Unknown Playlist":
+                        playlist_title = playlist_data.get("name") or "Unknown Playlist"
+                    if playlist_artwork is None:
+                        _img_sources = (
+                            (playlist_data.get("images") or {}).get("items", [{}])[0:1]
+                        )
+                        if _img_sources:
+                            _srcs = (_img_sources[0] or {}).get("sources") or []
+                            if _srcs:
+                                playlist_artwork = _srcs[-1].get("url")  # largest image last
+
                 content = playlist_data.get("content", {})
                 items = content.get("items", [])
-                
+
                 if not items:
                     break
                     
@@ -680,9 +707,16 @@ class SpotifyClient:
                     tracks.append(track_meta)
                     
                 total_count = content.get("totalCount", 0)
+
+                if page_callback:
+                    try:
+                        page_callback(list(tracks))
+                    except Exception:
+                        pass
+
                 if len(items) < limit or offset + len(items) >= total_count:
                     break
-                    
+
                 offset += limit
                 time.sleep(0.15)
                 
@@ -1082,6 +1116,9 @@ class SpotifyClient:
     def _fetch_album(self, url_or_id: str) -> list[TrackMetadata]:
         album_id = _strip_id(url_or_id, "album")
         if not self.sp:
+            fallback_tracks = self._fetch_album_via_partner_api(album_id)
+            if fallback_tracks:
+                return fallback_tracks
             fallback_tracks = self._fetch_public_album_page(album_id)
             if fallback_tracks:
                 return fallback_tracks
@@ -1090,6 +1127,8 @@ class SpotifyClient:
         try:
             # Fetch full album for metadata
             album_data = self.sp.album(album_id, market=self._market)
+            markets = self._extract_available_markets(album_data)
+            self._raise_if_album_unavailable(album_id, album_data, markets)
             album_name = album_data.get("name", "Unknown Album")
             release_date = album_data.get("release_date", "")
             release_year = int(release_date[:4]) if release_date else None
@@ -1098,8 +1137,15 @@ class SpotifyClient:
             total_tracks = album_data.get("total_tracks")
             album_genres = album_data.get("genres", [])
             album_artist_names = [a["name"] for a in album_data.get("artists", []) if a.get("name")]
+            available_in_market = self._album_available_in_market(markets)
+            availability_note = self._format_availability_note(markets)
         except Exception as e:
             logger.warning(f"Spotify album API unavailable or credentials invalid for {album_id}: {e}")
+            if isinstance(e, SpotifyAvailabilityError):
+                raise
+            fallback_tracks = self._fetch_album_via_partner_api(album_id)
+            if fallback_tracks:
+                return fallback_tracks
             fallback_tracks = self._fetch_public_album_page(album_id)
             if fallback_tracks:
                 return fallback_tracks
@@ -1135,6 +1181,9 @@ class SpotifyClient:
                     album_id=album_id,
                     artwork_url=artwork_url,
                     genres=album_genres,
+                    available_markets=markets,
+                    available_in_market=available_in_market,
+                    availability_note=availability_note,
                 ))
 
             logger.info(f"  Fetched {len(tracks)} album tracks so far...")
@@ -1373,6 +1422,11 @@ class SpotifyClient:
             html = response.text
             data = self._extract_next_data(html)
             entity = data.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+            full_album = self._fetch_full_album_data(album_id)
+            markets = self._extract_available_markets(full_album)
+            self._raise_if_album_unavailable(album_id, full_album, markets)
+            available_in_market = self._album_available_in_market(markets)
+            availability_note = self._format_availability_note(markets)
             album_name = entity.get("name") or entity.get("title") or self._extract_meta_content(html, "og:title") or "Unknown Album"
             artwork_url = self._extract_meta_content(html, "og:image")
             release_date = (
@@ -1405,6 +1459,9 @@ class SpotifyClient:
                         spotify_id=track_uri.split(":")[-1],
                         album_id=album_id,
                         artwork_url=artwork_url,
+                        available_markets=markets,
+                        available_in_market=available_in_market,
+                        availability_note=availability_note,
                     )
                 )
 
@@ -1421,7 +1478,13 @@ class SpotifyClient:
         track list including disc/track numbers and durations.
         No Spotify credentials required.
         """
-        token = self._get_anonymous_access_token()
+        full_album = self._fetch_full_album_data(album_id)
+        markets = self._extract_available_markets(full_album)
+        self._raise_if_album_unavailable(album_id, full_album, markets)
+        available_in_market = self._album_available_in_market(markets)
+        availability_note = self._format_availability_note(markets)
+
+        token = self._get_anonymous_access_token() or self._get_totp_access_token()
         if not token:
             return []
 
@@ -1520,6 +1583,25 @@ class SpotifyClient:
         release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
         artwork_url = album_meta.get("artwork_url")
         total_tracks = album_meta.get("total_tracks") or len(all_items)
+        track_playability = [
+            bool(
+                (item.get("track") if isinstance(item.get("track"), dict) else item)
+                .get("playability", {})
+                .get("playable")
+            )
+            for item in all_items
+            if isinstance((item.get("track") if isinstance(item.get("track"), dict) else item), dict)
+        ]
+        if track_playability and not any(track_playability):
+            title = album_name or album_id
+            raise SpotifyAvailabilityError(
+                f"Spotify album '{title}' is not playable in {self._current_market()}. "
+                "Spotify's partner API reports every track as region-locked in the current market."
+            )
+        if not markets and track_playability:
+            available_in_market = any(track_playability)
+            if available_in_market and not availability_note:
+                availability_note = f"Playable in current market ({self._current_market()})"
 
         result: list[TrackMetadata] = []
         for idx, item in enumerate(all_items, start=1):
@@ -1550,6 +1632,9 @@ class SpotifyClient:
                     duration_ms=int(duration_ms) if duration_ms else None,
                     artwork_url=artwork_url,
                     spotify_id=spotify_id,
+                    available_markets=markets,
+                    available_in_market=available_in_market,
+                    availability_note=availability_note,
                 ))
             except Exception as e:
                 logger.debug(f"[Spotify] Skipping partner API album track: {e}")
@@ -1637,6 +1722,7 @@ class SpotifyClient:
             offset += limit
             _time.sleep(0.05)
 
+        self._hydrate_discography_availability(albums)
         deduped_albums = self._dedupe_discography_albums(albums, explicit_cache)
         logger.info(
             f"Discography fetched for {artist_name}: {len(deduped_albums)} releases "
@@ -1886,6 +1972,7 @@ class SpotifyClient:
                     track.release_date = release_date
                 if release_date[:4].isdigit() and not track.release_year:
                     track.release_year = int(release_date[:4])
+                self._apply_album_availability(track, album)
                 return track
             except Exception as e:
                 last_error = e
@@ -1954,6 +2041,15 @@ class SpotifyClient:
         if self._oauth_sp and self._oauth_sp is not self.sp:
             clients.append(self._oauth_sp)
         if not clients:
+            _MAX_NO_CREDS_ENRICH = 50
+            if len(tracks) > _MAX_NO_CREDS_ENRICH:
+                logger.info(
+                    "[batch_enrich] No credentials — skipping per-track enrichment "
+                    "for %d tracks (cap %d); using anonymous ISRC fetch only",
+                    len(tracks), _MAX_NO_CREDS_ENRICH,
+                )
+                self._batch_fetch_isrcs_anonymous(tracks)
+                return tracks
             enriched = [self.enrich_public_track_metadata(track) for track in tracks]
             # Still try to fetch ISRCs via anonymous token even without credentials
             self._batch_fetch_isrcs_anonymous(enriched)
@@ -1993,6 +2089,9 @@ class SpotifyClient:
             total_tracks = album.get("total_tracks")
             release_date = album.get("release_date") or ""
             release_year = int(release_date[:4]) if release_date[:4].isdigit() else None
+            markets = self._extract_available_markets(album)
+            available_in_market = self._album_available_in_market(markets)
+            availability_note = self._format_availability_note(markets)
             for i in indices:
                 if genres:
                     tracks[i].genres = genres
@@ -2004,6 +2103,9 @@ class SpotifyClient:
                     tracks[i].release_date = release_date
                 if release_year and not tracks[i].release_year:
                     tracks[i].release_year = release_year
+                tracks[i].available_markets = markets
+                tracks[i].available_in_market = available_in_market
+                tracks[i].availability_note = availability_note
 
         # Batch-fetch ISRCs for tracks that don't have one yet.
         # The album_tracks endpoint returns simplified track objects without
@@ -2046,9 +2148,14 @@ class SpotifyClient:
         # many Spotify albums/artists simply don't return genre data, and doing a
         # track-by-track fallback here turns playlist startup into hundreds of
         # extra network requests.
+        _MAX_PER_TRACK_FALLBACK = 50
+        fallback_count = 0
         for i, track in enumerate(tracks):
+            if fallback_count >= _MAX_PER_TRACK_FALLBACK:
+                break
             if track.album_id and track.album_id not in album_data:
                 tracks[i] = self.enrich_public_track_metadata(track)
+                fallback_count += 1
             elif (
                 not track.release_year
                 or not track.release_date
@@ -2057,13 +2164,14 @@ class SpotifyClient:
                 or track.album == "Unknown Album"
             ):
                 tracks[i] = self.enrich_public_track_metadata(track)
+                fallback_count += 1
 
         return tracks
 
     def enrich_public_track_metadata(self, track: TrackMetadata) -> TrackMetadata:
-        """Best-effort public metadata fallback for artwork, year, and genres."""
+        """Best-effort public metadata fallback for artwork/year without locking in fuzzy genres."""
         if not track.spotify_id:
-            return self._enrich_track_metadata_via_itunes(track)
+            return self._enrich_track_metadata_via_itunes(track, allow_genre=False)
 
         try:
             public_data = self._fetch_public_track_page_data(track.spotify_id)
@@ -2085,7 +2193,7 @@ class SpotifyClient:
                 track.release_year = release_year
         except Exception as e:
             logger.debug(f"Public track artwork fallback failed for {track.spotify_id}: {e}")
-        return self._enrich_track_metadata_via_itunes(track)
+        return self._enrich_track_metadata_via_itunes(track, allow_genre=False)
 
     def _fetch_public_track_page(self, track_id: str) -> Optional[TrackMetadata]:
         public_data = self._fetch_public_track_page_data(track_id)
@@ -2168,8 +2276,18 @@ class SpotifyClient:
             "release_year": release_year,
         }
 
-    def _enrich_track_metadata_via_itunes(self, track: TrackMetadata) -> TrackMetadata:
-        """Fill any remaining missing year/genre/artwork fields from iTunes Search."""
+    def _enrich_track_metadata_via_itunes(
+        self,
+        track: TrackMetadata,
+        allow_genre: bool = True,
+    ) -> TrackMetadata:
+        """Fill missing public metadata from iTunes Search.
+
+        `allow_genre=False` is used during the early Spotify metadata pass where
+        fuzzy iTunes matches can stamp unrelated broad genres like "Indian" onto
+        individual album tracks. Final post-resolve enrichment still uses stricter
+        source-backed paths (Deezer/ISRC first, then iTunes if needed) to fill genre.
+        """
         query_parts = [track.primary_artist if track.artists else "", track.title]
         query = " ".join(part for part in query_parts if part).strip()
         if not query:
@@ -2193,7 +2311,7 @@ class SpotifyClient:
             track.release_date = fallback.release_date
         if not track.release_year and fallback.release_year:
             track.release_year = fallback.release_year
-        if not track.genres and fallback.genres:
+        if allow_genre and not track.genres and fallback.genres:
             track.genres = fallback.genres
         if not track.total_tracks and fallback.total_tracks:
             track.total_tracks = fallback.total_tracks
@@ -2263,6 +2381,7 @@ class SpotifyClient:
             images = album_data.get("images", [])
             artwork_url = images[0]["url"] if images else None
             album_artists = [a["name"] for a in album_data.get("artists", []) if a.get("name")]
+            markets = self._extract_available_markets(album_data)
 
             explicit = track.get("explicit")
             return TrackMetadata(
@@ -2280,7 +2399,138 @@ class SpotifyClient:
                 album_id=album_data.get("id"),
                 artwork_url=artwork_url,
                 is_explicit=bool(explicit) if explicit is not None else None,
+                available_markets=markets,
+                available_in_market=self._album_available_in_market(markets),
+                availability_note=self._format_availability_note(markets),
             )
         except Exception as e:
             logger.warning(f"Failed to parse track: {e} — raw: {track.get('name')}")
             return None
+
+    def _current_market(self) -> str:
+        return (self._market or "US").upper()
+
+    def _extract_available_markets(self, album: Optional[dict]) -> list[str]:
+        if not isinstance(album, dict):
+            return []
+        raw = album.get("available_markets")
+        if not isinstance(raw, list):
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for code in raw:
+            if not isinstance(code, str):
+                continue
+            cleaned = code.strip().upper()
+            if len(cleaned) != 2 or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            result.append(cleaned)
+        return result
+
+    def _album_available_in_market(self, markets: list[str]) -> Optional[bool]:
+        if not markets:
+            return None
+        return self._current_market() in set(markets)
+
+    def _format_availability_note(self, markets: list[str]) -> Optional[str]:
+        if not markets:
+            return None
+        market = self._current_market()
+        if len(markets) == 1:
+            only = markets[0]
+            if only == market:
+                return f"Available in: {only} only"
+            return f"Unavailable in {market}. Available in: {only} only"
+        if market in markets:
+            return f"Available in {len(markets)} markets"
+        preview = ", ".join(markets[:3])
+        suffix = "..." if len(markets) > 3 else ""
+        return f"Unavailable in {market}. Available in: {preview}{suffix}"
+
+    def _raise_if_album_unavailable(
+        self,
+        album_id: str,
+        album_data: Optional[dict],
+        markets: Optional[list[str]] = None,
+    ) -> None:
+        normalized = self._extract_available_markets(album_data) if markets is None else list(markets)
+        if normalized and self._current_market() not in set(normalized):
+            album_name = ""
+            if isinstance(album_data, dict):
+                album_name = str(album_data.get("name") or "").strip()
+            note = self._format_availability_note(normalized) or "This album is region-locked."
+            title = album_name or album_id
+            raise SpotifyAvailabilityError(f"Spotify album '{title}' is not available in {self._current_market()}. {note}")
+
+    def _apply_album_availability(self, track: TrackMetadata, album_data: Optional[dict]) -> None:
+        markets = self._extract_available_markets(album_data)
+        track.available_markets = markets
+        track.available_in_market = self._album_available_in_market(markets)
+        track.availability_note = self._format_availability_note(markets)
+
+    def _fetch_full_album_data_anonymous(self, album_id: str) -> Optional[dict]:
+        token = self._get_anonymous_access_token() or self._get_totp_access_token()
+        if not token:
+            return None
+        try:
+            resp = requests.get(
+                f"https://api.spotify.com/v1/albums/{album_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"market": self._current_market()},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, dict) and payload.get("id"):
+                return payload
+        except Exception as e:
+            logger.debug(f"[Spotify] Anonymous full album fetch failed for {album_id}: {e}")
+        return None
+
+    def _fetch_full_album_data(self, album_id: str) -> Optional[dict]:
+        clients = [client for client in [self.sp, self._oauth_sp] if client is not None]
+        for client in clients:
+            try:
+                album = client.album(album_id, market=self._current_market())
+                if isinstance(album, dict) and album.get("id"):
+                    return album
+            except Exception as e:
+                logger.debug(f"[Spotify] Full album fetch failed for {album_id}: {e}")
+        return self._fetch_full_album_data_anonymous(album_id)
+
+    def _hydrate_discography_availability(self, albums: list[dict]) -> None:
+        if not albums:
+            return
+        album_map = {
+            str(album.get("id")): album
+            for album in albums
+            if isinstance(album, dict) and album.get("id")
+        }
+        if not album_map:
+            return
+
+        hydrated: dict[str, dict] = {}
+        ids = list(album_map.keys())
+        chunk_size = 20
+        for start in range(0, len(ids), chunk_size):
+            chunk = ids[start:start + chunk_size]
+            try:
+                result = self.sp.albums(chunk, market=self._current_market())
+                for album in (result.get("albums") or []):
+                    if album and album.get("id"):
+                        hydrated[str(album["id"])] = album
+            except Exception as e:
+                logger.debug(f"[Spotify] Discography album batch hydrate failed: {e}")
+                for album_id in chunk:
+                    album = self._fetch_full_album_data(album_id)
+                    if album:
+                        hydrated[album_id] = album
+
+        for album_id, item in album_map.items():
+            full = hydrated.get(album_id)
+            markets = self._extract_available_markets(full) if full else []
+            available_in_market = self._album_available_in_market(markets)
+            item["available_markets"] = markets
+            item["available_in_market"] = available_in_market
+            item["availability_note"] = self._format_availability_note(markets)

@@ -41,7 +41,7 @@ _ITUNES_SEARCH = "https://itunes.apple.com/search"
 _AM_CATALOG = "https://amp-api.music.apple.com/v1/catalog/{storefront}"
 
 REQUEST_TIMEOUT = 15
-MAX_PLAYLIST_PAGES = 20   # safety cap at 500 tracks (25 per page)
+MAX_PLAYLIST_PAGES = 200  # safety cap at 5000 tracks (25 per page)
 
 
 def is_apple_music_url(url: str) -> bool:
@@ -104,7 +104,7 @@ class AppleFetcher:
             "Supported: song, album, or playlist links from music.apple.com"
         )
 
-    def fetch(self, url: str) -> list[TrackMetadata]:
+    def fetch(self, url: str, page_callback=None) -> list[TrackMetadata]:
         """
         Resolve an Apple Music URL to a list of TrackMetadata objects.
         Raises ValueError if the URL isn't a recognised Apple Music URL.
@@ -123,13 +123,18 @@ class AppleFetcher:
 
         if url_type == "album":
             logger.info(f"[Apple] Detected album URL — album ID {entity_id}")
-            return self._fetch_album(entity_id, storefront)
+            return self._fetch_album(entity_id, storefront, source_url=url)
 
         # playlist — extract human-readable name from URL slug as fallback
         slug_match = re.search(r"/playlist/([^/]+)/", url)
         url_slug_name = slug_match.group(1).replace("-", " ").title() if slug_match else "Apple Music Playlist"
         logger.info(f"[Apple] Detected playlist URL — {entity_id}")
-        return self._fetch_playlist(entity_id, storefront, url_slug_name=url_slug_name)
+        return self._fetch_playlist(
+            entity_id,
+            storefront,
+            url_slug_name=url_slug_name,
+            page_callback=page_callback,
+        )
 
     # ── Song ──────────────────────────────────────────────────────────────────
 
@@ -184,7 +189,12 @@ class AppleFetcher:
 
     # ── Album ─────────────────────────────────────────────────────────────────
 
-    def _fetch_album(self, album_id: str, storefront: str = "us") -> list[TrackMetadata]:
+    def _fetch_album(
+        self,
+        album_id: str,
+        storefront: str = "us",
+        source_url: Optional[str] = None,
+    ) -> list[TrackMetadata]:
         """Fetch all tracks in an album."""
         token = self._get_developer_token()
         if token:
@@ -285,6 +295,12 @@ class AppleFetcher:
             logger.warning(f"[Apple] No tracks found for album ID {album_id}")
             return []
 
+        page_release_date, page_disc_count, page_track_meta = self._fetch_album_page_context(
+            source_url or f"https://music.apple.com/{storefront}/album/{album_id}"
+        )
+        if page_release_date:
+            release_date = page_release_date
+
         tracks = []
         for song in songs:
             meta = self._item_to_metadata(song)
@@ -292,6 +308,8 @@ class AppleFetcher:
                 # Enrich with album-level data when available
                 if album_art and not meta.artwork_url:
                     meta.artwork_url = album_art
+                if not meta.album_id:
+                    meta.album_id = str(album_id)
                 if total_tracks and meta.total_tracks is None:
                     meta.total_tracks = total_tracks
                 if release_date:
@@ -300,6 +318,12 @@ class AppleFetcher:
                         meta.release_year = int(release_date[:4])
                     except ValueError:
                         pass
+                if page_disc_count and page_disc_count > 1:
+                    meta.total_discs = page_disc_count
+                page_entry = page_track_meta.get(str(meta.apple_music_id or ""))
+                if page_entry:
+                    meta.disc_number = page_entry["disc_number"]
+                    meta.track_number = page_entry["track_number"]
                 # Override track collection name with the parent album name so
                 # anomalous Apple multi-disc segments (e.g. "Disc 29") fall under the parent folder.
                 if album_name:
@@ -309,6 +333,16 @@ class AppleFetcher:
                 if album_artists and not meta.album_artists:
                     meta.album_artists = album_artists
                 tracks.append(meta)
+
+        if page_track_meta:
+            tracks.sort(
+                key=lambda track: (
+                    page_track_meta.get(str(track.apple_music_id or ""), {}).get("order", 10**9),
+                    track.disc_number or 10**9,
+                    track.track_number or 10**9,
+                    track.title.lower(),
+                )
+            )
 
         # Apple Music sometimes glitches and assigns arbitrary high disc numbers (like 29 or 39)
         # to tracks on standard albums, which splits the album in music players
@@ -321,9 +355,67 @@ class AppleFetcher:
         logger.info(f"[Apple] Fetched {len(tracks)} tracks from album '{album_name or album_id}'")
         return tracks
 
+    def _fetch_album_page_context(self, url: str) -> tuple[str, Optional[int], dict[str, dict[str, int]]]:
+        """Best-effort scrape of album-level page metadata used for foldering and order."""
+        try:
+            resp = self._session.get(
+                url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            html = resp.text or ""
+        except Exception as e:
+            logger.debug(f"[Apple] Album page metadata scrape failed for {url}: {e}")
+            return "", None, {}
+
+        page_track_meta: dict[str, dict[str, int]] = {}
+        song_ids = re.findall(r'<meta property="music:song" content="https://music\.apple\.com/[^"]*/song/[^"]*/(\d+)">', html)
+        discs = [int(v) for v in re.findall(r'<meta property="music:song:disc" content="(\d+)">', html)]
+        tracks = [int(v) for v in re.findall(r'<meta property="music:song:track" content="(\d+)">', html)]
+        if len(song_ids) == len(discs) == len(tracks):
+            for order, (song_id, disc_number, track_number) in enumerate(zip(song_ids, discs, tracks), start=1):
+                page_track_meta[str(song_id)] = {
+                    "disc_number": disc_number,
+                    "track_number": track_number,
+                    "order": order,
+                }
+
+        disc_count = max((entry["disc_number"] for entry in page_track_meta.values()), default=0)
+        if not disc_count:
+            disc_count = len(re.findall(r">\s*Disc\s+\d+\s*<", html, flags=re.IGNORECASE))
+
+        match = re.search(r'<meta property="music:release_date" content="(\d{4}-\d{2}-\d{2})T', html)
+        if match:
+            return match.group(1), disc_count or None, page_track_meta
+
+        match = re.search(r'"releaseDate"\s*:\s*"(\d{4}-\d{2}-\d{2})"', html)
+        if match:
+            return match.group(1), disc_count or None, page_track_meta
+
+        match = re.search(r'([A-Z][a-z]+ \d{1,2}, \d{4})\s+\d+\s+songs?,', html)
+        if match:
+            try:
+                return (
+                    time.strftime("%Y-%m-%d", time.strptime(match.group(1), "%B %d, %Y")),
+                    disc_count or None,
+                    page_track_meta,
+                )
+            except ValueError:
+                return "", disc_count or None, page_track_meta
+        return "", disc_count or None, page_track_meta
+
     # ── Playlist ──────────────────────────────────────────────────────────────
 
-    def _fetch_playlist(self, playlist_id: str, storefront: str = "us", url_slug_name: str = "Apple Music Playlist") -> list[TrackMetadata]:
+    def _fetch_playlist(
+        self,
+        playlist_id: str,
+        storefront: str = "us",
+        url_slug_name: str = "Apple Music Playlist",
+        page_callback=None,
+    ) -> list[TrackMetadata]:
         """
         Fetch tracks from an Apple Music playlist via the Catalog API.
 
@@ -335,7 +427,7 @@ class AppleFetcher:
         token = self._get_developer_token()
 
         if token:
-            tracks = self._playlist_via_catalog_api(playlist_id, storefront, token)
+            tracks = self._playlist_via_catalog_api(playlist_id, storefront, token, page_callback=page_callback)
             if tracks:
                 return tracks
             logger.warning("[Apple] Catalog API returned no tracks — trying RSS fallback")
@@ -401,6 +493,7 @@ class AppleFetcher:
         playlist_id: str,
         storefront: str,
         token: str,
+        page_callback=None,
     ) -> list[TrackMetadata]:
         """Paginate through the Apple Music Catalog API to fetch all playlist tracks."""
         playlist_name, playlist_artwork = self._fetch_playlist_meta(playlist_id, storefront, token)
@@ -450,6 +543,12 @@ class AppleFetcher:
                     if playlist_artwork:
                         meta.playlist_artwork_url = playlist_artwork
                     tracks.append(meta)
+
+            if page_callback and tracks:
+                try:
+                    page_callback(list(tracks))
+                except Exception:
+                    pass
 
             # Pagination
             next_url = data.get("next")

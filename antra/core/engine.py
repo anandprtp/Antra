@@ -18,6 +18,7 @@ from antra.core.events import EngineEvent, EngineEventType
 from antra.core.models import AudioFormat, TrackMetadata, DownloadResult, DownloadStatus
 from antra.core.resolver import SourceResolver
 from antra.sources.base import RateLimitedError
+from antra.utils.matching import duration_close
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
 from antra.utils.tagger import FileTagger
@@ -56,7 +57,7 @@ def _is_server_error(exc: BaseException) -> bool:
         return True
     # Catch phrased server errors from mirror adapters
     return any(kw in msg for kw in (
-        "server error", "internal error", "all mirrors failed",
+        "server error", "internal error",
         "service unavailable", "bad gateway",
     ))
 
@@ -68,6 +69,7 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     output_format: str = "source"
+    strict_matching: bool = False
     max_workers: int = 1
 
 
@@ -155,17 +157,242 @@ class DownloadEngine:
             logger.debug(f"  [MB]  Genre fetch failed: {e}")
 
     @staticmethod
+    def _enrich_track_metadata_if_needed(track: TrackMetadata) -> None:
+        """Fill missing metadata (ISRC, track number, release date, genre, artwork) from Deezer + iTunes."""
+        from antra.utils.matching import score_similarity
+        import re as _re
+
+        needs_isrc = not track.isrc
+        needs_track_num = not track.track_number
+        needs_disc = not track.disc_number
+        needs_date = not track.release_year and not track.release_date
+        needs_genre = not track.genres
+        needs_composer = not track.composer
+        _is_spotify_art = bool(track.artwork_url and "i.scdn.co" in track.artwork_url)
+        needs_art = not track.artwork_url or _is_spotify_art
+
+        if not any([needs_isrc, needs_track_num, needs_disc, needs_date, needs_genre, needs_art, needs_composer]):
+            return
+        if not track.title or not track.artists:
+            return
+
+        try:
+            import requests as _req
+        except ImportError:
+            return
+
+        artist = track.artists[0]
+        title = track.title
+
+        # ── Deezer free API: ISRC, track position, disc, release date, artwork ──
+        try:
+            resp = _req.get(
+                "https://api.deezer.com/search",
+                params={"q": f'artist:"{artist}" track:"{title}"', "limit": 5},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                for hit in resp.json().get("data") or []:
+                    hit_title = hit.get("title") or ""
+                    hit_artist = (hit.get("artist") or {}).get("name") or ""
+                    if score_similarity(title, track.artists, hit_title, hit_artist) < 0.60:
+                        continue
+                    if needs_isrc and hit.get("isrc"):
+                        track.isrc = hit["isrc"]
+                        needs_isrc = False
+                        logger.debug("[MetaEnrich] ISRC from Deezer: %s", title)
+                    if needs_track_num and hit.get("track_position"):
+                        track.track_number = int(hit["track_position"])
+                        needs_track_num = False
+                        logger.debug("[MetaEnrich] Track# from Deezer: %s -> %s", title, track.track_number)
+                    if needs_disc and hit.get("disk_number"):
+                        track.disc_number = int(hit["disk_number"])
+                        needs_disc = False
+                    if needs_date:
+                        rd = (hit.get("album") or {}).get("release_date") or ""
+                        if rd:
+                            track.release_date = rd
+                            try:
+                                track.release_year = int(rd[:4])
+                            except (ValueError, TypeError):
+                                pass
+                            needs_date = False
+                            logger.debug("[MetaEnrich] Date from Deezer: %s -> %s", title, rd)
+                    if needs_art:
+                        cover_xl = (hit.get("album") or {}).get("cover_xl") or ""
+                        if cover_xl:
+                            track.artwork_url = cover_xl
+                            needs_art = False
+                            logger.debug("[MetaEnrich] Art from Deezer: %s", title)
+                    break
+        except Exception as e:
+            logger.debug("[MetaEnrich] Deezer failed for %r: %s", title, e)
+
+        # ── iTunes Search API: track#, disc#, year, genre, composer, artwork ──
+        if any([needs_track_num, needs_disc, needs_date, needs_genre, needs_art, needs_composer]):
+            try:
+                resp = _req.get(
+                    "https://itunes.apple.com/search",
+                    params={"term": f"{artist} {title}", "entity": "song", "limit": 8, "country": "us"},
+                    timeout=8,
+                )
+                if resp.status_code == 200:
+                    for hit in resp.json().get("results") or []:
+                        if hit.get("wrapperType") != "track":
+                            continue
+                        hit_title = hit.get("trackName") or ""
+                        hit_artist = hit.get("artistName") or ""
+                        if score_similarity(title, track.artists, hit_title, hit_artist) < 0.60:
+                            continue
+                        if needs_track_num and hit.get("trackNumber"):
+                            track.track_number = int(hit["trackNumber"])
+                            needs_track_num = False
+                            logger.debug("[MetaEnrich] Track# from iTunes: %s -> %s", title, track.track_number)
+                        if needs_disc and hit.get("discNumber"):
+                            track.disc_number = int(hit["discNumber"])
+                            needs_disc = False
+                        if needs_date and not track.release_year:
+                            rd = hit.get("releaseDate") or ""
+                            if rd and len(rd) >= 4 and rd[:4].isdigit():
+                                track.release_year = int(rd[:4])
+                                track.release_date = rd[:10]
+                                needs_date = False
+                                logger.debug("[MetaEnrich] Year from iTunes: %s -> %s", title, track.release_year)
+                        if needs_genre and hit.get("primaryGenreName"):
+                            track.genres = [hit["primaryGenreName"]]
+                            needs_genre = False
+                            logger.debug("[MetaEnrich] Genre from iTunes: %s -> %s", title, track.genres)
+                        if needs_composer and hit.get("composerName"):
+                            track.composer = hit["composerName"]
+                            needs_composer = False
+                        if needs_art and hit.get("artworkUrl100"):
+                            track.artwork_url = _re.sub(r"\d+x\d+bb", "3000x3000bb", hit["artworkUrl100"])
+                            needs_art = False
+                            logger.debug("[MetaEnrich] Art from iTunes: %s", title)
+                        break
+            except Exception as e:
+                logger.debug("[MetaEnrich] iTunes failed for %r: %s", title, e)
+
+    @staticmethod
+    def _metadata_debug_snapshot(track: TrackMetadata) -> dict:
+        """Compact metadata snapshot for post-resolve / pre-tag diagnostics."""
+        return {
+            "title": track.title,
+            "album": track.album,
+            "artists": track.artists or [],
+            "album_artists": track.album_artists or [],
+            "isrc": track.isrc or "",
+            "genres": track.genres or [],
+            "composer": track.composer or "",
+            "release_year": track.release_year,
+            "release_date": track.release_date or "",
+            "track_number": track.track_number,
+            "disc_number": track.disc_number,
+            "artwork_url": bool(track.artwork_url),
+        }
+
+    @classmethod
+    def _log_pre_tag_metadata_diagnostics(
+        cls,
+        track: TrackMetadata,
+        result,
+        file_path: str,
+        adapter_name: str,
+        before_snapshot: dict,
+    ) -> None:
+        """Log a structured before/after enrichment snapshot and flag missing key tags."""
+        source_meta = getattr(result, "source_metadata", None) or {}
+        after_snapshot = cls._metadata_debug_snapshot(track)
+        logger.debug(
+            "  [META] pre-tag adapter=%s file=%s source_meta=%s before=%s after=%s",
+            adapter_name,
+            file_path,
+            source_meta,
+            before_snapshot,
+            after_snapshot,
+        )
+        if source_meta.get("isrc") and not track.isrc:
+            logger.warning(
+                "  [META] Resolver returned ISRC %r for '%s' via %s, but track.isrc is still empty before tagging.",
+                source_meta.get("isrc"),
+                track.title,
+                adapter_name,
+            )
+        if source_meta.get("isrc") and not track.genres:
+            diagnostics = getattr(track, "_antra_meta_diag", None) or {}
+            logger.warning(
+                "  [META] Genre still missing before tagging '%s' via %s despite resolver ISRC %r. "
+                "This means post-resolve enrichment did not recover genre. diagnostics=%s",
+                track.title,
+                adapter_name,
+                source_meta.get("isrc"),
+                diagnostics,
+            )
+
+    @staticmethod
     def _audio_format_from_path(file_path: str) -> AudioFormat | None:
         ext = file_path.lower().rsplit(".", 1)[-1] if "." in file_path else ""
-        return {
+        basic = {
             "flac": AudioFormat.FLAC,
             "mp3": AudioFormat.MP3,
             "aac": AudioFormat.AAC,
-            "m4a": AudioFormat.AAC,
         }.get(ext)
+        if basic is not None:
+            return basic
+        if ext == "m4a":
+            try:
+                audio = MutagenFile(file_path)
+                codec = str(getattr(getattr(audio, "info", None), "codec", "") or "").lower()
+                if codec.startswith("alac"):
+                    return AudioFormat.ALAC
+            except Exception:
+                pass
+            return AudioFormat.AAC
+        return None
+
+    @classmethod
+    def _quality_label_from_file(
+        cls,
+        file_path: str,
+        fallback_format: AudioFormat | None,
+        fallback_label: str,
+    ) -> str:
+        try:
+            audio = MutagenFile(file_path)
+        except Exception:
+            audio = None
+        info = getattr(audio, "info", None)
+        detected_format = cls._audio_format_from_path(file_path) or fallback_format
+        if info and detected_format is not None:
+            sample_rate = getattr(info, "sample_rate", None)
+            bit_depth = getattr(info, "bits_per_sample", None)
+            bitrate = getattr(info, "bitrate", None)
+            fmt = detected_format.value.upper()
+            if detected_format in {AudioFormat.FLAC, AudioFormat.ALAC}:
+                if bit_depth and sample_rate:
+                    return f"{fmt} {int(bit_depth)}-bit/{int(sample_rate) // 1000}kHz"
+                if bit_depth:
+                    return f"{fmt} {int(bit_depth)}-bit"
+                return fmt
+            if bitrate:
+                return f"{fmt} {int(bitrate) // 1000}kbps"
+            return fmt
+        return fallback_label
 
     def _should_convert_output(self, file_path: str, output_format: str) -> bool:
         return self.transcoder.needs_conversion(file_path, output_format)
+
+    @staticmethod
+    def _format_conversion_log(file_path: str, output_format: str) -> str:
+        ext = os.path.splitext(file_path)[1].lower() or "source"
+        base_format = output_format.split("-")[0] if output_format.endswith(("-16", "-24")) else output_format
+        if base_format in {"lossless", "flac"}:
+            return f"Preparing FLAC output from {ext}"
+        if base_format == "alac":
+            return f"Preparing ALAC output from {ext}"
+        if base_format in {"aac", "m4a", "mp3"}:
+            return f"Transcoding to {base_format.upper()} from {ext}"
+        return f"Converting to {output_format} from {ext}"
 
     def _requires_lossless_output(self) -> bool:
         return self.cfg.output_format in {"flac", "lossless", "alac", "lossless-16", "lossless-24", "alac-16", "alac-24"}
@@ -175,6 +402,13 @@ class DownloadEngine:
 
     @staticmethod
     def _probe_duration_seconds(file_path: str) -> float | None:
+        # Mutagen is unreliable for some Apple-wrapper ALAC M4A files and can
+        # report short bogus durations (for example ~15s for a full-length song).
+        # Prefer ffprobe for MP4-family containers so lossless Apple downloads
+        # are not falsely flagged as truncated.
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".m4a":
+            return DownloadEngine._probe_duration_seconds_with_ffprobe(file_path)
         try:
             audio = MutagenFile(file_path)
         except Exception:
@@ -230,40 +464,50 @@ class DownloadEngine:
         file_path: str,
         expected_duration_ms: int | None,
         result_duration_ms: int | None = None,
+        strict_matching: bool = False,
     ) -> str | None:
         if not expected_duration_ms or expected_duration_ms < 60000:
             return None
-
-        # Lossy formats (mp3, aac, m4a with opus/aac) from Amazon are often
-        # a different edit or preview version — skip the duration check entirely.
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext in {".mp3", ".aac"}:
-            # For lossy output, only run the FLAC size check (which is a no-op
-            # for non-FLAC files). Duration mismatches on lossy files are almost
-            # always version differences, not truncated downloads.
-            return cls._get_flac_truncation_reason(file_path)
 
         actual_seconds = cls._probe_duration_seconds(file_path)
         if actual_seconds is None:
             return None
         expected_seconds = expected_duration_ms / 1000.0
 
+        def _severe_mismatch(expected_s: float, actual_s: float) -> bool:
+            shorter = (
+                actual_s < expected_s * 0.8
+                and (expected_s - actual_s) >= 20
+            )
+            longer = (
+                actual_s > expected_s * 1.3
+                and (actual_s - expected_s) >= 45
+            )
+            return shorter or longer
+
         # If the source result reported its own duration and the file matches it,
-        # the download is complete — the track metadata duration (e.g. from Spotify)
-        # may differ because it's a different version (radio edit, preview, etc.).
+        # the download is complete — but only when the source duration is itself
+        # reasonably close to the expected metadata duration. Otherwise a mirror
+        # can serve the wrong recording (or a preview) while staying internally
+        # self-consistent, which would let bad audio slip through.
         if result_duration_ms and result_duration_ms >= 60000:
             result_seconds = result_duration_ms / 1000.0
-            if abs(actual_seconds - result_seconds) <= result_seconds * 0.05 + 5:
+            source_matches_expected = not _severe_mismatch(expected_seconds, result_seconds)
+            if source_matches_expected and abs(actual_seconds - result_seconds) <= result_seconds * 0.05 + 5:
                 # File matches the source's own declared duration — not truncated.
                 return cls._get_flac_truncation_reason(file_path)
 
-        # Duration-based truncation check for lossless files
-        if (
-            actual_seconds < expected_seconds * 0.8
-            and (expected_seconds - actual_seconds) >= 20
-        ):
+        # Gross duration mismatch check for all formats. This catches both
+        # preview clips (~30s) and completely different full tracks.
+        if _severe_mismatch(expected_seconds, actual_seconds):
             return (
                 f"duration mismatch: got {actual_seconds:.1f}s "
+                f"but expected {expected_seconds:.1f}s"
+            )
+
+        if strict_matching and not duration_close(expected_seconds, actual_seconds, tolerance=8):
+            return (
+                f"strict duration mismatch: got {actual_seconds:.1f}s "
                 f"but expected {expected_seconds:.1f}s"
             )
 
@@ -439,6 +683,7 @@ class DownloadEngine:
         rate_limited_retried: set[str] = set()
         last_error: Optional[str] = None
         last_source: Optional[str] = None
+        attempted_sources: list[str] = []  # ordered list of sources that were tried
         used_lossy_fallback: bool = False  # flag for post-download warning
 
         while True:
@@ -458,7 +703,18 @@ class DownloadEngine:
                     rate_limited_adapters.clear()
                     continue
 
-                user_error = last_error or "No matching source found"
+                if last_error:
+                    user_error = last_error
+                elif attempted_sources:
+                    user_error = (
+                        f"No matching source found — tried: {', '.join(attempted_sources)}"
+                    )
+                else:
+                    fmt = self.cfg.output_format or "auto"
+                    user_error = (
+                        f"No source could find this track in {fmt.upper()} mode. "
+                        "The track may not be in the catalog of any configured lossless service."
+                    )
                 if (
                     getattr(track, "amazon_asin", None)
                     and self._is_lossy_output_mode()
@@ -556,9 +812,22 @@ class DownloadEngine:
                         if _pre_transcode_duration_s is not None else None
                     )
                     if self._should_convert_output(candidate_path, self.cfg.output_format):
-                        logger.info(f"  [FMT]  Converting to {self.cfg.output_format}: {track.title}")
+                        logger.info(
+                            "  [FMT]  %s: %s",
+                            self._format_conversion_log(candidate_path, self.cfg.output_format),
+                            track.title,
+                        )
                         try:
                             candidate_path = self.transcoder.convert(candidate_path, self.cfg.output_format)
+                        except RuntimeError as conv_err:
+                            # ffmpeg failed — discard the corrupt source so it does not
+                            # linger on disk and re-raise so the engine falls through to
+                            # the next adapter (Apple DRM-locked M4A being the primary case).
+                            self._discard_file(candidate_path)
+                            raise RuntimeError(
+                                f"[{adapter.name}] Audio conversion failed — "
+                                f"source file may be corrupt or DRM-protected: {conv_err}"
+                            ) from conv_err
                         except (KeyError, ValueError) as conv_err:
                             # Unsupported format string (e.g. 'lossless-24' in old binary) —
                             # keep the file as-is rather than crashing the whole engine.
@@ -570,6 +839,7 @@ class DownloadEngine:
                         candidate_path,
                         track.duration_ms,
                         result_duration_ms=source_duration_ms,
+                        strict_matching=self.cfg.strict_matching,
                     )
                     if truncation_reason is not None:
                         self._discard_file(candidate_path)
@@ -577,6 +847,32 @@ class DownloadEngine:
                             f"[{adapter.name}] Download appears truncated for {track.title} "
                             f"({truncation_reason})"
                         )
+                    # Quality verification: if the adapter claimed 24-bit hi-res but
+                    # the actual file is 16-bit, discard and try the next source.
+                    # Amazon in particular hardcodes bit_depth=24 in search results
+                    # but sometimes serves 16-bit streams (track-level quality < album).
+                    claimed_bit_depth = getattr(result, "bit_depth", None)
+                    if (
+                        claimed_bit_depth is not None
+                        and claimed_bit_depth >= 24
+                        and (self.cfg.output_format or "").lower() in {"lossless", "lossless-24", "flac", "alac", "source", ""}
+                        and candidate_path.lower().endswith((".flac", ".m4a"))
+                    ):
+                        try:
+                            from mutagen import File as _MF
+                            _audio = _MF(candidate_path)
+                            _actual_bd = getattr(getattr(_audio, "info", None), "bits_per_sample", None)
+                            if _actual_bd and _actual_bd < 24:
+                                self._discard_file(candidate_path)
+                                raise RuntimeError(
+                                    f"[{adapter.name}] Quality mismatch for '{track.title}': "
+                                    f"claimed {claimed_bit_depth}-bit but delivered {_actual_bd}-bit — "
+                                    f"retrying with next source"
+                                )
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            pass  # Probe failed — accept the file as-is
                     file_path = candidate_path
                     break
                 except Exception as e:
@@ -585,6 +881,8 @@ class DownloadEngine:
                     final_error = e
                     last_error = str(e)
                     last_source = adapter.name
+                    if adapter.name not in attempted_sources:
+                        attempted_sources.append(adapter.name)
                     adapter.mark_failed_result(result, e)
 
                     # Rate-limited: skip to next source immediately — no sleep, no retry.
@@ -602,8 +900,10 @@ class DownloadEngine:
                     if adapter.name == "hifi" and "all quality levels failed" in str(e).lower():
                         logger.info("  [INFO]  HiFi mirrors could not provide a valid stream. Trying next source...")
                     elif will_retry:
-                        # Transient failure — more attempts coming, keep it quiet
-                        logger.debug(f"  [RETRY] Attempt {attempt} failed, retrying... ({e})")
+                        if "appears truncated" in str(e):
+                            logger.info(f"  [TRUNC]  Attempt {attempt} truncated — retrying... ({e})")
+                        else:
+                            logger.debug(f"  [RETRY] Attempt {attempt} failed, retrying... ({e})")
                     else:
                         # Final failure for this adapter — surface it
                         logger.warning(f"  [WARN]  Attempt {attempt} failed: {e}")
@@ -613,8 +913,21 @@ class DownloadEngine:
                     break
 
             if file_path:
-                # 4. Enrich genres + tag
-                self._enrich_genres_if_needed(track)
+                # 4. Enrich metadata from winning adapter + free APIs + lyrics + art
+                pre_enrich_snapshot = self._metadata_debug_snapshot(track)
+                try:
+                    from antra.core.metadata_enricher import MetadataEnricher
+                    MetadataEnricher.enrich(track, result)
+                except Exception:
+                    self._enrich_track_metadata_if_needed(track)
+                    self._enrich_genres_if_needed(track)
+                self._log_pre_tag_metadata_diagnostics(
+                    track,
+                    result,
+                    file_path,
+                    adapter.name,
+                    pre_enrich_snapshot,
+                )
                 logger.debug(
                     "  [TAG]  %s | album=%r artwork=%s lyrics=%s synced=%s genres=%s",
                     file_path,
@@ -647,6 +960,12 @@ class DownloadEngine:
                         f"downloaded as {result.quality_label} from {adapter.name}. "
                         f"Not true lossless."
                     )
+                completed_audio_format = self._audio_format_from_path(file_path) or result.audio_format
+                completed_quality_label = self._quality_label_from_file(
+                    file_path,
+                    completed_audio_format,
+                    result.quality_label,
+                )
                 self._emit(
                     EngineEventType.TRACK_COMPLETED,
                     track=track,
@@ -654,14 +973,14 @@ class DownloadEngine:
                     track_total=track_total,
                     source=adapter.name,
                     file_path=file_path,
-                    quality_label=result.quality_label,
+                    quality_label=completed_quality_label,
                 )
                 return DownloadResult(
                     track=track,
                     status=DownloadStatus.COMPLETED,
                     file_path=file_path,
                     source_used=adapter.name,
-                    audio_format=self._audio_format_from_path(file_path) or result.audio_format,
+                    audio_format=completed_audio_format,
                 )
 
             # Rate-limited adapters already placed in rate_limited_adapters above — skip

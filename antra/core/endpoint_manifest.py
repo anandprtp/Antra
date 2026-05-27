@@ -133,27 +133,54 @@ def _fetch_remote_manifest(manifest_url: str) -> Any | None:
     session = requests.Session()
     session.trust_env = False
 
+    remote_data = None
+
     try:
         response = session.get(manifest_url, timeout=_REQUEST_TIMEOUT)
         response.raise_for_status()
-        return response.json()
+        remote_data = response.json()
     except Exception as exc:
         logger.debug(f"[Endpoints] Remote manifest fetch failed: {exc}")
 
+    if remote_data is None:
+        gist_id = _extract_gist_id(manifest_url)
+        if gist_id:
+            try:
+                response = session.get(
+                    f"https://api.github.com/gists/{gist_id}",
+                    timeout=_REQUEST_TIMEOUT,
+                    headers={"Accept": "application/vnd.github+json"},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                remote_data = _extract_manifest_from_gist_payload(payload)
+            except Exception as exc:
+                logger.debug(f"[Endpoints] Gist API manifest fetch failed: {exc}")
+            if remote_data is None:
+                return None
+
+    # Also try to fetch mirrors.txt from the same Gist to merge mirror URLs
     gist_id = _extract_gist_id(manifest_url)
-    if gist_id:
+    if gist_id and remote_data is not None:
         try:
-            response = session.get(
-                f"https://api.github.com/gists/{gist_id}",
-                timeout=_REQUEST_TIMEOUT,
-                headers={"Accept": "application/vnd.github+json"},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            return _extract_manifest_from_gist_payload(payload)
+            gist_owner = "anandprtp"
+            owner_m = re.search(r"githubusercontent\.com/([^/]+)/", manifest_url)
+            if owner_m:
+                gist_owner = owner_m.group(1)
+            mirrors_url = f"https://gist.githubusercontent.com/{gist_owner}/{gist_id}/raw/mirrors.txt"
+            if mirrors_url != manifest_url.rstrip("/"):
+                m_resp = session.get(mirrors_url, timeout=_REQUEST_TIMEOUT)
+                if m_resp.status_code == 200:
+                    mirrors_data = m_resp.json()
+                    if isinstance(mirrors_data, dict) and isinstance(remote_data, dict):
+                        remote_mirrors = remote_data.setdefault("mirrors", {})
+                        for key, val in (mirrors_data or {}).items():
+                            if isinstance(val, str) and val.strip() and key not in remote_mirrors:
+                                remote_mirrors[key] = val.strip()
         except Exception as exc:
-            logger.debug(f"[Endpoints] Gist API manifest fetch failed: {exc}")
-    return None
+            logger.debug(f"[Endpoints] Gist mirrors.txt fetch failed: {exc}")
+
+    return remote_data
 
 
 def _extract_gist_id(manifest_url: str) -> str | None:

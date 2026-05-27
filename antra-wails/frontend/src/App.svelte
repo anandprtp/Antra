@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, RequestAccessKey } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus } from '../wailsjs/go/main/App.js';
+  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, SaveCoverArt } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus, GetAlbumAvailability } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
   import AntraLogo from './AntraLogo.svelte';
@@ -50,6 +50,18 @@
     tidal_token_type: 'Bearer',
     tidal_country_code: '',
     antra_api_key: '',
+    theme: '',
+    strict_matching: false,
+    download_source: 'auto',
+    single_track_filename_template: '{artist} - {title}',
+    album_track_filename_template: '{track} - {title}',
+    folder_structure_template: '{album_artist}/{year} - {album}',
+    multi_disc_handling: '',
+    track_number_padding: 2,
+    illegal_character_replacement: '_',
+    whitespace_handling: 'keep',
+    fetch_lyrics: true,
+    filename_conflict_behavior: 'skip',
   };
   let tidalValidationStatus: { ok: boolean; message: string; display_name?: string; country_code?: string } | null = null;
   let tidalValidationLoading = false;
@@ -106,11 +118,97 @@
     synced_lyrics?: string;
   }
 
+  // ── Theme system ────────────────────────────────────────────────────────────
+  const THEMES = [
+    { id: 'antra',        label: 'Antra',        cat: 'original', desc: 'Midnight jade with polished glass surfaces and a vivid aqua edge.',  colors: ['#081412','#102320','#37e2c2'], icon: null, preview: 'linear-gradient(145deg, #081412 0%, #102320 56%, #183632 100%)', tone: '#dffdf6' },
+    { id: 'linen',        label: 'Linen',        cat: 'original', desc: 'A proper light theme with soft paper whites and brass-green accents.', colors: ['#f6f1e7','#ebe2d2','#6c8a62'], icon: null, preview: 'linear-gradient(145deg, #f8f4ec 0%, #efe7d7 58%, #e5d7bd 100%)', tone: '#233126' },
+    { id: 'ember',        label: 'Ember',        cat: 'original', desc: 'Burnished copper, smoked cacao, and warm lounge lighting.',           colors: ['#16100d','#231914','#cf7a3a'], icon: null, preview: 'linear-gradient(145deg, #16100d 0%, #231914 52%, #3b2318 100%)', tone: '#fff0e4' },
+    { id: 'ocean',        label: 'Ocean',        cat: 'original', desc: 'Ink-blue depth with steel-blue highlights and cool contrast.',        colors: ['#07111d','#102033','#71a8e8'], icon: null, preview: 'linear-gradient(145deg, #07111d 0%, #102033 54%, #18314b 100%)', tone: '#edf6ff' },
+    { id: 'graphite',     label: 'Graphite',     cat: 'original', desc: 'Refined monochrome with silver ink and gallery-style restraint.',    colors: ['#101113','#1a1c20','#b7bcc6'], icon: null, preview: 'linear-gradient(145deg, #101113 0%, #1a1c20 55%, #2a2d34 100%)', tone: '#f3f5f8' },
+    { id: 'sunset',       label: 'Sunset',       cat: 'original', desc: 'Plum dusk, rose glow, and a softer golden finish.',                  colors: ['#150d1a','#24132b','#e091a3'], icon: null, preview: 'linear-gradient(145deg, #150d1a 0%, #24132b 54%, #4d2434 100%)', tone: '#fff0f5' },
+    { id: 'spotify',      label: 'Spotify',      cat: 'service',  desc: 'Closer to Spotify itself: charcoal layers, sharp type, green only on action.', colors: ['#121212','#1b1b1b','#1ed760'], icon: null, preview: 'linear-gradient(145deg, #121212 0%, #181818 54%, #242424 100%)', tone: '#ffffff' },
+    { id: 'tidal',        label: 'TIDAL',        cat: 'service',  desc: 'Luxury black-and-white with a restrained cool-aqua highlight.',      colors: ['#050607','#0d1014','#8ae5ff'], icon: '/icons/tidal.webp', preview: 'linear-gradient(145deg, #050607 0%, #0d1014 58%, #171d24 100%)', tone: '#f8fbff' },
+    { id: 'qobuz',        label: 'Qobuz',        cat: 'service',  desc: 'Editorial navy, hi-fi blue, and a more premium liner-note feel.',    colors: ['#08101c','#0f1a2b','#3d7fe3'], icon: '/icons/qobuz.png', preview: 'linear-gradient(145deg, #08101c 0%, #0f1a2b 54%, #173253 100%)', tone: '#eef5ff' },
+    { id: 'deezer',       label: 'Deezer',       cat: 'service',  desc: 'Deezer’s neon energy, but cleaner: aubergine depth with electric violet.', colors: ['#120d18','#1d1526','#a238ff'], icon: '/icons/deezer.webp', preview: 'linear-gradient(145deg, #120d18 0%, #1d1526 52%, #34204a 100%)', tone: '#f7efff' },
+    { id: 'apple-music',  label: 'Apple Music',  cat: 'service',  desc: 'Apple Music with bright porcelain surfaces instead of another dark clone.', colors: ['#fbfbfd','#ececf1','#fa2d5d'], icon: '/icons/apple-music.png', preview: 'linear-gradient(145deg, #ffffff 0%, #f4f4f8 55%, #ebecef 100%)', tone: '#1d1d21' },
+    { id: 'amazon-music', label: 'Amazon Music', cat: 'service',  desc: 'Amazon Music blue, modern slate panels, and a cleaner streaming-app look.', colors: ['#0b1220','#101a2b','#18a8ff'], icon: '/icons/amazon-music.jpg', preview: 'linear-gradient(145deg, #0b1220 0%, #101a2b 56%, #17365b 100%)', tone: '#edf6ff' },
+  ];
+  let showThemes = false;
+  function applyTheme(id: string) {
+    document.documentElement.setAttribute('data-theme', id || 'antra');
+    config.theme = id;
+    showThemes = false;
+    SaveConfig(config);
+  }
+
+  async function saveCoverArtToLibrary() {
+    if (!playlistArtwork) return;
+    try {
+      await SaveCoverArt(playlistArtwork, config.download_path);
+      addLog('success', '✔ Cover art saved to library folder.');
+    } catch (e) {
+      addLog('error', `Failed to save cover art: ${(e as any)?.message || e}`);
+    }
+  }
+
+  // ── Filename template system ────────────────────────────────────────────────
+  const TEMPLATE_DEMO = {
+    title: 'Come Together',
+    artist: 'The Beatles',
+    album_artist: 'The Beatles',
+    album: 'Abbey Road',
+    year: '1969',
+    track: '07',
+    disc: '1',
+    genre: 'Rock',
+    composer: 'Lennon-McCartney',
+    isrc: 'GBAYE6800032',
+    codec: 'flac',
+    bitrate: '1411',
+    quality: 'LOSSLESS',
+  };
+
+  function renderPreview(template: string): string {
+    if (!template) return '';
+    return template.replace(/\{(\w+)\}/gi, (_m, key) => {
+      const k = key.toLowerCase() as keyof typeof TEMPLATE_DEMO;
+      return TEMPLATE_DEMO[k] ?? `{${key}}`;
+    });
+  }
+
+  let focusedTemplateEl: HTMLInputElement | null = null;
+
+  function insertToken(token: string) {
+    const el = focusedTemplateEl;
+    if (!el) return;
+    const start = el.selectionStart ?? el.value.length;
+    const end   = el.selectionEnd   ?? el.value.length;
+    const before = el.value.slice(0, start);
+    const after  = el.value.slice(end);
+    el.value = before + token + after;
+    // Trigger Svelte reactivity via an input event
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    const newPos = start + token.length;
+    el.setSelectionRange(newPos, newPos);
+    el.focus();
+  }
+
+  function restoreFolderDefaults() {
+    config.single_track_filename_template  = '{artist} - {title}';
+    config.album_track_filename_template   = '{track} - {title}';
+    config.folder_structure_template       = '{album_artist}/{year} - {album}';
+    config.multi_disc_handling             = '';
+    config.track_number_padding            = 2;
+    config.illegal_character_replacement   = '_';
+    config.whitespace_handling             = 'keep';
+  }
+
   let isLoading = true;
   let setupMode = false;
   let showHistory = false;
   let showSettings = false;
   let showFolderSettings = false;
+  let folderSettingsSaving = false;
   let settingsScrollTarget: string | null = null; // id of settings section to scroll to on open
   let showDownloadedMusic = false;
   let settingsButtonEl: HTMLButtonElement | null = null;
@@ -176,6 +274,31 @@
   let healthLoading = false;
   let showHealthPopover = false;
 
+  // Gist-sourced source status — fetched once on startup from the public status Gist.
+  // Default: all true (green) so chips don't flash red before the fetch completes.
+  let gistStatus: Record<string, boolean> = { hifi: true, amazon: true, qobuz: true, apple: true, deezer: true };
+
+  async function fetchGistStatus() {
+    try {
+      const res = await fetch(
+        'https://gist.githubusercontent.com/anandprtp/fdc2c16b7bfdc2d337fbc86161b79371/raw/status.json',
+        { cache: 'no-store' }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        gistStatus = {
+          hifi:   !!(data['hifi']   ?? data['tidal'] ?? true),
+          amazon: !!(data['amazon'] ?? true),
+          qobuz:  !!(data['qobuz']  ?? data['dab']   ?? true),
+          apple:  !!(data['apple']  ?? true),
+          deezer: !!(data['deezer'] ?? true),
+        };
+      }
+    } catch {
+      // Fetch failed — keep defaults (all true). Downloads still work; status is unknown.
+    }
+  }
+
   const healthSources = [
     { key: 'hifi',   label: 'Tidal',   abbr: 'T', bg: '#1a1a2e', bgEnabled: 'rgba(29,185,222,0.14)',  border: '#1DB9DE', text: '#1DB9DE' },
     { key: 'apple',  label: 'Apple',   abbr: '',  bg: '#230a10', bgEnabled: 'rgba(252,60,68,0.14)',   border: '#fc3c44', text: '#fc3c44' },
@@ -231,6 +354,16 @@
   $: chipLive = Object.fromEntries(
     healthSources.map(s => [s.key, !!(healthCache[s.key] && healthCache[s.key].live > 0)])
   );
+
+  // Chip enabled: sourced from the public Gist status (fetched on startup).
+  // True = source is online per the Gist; false = source is down or status unknown.
+  $: chipEnabled = Object.fromEntries([
+    ['hifi',   gistStatus['hifi']],
+    ['apple',  gistStatus['apple']],
+    ['amazon', gistStatus['amazon']],
+    ['qobuz',  gistStatus['qobuz']],
+    ['deezer', gistStatus['deezer']],
+  ] as [string, boolean][]);
 
   async function openSettingsAt(sectionId: string) {
     settingsScrollTarget = sectionId;
@@ -358,6 +491,7 @@
   let logAtBottom = true;
   let showLog = false;
   let trackOrder: string[] = [];
+  let trackLabels: Record<string, string> = {};
   let playlistTitle = '';
   let playlistArtwork = '';
   let playlistArtists = '';
@@ -377,6 +511,43 @@
     retrying?: boolean,
     trackData?: FailedTrackPayload,
   }> = {};
+  let currentPlaylistTrackKeysByIndex: Record<number, string> = {};
+  let currentPlaylistTrackCount = 0;
+
+  function makeTrackDisplayName(artist?: string | null, title?: string | null) {
+    const artistPart = String(artist || '').trim();
+    const titlePart = String(title || '').trim();
+    if (artistPart && titlePart) return `${artistPart} - ${titlePart}`;
+    return titlePart || artistPart || 'Unknown Track';
+  }
+
+  function normalizeTrackKeyPart(value: string) {
+    return String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  function fallbackTrackKey(artist?: string | null, title?: string | null, trackData?: any) {
+    const artistPart = normalizeTrackKeyPart(artist || trackData?.artist_string || (Array.isArray(trackData?.artists) ? trackData.artists.join(' ') : ''));
+    const titlePart = normalizeTrackKeyPart(title || trackData?.title || '');
+    const durationPart = trackData?.duration_ms ? String(trackData.duration_ms) : '';
+    return `fallback::${artistPart}::${titlePart}::${durationPart}`;
+  }
+
+  function resolveTrackEventKey(data: any) {
+    const idx = Number(data?.track_index || 0);
+    if (idx > 0 && currentPlaylistTrackKeysByIndex[idx]) {
+      return currentPlaylistTrackKeysByIndex[idx];
+    }
+    const td = data?.track_data || {};
+    if (td.spotify_id) return `spotify:${td.spotify_id}`;
+    if (td.apple_music_id) return `apple:${td.apple_music_id}`;
+    if (td.deezer_track_id) return `deezer:${td.deezer_track_id}`;
+    if (td.tidal_track_id) return `tidal:${td.tidal_track_id}`;
+    if (td.isrc && td.album_id && td.track_number) return `albumtrack:${td.album_id}:${td.disc_number || 1}:${td.track_number}:${td.isrc}`;
+    return fallbackTrackKey(data?.artist, data?.track, td);
+  }
 
   function updateActiveTrack(trackName: string, patch: Partial<typeof activeTracks[string]>) {
     const existing = activeTracks[trackName] || { mode: 'status' as const, text: 'Resolving source...', status: 'resolving' as const };
@@ -449,6 +620,21 @@
       if (config.amazon_wvd_path === undefined || config.amazon_wvd_path === null) {
         config.amazon_wvd_path = '';
       }
+      if (config.strict_matching === undefined || config.strict_matching === null) {
+        config.strict_matching = false;
+      }
+      if (!config.download_source) {
+        config.download_source = 'auto';
+      }
+      // Template defaults
+      if (!config.single_track_filename_template) config.single_track_filename_template = '{artist} - {title}';
+      if (!config.album_track_filename_template)  config.album_track_filename_template  = '{track} - {title}';
+      if (!config.folder_structure_template)      config.folder_structure_template      = '{album_artist}/{year} - {album}';
+      if (!config.illegal_character_replacement)  config.illegal_character_replacement  = '_';
+      if (!config.whitespace_handling)            config.whitespace_handling            = 'keep';
+      if (!config.track_number_padding)           config.track_number_padding           = 2;
+      // Apply saved theme
+      applyTheme(config.theme || 'antra');
 
     } catch (e) {
       console.error('Failed to load config', e);
@@ -456,6 +642,7 @@
     }
 
     await loadSupportStatus();
+    fetchGistStatus(); // non-blocking — chips update when Gist responds
     isLoading = false;
 
     // Listen to backend events
@@ -581,7 +768,6 @@
     }
 
     const handleWindowResize = () => {
-      if (showKeyReminder) updateKeyReminderPosition();
     };
     window.addEventListener('resize', handleWindowResize);
     return () => window.removeEventListener('resize', handleWindowResize);
@@ -666,17 +852,61 @@
         trackOrder = [...trackOrder, sepKey];
       }
 
-      // Pre-populate the full tracklist in waiting state before downloads begin
-      const incoming: string[] = trkList.map((t: any) => `${t.artist} - ${t.title}`);
-      for (const name of incoming) {
-        if (!trackOrder.includes(name)) {
-          trackOrder = [...trackOrder, name];
+      currentPlaylistTrackKeysByIndex = {};
+      currentPlaylistTrackCount = 0;
+
+      // Pre-populate the full tracklist in waiting state (Set-based O(N) dedup)
+      const seen = new Set(trackOrder);
+      const newTracks: string[] = [];
+      trkList.forEach((t: any, idx: number) => {
+        const rowKey = `track:${Date.now()}:${idx + 1}`;
+        const label = makeTrackDisplayName(t.artist, t.title);
+        currentPlaylistTrackKeysByIndex[idx + 1] = rowKey;
+        currentPlaylistTrackCount = idx + 1;
+        trackLabels[rowKey] = label;
+        if (!seen.has(rowKey)) {
+          seen.add(rowKey);
+          newTracks.push(rowKey);
+          if (!activeTracks[rowKey]) {
+            activeTracks[rowKey] = { mode: 'status', text: 'Waiting...', status: 'resolving' };
+          }
         }
-        if (!activeTracks[name]) {
-          activeTracks[name] = { mode: 'status', text: 'Waiting...', status: 'resolving' };
-        }
+      });
+      if (newTracks.length > 0) {
+        trackOrder = [...trackOrder, ...newTracks];
       }
+      trackLabels = { ...trackLabels };
       activeTracks = { ...activeTracks };
+      return;
+    }
+
+    if (payload.type === 'tracks_appended') {
+      // Progressive playlist loading: append new tracks without resetting existing rows
+      const trkList2: any[] = payload.tracks || [];
+      const seen2 = new Set(trackOrder);
+      const newTracks2: string[] = [];
+      trkList2.forEach((t: any, idx: number) => {
+        const absoluteIndex = currentPlaylistTrackCount + idx + 1;
+        const rowKey = `track:${Date.now()}:${absoluteIndex}`;
+        const label = makeTrackDisplayName(t.artist, t.title);
+        currentPlaylistTrackKeysByIndex[absoluteIndex] = rowKey;
+        trackLabels[rowKey] = label;
+        if (!seen2.has(rowKey)) {
+          seen2.add(rowKey);
+          newTracks2.push(rowKey);
+          if (!activeTracks[rowKey]) {
+            activeTracks[rowKey] = { mode: 'status', text: 'Waiting...', status: 'resolving' };
+          }
+        }
+      });
+      if (newTracks2.length > 0) {
+        trackOrder = [...trackOrder, ...newTracks2];
+        activeTracks = { ...activeTracks };
+        trackLabels = { ...trackLabels };
+        playlistTotalTracks = (playlistTotalTracks || 0) + newTracks2.length;
+        playlistTotalDurationMs = (playlistTotalDurationMs || 0) + trkList2.reduce((s: number, t: any) => s + (t.duration_ms || 0), 0);
+        currentPlaylistTrackCount += newTracks2.length;
+      }
       return;
     }
 
@@ -685,7 +915,10 @@
       Object.keys(activeTracks).forEach(clearTrackInterval);
       if (payload.status === 'cancelled') {
         trackOrder = [];
+        trackLabels = {};
         activeTracks = {};
+        currentPlaylistTrackKeysByIndex = {};
+        currentPlaylistTrackCount = 0;
         addLog('warning', '■ Library sync stopped');
       } else if (payload.status === 'failed') {
         addLog('error', '✖ Library sync stopped with errors');
@@ -722,23 +955,28 @@
       const name = payload.name;
       const data = payload.payload;
 
-      const trackName = data.track ? `${data.artist} - ${data.track}` : 'Unknown Track';
+      const trackKey = resolveTrackEventKey(data);
+      const trackLabel = makeTrackDisplayName(data.artist, data.track);
+      if (!trackLabels[trackKey]) {
+        trackLabels[trackKey] = trackLabel;
+        trackLabels = { ...trackLabels };
+      }
 
       if (name === 'track_started') {
-        if (!trackOrder.includes(trackName)) {
-          trackOrder = [...trackOrder, trackName];
+        if (!trackOrder.includes(trackKey)) {
+          trackOrder = [...trackOrder, trackKey];
         }
-        updateActiveTrack(trackName, {
+        updateActiveTrack(trackKey, {
           mode: 'status',
           progress: undefined,
           text: 'Resolving best source...',
           status: 'resolving',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
 
       } else if (name === 'track_resolved') {
-        clearTrackInterval(trackName);
+        clearTrackInterval(trackKey);
         let displaySource = data.source || 'auto';
         if (displaySource === 'hifi') displaySource = 'Tidal';
         else if (displaySource === 'apple') displaySource = 'Apple';
@@ -746,28 +984,28 @@
         else if (displaySource === 'dab') displaySource = 'Qobuz';
         else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
 
-        updateActiveTrack(trackName, {
+        updateActiveTrack(trackKey, {
           mode: 'status',
           progress: undefined,
           text: `Accepted via ${displaySource}${data.quality_label ? ` • ${data.quality_label}` : ''}`,
           status: 'resolving',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
 
       } else if (name === 'track_download_attempt') {
         const source = String(data.source || 'auto');
         const attempt = data.attempt ?? 1;
-        clearTrackInterval(trackName);
+        clearTrackInterval(trackKey);
 
         if (source.startsWith('soulseek')) {
-          updateActiveTrack(trackName, {
+          updateActiveTrack(trackKey, {
             mode: 'status',
             progress: undefined,
             text: 'Waiting for Soulseek transfer...',
             status: 'downloading',
             retrying: false,
-            trackData: data.track_data || activeTracks[trackName]?.trackData,
+            trackData: data.track_data || activeTracks[trackKey]?.trackData,
           });
           return;
         }
@@ -780,60 +1018,60 @@
         else if (displaySource === 'dab') displaySource = 'Qobuz';
         else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
 
-        updateActiveTrack(trackName, {
+        updateActiveTrack(trackKey, {
           mode: 'progress',
           progress: 8,
           text: `Downloading from ${displaySource}${data.quality_label ? ` • ${data.quality_label}` : ''}${attemptSuffix}`,
           status: 'downloading',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
 
         const intervalId = setInterval(() => {
-          if (activeTracks[trackName] && activeTracks[trackName].mode === 'progress' && (activeTracks[trackName].progress ?? 0) < 85) {
-            updateActiveTrack(trackName, {
-              progress: Math.min(85, (activeTracks[trackName].progress ?? 0) + Math.random() * 5)
+          if (activeTracks[trackKey] && activeTracks[trackKey].mode === 'progress' && (activeTracks[trackKey].progress ?? 0) < 85) {
+            updateActiveTrack(trackKey, {
+              progress: Math.min(85, (activeTracks[trackKey].progress ?? 0) + Math.random() * 5)
             });
           } else {
             clearInterval(intervalId);
           }
         }, 800);
 
-        (activeTracks[trackName] as any)._intervalId = intervalId;
+        (activeTracks[trackKey] as any)._intervalId = intervalId;
         activeTracks = { ...activeTracks };
 
       } else if (name === 'track_completed') {
-        addLog('success', `[✓] Added to library: ${trackName}`);
-        clearTrackInterval(trackName);
-        updateActiveTrack(trackName, {
+        addLog('success', `[✓] Added to library: ${trackLabel}`);
+        clearTrackInterval(trackKey);
+        updateActiveTrack(trackKey, {
           mode: 'progress',
           progress: 100,
           text: '✓ Added to library',
           error: undefined,
           status: 'done',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
       } else if (name === 'track_failed') {
-        addLog('error', `[FAIL] ${trackName} - ${data.error}`);
-        clearTrackInterval(trackName);
-        updateActiveTrack(trackName, {
+        addLog('error', `[FAIL] ${trackLabel} - ${data.error}`);
+        clearTrackInterval(trackKey);
+        updateActiveTrack(trackKey, {
           mode: 'status',
           progress: undefined,
           text: 'Download failed',
           error: data.error || 'Failed',
           status: 'failed',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
       } else if (name === 'track_skipped') {
-        addLog('warning', `[—] Already in library: ${trackName}`);
-        updateActiveTrack(trackName, {
+        addLog('warning', `[—] Already in library: ${trackLabel}`);
+        updateActiveTrack(trackKey, {
           mode: 'status',
           text: 'Already in library',
           status: 'skipped',
           retrying: false,
-          trackData: data.track_data || activeTracks[trackName]?.trackData,
+          trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
       } else if (name === 'playlist_started') {
         addLog('info', `Creating playlist structure and syncing tracks: ${data.message}`);
@@ -859,6 +1097,7 @@
     status: TrackStatus;
     probe?: any;
     spectrogram?: string;
+    stats?: any;   // AudioStats: peakDb, rmsDb, truePeakDb, lufsI, lufsLRA, cutoffHz
     error?: string;
   }
 
@@ -981,6 +1220,39 @@
     return deduped;
   }
 
+  // ── Album Availability Studio ───────────────────────────────────────────────
+  let showAvailability = false;
+  let availabilityUrl = '';
+  let availabilityLoading = false;
+  let availabilityResult: any = null;
+  let availabilityError = '';
+
+  async function inspectAlbum() {
+    if (!availabilityUrl.trim()) return;
+    availabilityLoading = true;
+    availabilityError = '';
+    availabilityResult = null;
+    try {
+      const raw = await GetAlbumAvailability(availabilityUrl.trim());
+      const parsed = JSON.parse(raw);
+      if (parsed.error) {
+        availabilityError = parsed.error;
+      } else {
+        availabilityResult = parsed;
+      }
+    } catch (e) {
+      availabilityError = String((e as any)?.message || e);
+    } finally {
+      availabilityLoading = false;
+    }
+  }
+
+  function availabilityToneColor(tone: string): string {
+    if (tone === 'ok')   return '#22c55e';
+    if (tone === 'warn') return '#f59e0b';
+    return '#555';
+  }
+
   let showAnalyzer = false;
   let analyzerTracks: TrackAnalysis[] = [];
   let analyzerCurrentIndex = 0;
@@ -1003,6 +1275,14 @@
     analyzerCurrentIndex = 0;
     analyzerViewMode = 'gallery';
     analyzerExportStatus = '';
+  }
+
+  function analyzerRemoveTrack(i: number) {
+    analyzerTracks = analyzerTracks.filter((_, idx) => idx !== i);
+    if (analyzerCurrentIndex >= analyzerTracks.length) {
+      analyzerCurrentIndex = Math.max(0, analyzerTracks.length - 1);
+    }
+    if (analyzerTracks.length < 2) analyzerViewMode = 'gallery';
   }
 
   function analyzerFileName(path: string): string {
@@ -1047,6 +1327,7 @@
           status: result.spectrogramError && result.probeError ? 'error' : 'done',
           probe: result.probe,
           spectrogram: result.spectrogram,
+          stats: result.stats,
           error: result.spectrogramError || result.probeError || undefined,
         };
       } catch (e: any) {
@@ -1133,6 +1414,20 @@
     return rows;
   }
 
+  function analyzerFormatStats(track: TrackAnalysis): { label: string; value: string }[] {
+    const s = track.stats;
+    if (!s) return [];
+    const fmt = (v: number, suffix: string) => (v <= -999 || v === null || v === undefined) ? '—' : `${v.toFixed(1)} ${suffix}`;
+    const rows: { label: string; value: string }[] = [];
+    rows.push({ label: 'Peak',        value: fmt(s.peakDb,     'dBFS') });
+    rows.push({ label: 'RMS',         value: fmt(s.rmsDb,      'dBFS') });
+    rows.push({ label: 'True Peak',   value: fmt(s.truePeakDb, 'dBTP') });
+    rows.push({ label: 'Loudness',    value: fmt(s.lufsI,      'LUFS') });
+    rows.push({ label: 'LRA',         value: fmt(s.lufsLRA,    'LU')   });
+    rows.push({ label: 'Freq. Cutoff', value: s.cutoffHz > 0 ? `${(s.cutoffHz / 1000).toFixed(0)} kHz` : '—' });
+    return rows;
+  }
+
   function analyzerQualityBadge(track: TrackAnalysis): { label: string; color: string } {
     if (!track.probe) return { label: '—', color: '#555' };
     const streams = track.probe.streams || [];
@@ -1142,15 +1437,16 @@
     const bits = +(stream.bits_per_raw_sample || stream.bits_per_sample || 0);
     const sr = +(stream.sample_rate || 0);
     const br = +(fmt.bit_rate || 0);
+    const cutoff = track.stats?.cutoffHz ?? 0;
 
     if (codec === 'flac' || codec === 'alac') {
+      // Frequency cutoff below 14 kHz = almost certainly a lossy-to-lossless transcode
+      if (cutoff > 0 && cutoff < 14000) return { label: 'Fake Lossless', color: '#f87171' };
       if (bits >= 24 && sr >= 88200) {
-        // Extra sanity: hi-res lossless should be at least 800kbps
         if (br > 0 && br < 400000) return { label: 'Suspect (Low Bitrate)', color: '#f87171' };
         return { label: 'Hi-Res Lossless', color: '#a78bfa' };
       }
-      // Standard lossless (16-bit CD quality) should be at least ~400kbps;
-      // below ~250kbps is almost always a lossy-to-lossless transcode (fake FLAC).
+      // Standard lossless: below ~250kbps almost always a transcode
       if (br > 0 && br < 250000) return { label: 'Fake Lossless', color: '#f87171' };
       if (br > 0 && br < 400000) return { label: 'Lossless (Low BR)', color: '#facc15' };
       return { label: 'Lossless', color: '#00ffcc' };
@@ -1421,10 +1717,6 @@
     }
     await SaveConfig(config);
     setupMode = false;
-    if (!config.antra_api_key?.trim()) {
-      await tick();
-      showKeyReminderToast();
-    }
   }
 
   async function startDownload() {
@@ -1450,6 +1742,7 @@
       isDownloading = true;
       logs = [];
       trackOrder = [];
+      trackLabels = {};
       playlistTitle = '';
       playlistArtwork = '';
       playlistArtists = '';
@@ -1460,6 +1753,8 @@
       playlistTotalTracks = 0;
       Object.keys(activeTracks).forEach(clearTrackInterval);
       activeTracks = {};
+      currentPlaylistTrackKeysByIndex = {};
+      currentPlaylistTrackCount = 0;
       separatorMeta = {};
       shouldAutoScroll = true;
       addLog('info', `━━━ Building your music library ━━━`);
@@ -1599,41 +1894,34 @@
     if (!config.max_retries || config.max_retries < 1) {
       config.max_retries = 3;
     }
-    config.folder_structure = config.album_folder_structure || 'standard';
     await SaveConfig(config);
     showSettings = false;
   }
 
-  // ── Access key reminder toast ───────────────────────────────────────────────
-  let showKeyReminder = false;
-  let keyReminderLeaving = false;
-  let keyReminderTimer: ReturnType<typeof setTimeout>;
-  let keyReminderStyle = '';
+  async function openFolderSettings(event?: MouseEvent) {
+    event?.stopPropagation();
+    if (folderSettingsSaving) return;
+    focusedTemplateEl = null;
+    showFolderSettings = true;
+    await tick();
+  }
 
-  function updateKeyReminderPosition() {
-    if (!settingsButtonEl) {
-      keyReminderStyle = '';
-      return;
+  function closeFolderSettings() {
+    if (folderSettingsSaving) return;
+    focusedTemplateEl = null;
+    showFolderSettings = false;
+  }
+
+  async function saveFolderSettings() {
+    if (folderSettingsSaving) return;
+    folderSettingsSaving = true;
+    focusedTemplateEl = null;
+    try {
+      await SaveConfig(config);
+      showFolderSettings = false;
+    } finally {
+      folderSettingsSaving = false;
     }
-    const rect = settingsButtonEl.getBoundingClientRect();
-    const width = 320;
-    const top = rect.bottom + 14;
-    const left = Math.max(16, rect.right - width);
-    keyReminderStyle = `top:${top}px; left:${left}px;`;
-  }
-
-  function showKeyReminderToast() {
-    updateKeyReminderPosition();
-    showKeyReminder = true;
-    keyReminderLeaving = false;
-    clearTimeout(keyReminderTimer);
-    keyReminderTimer = setTimeout(() => dismissKeyReminder(), 6000);
-  }
-
-  function dismissKeyReminder() {
-    keyReminderLeaving = true;
-    clearTimeout(keyReminderTimer);
-    setTimeout(() => { showKeyReminder = false; keyReminderLeaving = false; }, 450);
   }
 
   async function openSettings() {
@@ -1644,53 +1932,6 @@
       slskdWebUIInfo = (info && info.url) ? info : null;
     } catch {
       slskdWebUIInfo = null;
-    }
-  }
-
-  function openSettingsForKey() {
-    dismissKeyReminder();
-    openSettingsAt('access-key-section');
-  }
-  interface KeyGenState {
-    phase: 'idle' | 'loading' | 'success' | 'error';
-    error?: string;
-    expiresAt?: string;
-    downloadLimit?: number;
-  }
-  let keyGen: KeyGenState = { phase: 'idle' };
-
-  async function requestKey() {
-    keyGen = { phase: 'loading' };
-    try {
-      const result = await RequestAccessKey();
-      if (result.ok) {
-        // config.antra_api_key is already saved by the Go backend
-        config = await GetConfig();
-        keyGen = {
-          phase: 'success',
-          expiresAt: result.expires_at,
-          downloadLimit: result.download_limit,
-        };
-      } else {
-        keyGen = { phase: 'error', error: result.error || 'Unknown error. Try again.' };
-      }
-    } catch (e: any) {
-      keyGen = { phase: 'error', error: e?.message || 'Could not reach Antra servers.' };
-    }
-  }
-
-  function formatKeyExpiry(isoStr: string): string {
-    try {
-      const exp = new Date(isoStr);
-      const now = new Date();
-      const diffMs = exp.getTime() - now.getTime();
-      if (diffMs <= 0) return 'expired';
-      const diffH = Math.floor(diffMs / 3600000);
-      const diffM = Math.floor((diffMs % 3600000) / 60000);
-      if (diffH >= 1) return `${diffH}h ${diffM}m remaining`;
-      return `${diffM}m remaining`;
-    } catch {
-      return '';
     }
   }
 
@@ -1860,7 +2101,9 @@
           <button on:click={openDownloadedMusic} title="Downloaded Music" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🎵</button>
           <button on:click={openHistory} title="Library History" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🕒</button>
           <button on:click={() => { showAnalyzer = true; }} title="Audio Analyzer" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🔬</button>
-          <button on:click={() => showFolderSettings = true} title="Library & Folder Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">📁</button>
+          <button on:click={() => { showAvailability = true; availabilityResult = null; availabilityError = ''; }} title="Album Availability Studio" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🌍</button>
+          <button on:click={() => showThemes = true} title="Themes" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">🎨</button>
+          <button on:click={openFolderSettings} title="Library & Folder Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">📁</button>
           <button bind:this={settingsButtonEl} on:click={openSettings} title="Settings" style="background: rgba(255,255,255,0.05); padding: 6px 10px; font-size: 16px; border-color: rgba(255,255,255,0.1); line-height:1;">⚙️</button>
           <div style="width: 1px; height: 20px; background: rgba(255,255,255,0.1); margin: 0 2px;"></div>
           <div class="kofi-wrap">
@@ -1965,41 +2208,38 @@
       <!-- Source health chips + format selector -->
       <div class="source-health-bar">
         {#each healthSources as src}
-          {@const live = !!chipLive[src.key]}
+          {@const live  = !!chipLive[src.key]}
+          {@const isOn  = !!(chipEnabled[src.key])}
           {@const checked = src.key in healthCache}
           <button
             class="health-chip"
-            class:health-chip-disabled={checked && !live}
-            class:health-chip-enabled={live}
-            style={live
+            class:health-chip-disabled={!isOn}
+            class:health-chip-enabled={isOn}
+            style={isOn
               ? `background:${src.bgEnabled};`
               : `background:rgba(0,0,0,0);`}
             on:click={() => handleChipClick(src.key)}
-            title={!checked
-              ? `Check ${src.label} endpoint`
-              : live
-                ? src.key === 'apple'
-                  ? `Apple — AAC / MP3 only`
-                  : `${src.label} — endpoint live`
-                : `${src.label} — endpoint down`}
+            title={isOn
+              ? src.key === 'apple'
+                ? `Apple — AAC / MP3 only (online)`
+                : `${src.label} — online`
+              : `${src.label} — currently unavailable`}
           >
-            {#if !checked}
-              <span class="health-chip-off-badge">···</span>
-            {:else if live}
-              <span class="health-chip-on-badge">live</span>
+            {#if isOn}
+              <span class="health-chip-on-badge">on</span>
             {:else}
-              <span class="health-chip-off-badge">down</span>
+              <span class="health-chip-off-badge">off</span>
             {/if}
             {#if src.key === 'hifi'}
-              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
+              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
             {:else if src.key === 'apple'}
-              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
+              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
             {:else if src.key === 'amazon'}
-              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1}; border-radius: 4px;" />
+              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3}; border-radius: 4px;" />
             {:else if src.key === 'qobuz'}
-              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
+              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
             {:else if src.key === 'deezer'}
-              <img src="/icons/deezer.webp" alt="Deezer" class="health-chip-icon" style="opacity:{(!checked || !live) ? 0.35 : 1};" />
+              <img src="/icons/deezer.webp" alt="Deezer" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
             {/if}
           </button>
         {/each}
@@ -2076,9 +2316,9 @@
             <p>Paste a URL above and press <strong>Add to Library</strong></p>
           </div>
         {:else}
-          {#each trackOrder as trackName (trackName)}
-            {#if trackName.startsWith('__SEP__')}
-              {@const sep = separatorMeta[trackName]}
+          {#each trackOrder as trackKey (trackKey)}
+            {#if trackKey.startsWith('__SEP__')}
+              {@const sep = separatorMeta[trackKey]}
               <div class="tracklist-album-sep">
                 {#if sep?.artwork}
                   <img src={sep.artwork} alt="" class="sep-artwork" />
@@ -2086,7 +2326,8 @@
                 <span class="sep-title">{sep?.title || 'Next album'}</span>
               </div>
             {:else}
-              {@const state = activeTracks[trackName]}
+              {@const state = activeTracks[trackKey]}
+              {@const trackLabel = trackLabels[trackKey] || trackKey}
               {#if state}
                 <div class="track-row"
                   class:track-done={state.status === 'done'}
@@ -2094,11 +2335,11 @@
                   class:track-skipped={state.status === 'skipped'}>
                   <div class="track-row-main">
                     <div class="track-row-head">
-                      <span class="track-row-name">{trackName}</span>
+                      <span class="track-row-name">{trackLabel}</span>
                       {#if state.status === 'failed'}
                         <button
                           class="track-retry-btn"
-                          on:click={() => retryFailedTrack(trackName)}
+                          on:click={() => retryFailedTrack(trackKey)}
                           disabled={isDownloading || !state.trackData || state.retrying}
                           title={isDownloading ? 'Wait for the current download to finish before retrying a single track.' : 'Retry this failed track only'}
                         >
@@ -2323,28 +2564,215 @@
   </div>
 {/if}
 
-<!-- ── Access key reminder toast ─────────────────────────────────────────── -->
-{#if showKeyReminder}
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <!-- svelte-ignore a11y-no-static-element-interactions -->
-  <div
-    class="key-reminder-toast"
-    class:leaving={keyReminderLeaving}
-    style={keyReminderStyle}
-    on:click={openSettingsForKey}
-    on:mouseenter={() => clearTimeout(keyReminderTimer)}
-    on:mouseleave={() => { keyReminderTimer = setTimeout(() => dismissKeyReminder(), 2500); }}
-  >
-    <div class="key-reminder-icon">🔑</div>
-    <div class="key-reminder-body">
-      <p class="key-reminder-title">Hey, Sailor!</p>
-      <p class="key-reminder-text">Don't forget to activate your access key — required to download from Antra's servers.</p>
-      <span class="key-reminder-cta">Open Settings →</span>
+<!-- ── Album Availability Studio ─────────────────────────────────────────── -->
+{#if showAvailability}
+<div class="modal-overlay" on:click={() => showAvailability = false}>
+  <div class="modal-content" on:click|stopPropagation style="max-width: 700px; width: 100%; max-height: 88vh; display: flex; flex-direction: column;">
+
+    <!-- Header -->
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; border-bottom:1px solid rgba(255,255,255,0.08); padding-bottom:16px; margin-bottom:16px; flex-shrink:0;">
+      <div>
+        <h3 style="margin:0 0 4px; color:var(--accent-color); font-size:16px;">🌍 Album Availability Studio</h3>
+        <p style="margin:0; font-size:12px; color:#555; line-height:1.4;">Paste a single Spotify or Deezer album link to inspect label, UPC, country coverage, and a live market view.</p>
+      </div>
+      <button on:click={() => showAvailability = false} style="padding:4px 10px; font-size:12px; flex-shrink:0; margin-left:16px;">✕ Close</button>
     </div>
-    <button class="key-reminder-close" on:click|stopPropagation={dismissKeyReminder} title="Dismiss">×</button>
+
+    <!-- URL input row -->
+    <div style="display:flex; gap:8px; flex-shrink:0; margin-bottom:20px;">
+      <input
+        type="text"
+        bind:value={availabilityUrl}
+        placeholder="https://open.spotify.com/album/... or deezer.com/album/..."
+        style="flex:1; font-size:13px; box-sizing:border-box;"
+        on:keydown={(e) => e.key === 'Enter' && !availabilityLoading && inspectAlbum()}
+      />
+      <button
+        on:click={inspectAlbum}
+        disabled={availabilityLoading || !availabilityUrl.trim()}
+        style="padding:7px 16px; font-size:13px; white-space:nowrap; flex-shrink:0;"
+      >{availabilityLoading ? '⏳ Inspecting…' : '🔍 Inspect Album'}</button>
+    </div>
+
+    <!-- Results / empty state -->
+    <div style="flex:1; overflow-y:auto; padding-right:4px;">
+
+      {#if availabilityError}
+        <div style="background:rgba(255,85,85,0.08); border:1px solid rgba(255,85,85,0.25); border-radius:8px; padding:14px 16px; color:#ff8888; font-size:13px;">
+          ⚠ {availabilityError}
+        </div>
+
+      {:else if availabilityResult}
+        <!-- Album header -->
+        <div style="display:flex; gap:16px; align-items:flex-start; margin-bottom:20px;">
+          {#if availabilityResult.artwork_url}
+            <img src={availabilityResult.artwork_url} alt="" style="width:80px; height:80px; border-radius:8px; object-fit:cover; flex-shrink:0;" />
+          {/if}
+          <div style="flex:1; min-width:0;">
+            <p style="margin:0 0 2px; font-size:16px; font-weight:700; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{availabilityResult.release_name}</p>
+            <p style="margin:0 0 2px; font-size:13px; color:#888;">{availabilityResult.artist}{availabilityResult.year ? ` · ${availabilityResult.year}` : ''}</p>
+            {#if availabilityResult.label}
+              <p style="margin:0 0 2px; font-size:11px; color:#555;">Label: {availabilityResult.label}</p>
+            {/if}
+            {#if availabilityResult.upc}
+              <p style="margin:0; font-size:11px; color:#555; font-family:monospace;">UPC: {availabilityResult.upc}</p>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Stats row -->
+        {#if availabilityResult.stats?.length}
+          <div style="display:flex; flex-wrap:wrap; gap:10px; margin-bottom:20px;">
+            {#each availabilityResult.stats as stat}
+              <div style="background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:10px 16px; text-align:center; flex:1; min-width:90px;">
+                <div style="font-size:20px; font-weight:700; color:var(--accent-color);">{stat.value}</div>
+                <div style="font-size:10px; color:#666; margin-top:2px; white-space:nowrap;">{stat.label}</div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Segments -->
+        {#each (availabilityResult.segments || []) as seg}
+          {#if seg.codes?.length}
+            <div style="margin-bottom:16px;">
+              <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                <div style="width:10px; height:10px; border-radius:50%; background:{availabilityToneColor(seg.tone)}; flex-shrink:0;"></div>
+                <span style="font-size:12px; font-weight:600; color:var(--text-primary);">{seg.label}</span>
+                <span style="font-size:11px; color:#555;">({seg.codes.length})</span>
+              </div>
+              <div style="display:flex; flex-wrap:wrap; gap:4px; padding-left:18px;">
+                {#each seg.codes as code}
+                  <span style="font-size:11px; font-family:monospace; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); border-radius:4px; padding:2px 6px; color:{availabilityToneColor(seg.tone)};">{code}</span>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        {/each}
+
+        <!-- Notes -->
+        {#if availabilityResult.notes?.length}
+          <div style="margin-top:16px; border-top:1px solid rgba(255,255,255,0.05); padding-top:12px;">
+            {#each availabilityResult.notes as note}
+              <p style="margin:0 0 6px; font-size:11px; color:#444; line-height:1.4;">{note}</p>
+            {/each}
+          </div>
+        {/if}
+
+      {:else if !availabilityLoading}
+        <!-- Empty state -->
+        <div style="text-align:center; padding:60px 0; color:#444;">
+          <div style="font-size:52px; margin-bottom:16px; opacity:0.3;">🌍</div>
+          <p style="margin:0; font-size:13px;">Paste a Spotify or Deezer album URL above to see<br>country-by-country availability.</p>
+        </div>
+      {:else}
+        <div style="text-align:center; padding:60px 0; color:#555; font-size:13px;">
+          Probing markets in parallel… this takes up to 30 seconds for Spotify.
+        </div>
+      {/if}
+    </div>
+
   </div>
+</div>
 {/if}
 
+<!-- ── Themes Panel ────────────────────────────────────────────────────────── -->
+{#if showThemes}
+<div class="themes-overlay" on:click={() => showThemes = false}>
+  <div class="themes-panel" on:click|stopPropagation>
+    <div class="themes-header">
+      <div>
+        <h2 class="themes-title">🎨 Themes</h2>
+        <p class="themes-subtitle">Choose from Antra originals or streaming-service-inspired looks. Your selection saves instantly.</p>
+      </div>
+      <button on:click={() => showThemes = false} style="padding: 6px 14px; font-size: 13px; flex-shrink: 0;">Close</button>
+    </div>
+    <div class="themes-body">
+      <div class="themes-section">
+        <div class="themes-section-head">
+          <span class="themes-section-label">ANTRA ORIGINALS</span>
+          <span class="themes-section-sub">Original Themes</span>
+        </div>
+        <div class="themes-grid">
+          {#each THEMES.filter(t => t.cat === 'original') as t}
+            <button
+              class="theme-card{config.theme === t.id || (!config.theme && t.id === 'antra') ? ' theme-card--active' : ''}"
+              on:click={() => applyTheme(t.id)}
+            >
+              <div class="theme-card-preview" style="background:{t.preview}; color:{t.tone};">
+                <div class="theme-card-preview-top">
+                  <span class="theme-card-preview-pill"></span>
+                  <span class="theme-card-preview-pill"></span>
+                  <span class="theme-card-preview-pill"></span>
+                </div>
+                <div class="theme-card-preview-lines">
+                  <span style="width:68%;"></span>
+                  <span style="width:48%;"></span>
+                </div>
+              </div>
+              <div class="theme-card-swatches">
+                {#each t.colors as c}
+                  <div class="theme-card-swatch" style="background:{c};"></div>
+                {/each}
+              </div>
+              <div class="theme-card-name">{t.label}</div>
+              <div class="theme-card-desc">{t.desc}</div>
+              {#if config.theme === t.id || (!config.theme && t.id === 'antra')}
+                <div class="theme-card-active-badge">ACTIVE</div>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="themes-section">
+        <div class="themes-section-head">
+          <span class="themes-section-label">STREAMING SERVICES</span>
+          <span class="themes-section-sub">Resolver-Inspired Themes</span>
+        </div>
+        <div class="themes-grid">
+          {#each THEMES.filter(t => t.cat === 'service') as t}
+            <button
+              class="theme-card{config.theme === t.id ? ' theme-card--active' : ''}"
+              on:click={() => applyTheme(t.id)}
+            >
+              <div class="theme-card-preview" style="background:{t.preview}; color:{t.tone};">
+                <div class="theme-card-preview-top">
+                  <span class="theme-card-preview-pill"></span>
+                  <span class="theme-card-preview-pill"></span>
+                  <span class="theme-card-preview-pill"></span>
+                </div>
+                <div class="theme-card-preview-lines">
+                  <span style="width:68%;"></span>
+                  <span style="width:48%;"></span>
+                </div>
+              </div>
+              <div class="theme-card-swatches">
+                {#each t.colors as c}
+                  <div class="theme-card-swatch" style="background:{c};"></div>
+                {/each}
+              </div>
+              <div style="display:flex; align-items:center; gap:6px; margin-top:2px;">
+                {#if t.icon}
+                  <img src={t.icon} alt="" class="theme-card-icon" />
+                {:else}
+                  <div style="width:14px; height:14px; border-radius:50%; background:{t.colors[2]}; flex-shrink:0; opacity:0.9;"></div>
+                {/if}
+                <div class="theme-card-name">{t.label}</div>
+              </div>
+              <div class="theme-card-desc">{t.desc}</div>
+              {#if config.theme === t.id}
+                <div class="theme-card-active-badge">ACTIVE</div>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{/if}
+
+<!-- ── Downloaded Music Modal ─────────────────────────────────────────────── -->
 {#if showDownloadedMusic}
 <div class="modal-overlay" on:click={() => showDownloadedMusic = false}>
   <div class="modal-content downloaded-modal" on:click|stopPropagation>
@@ -2576,71 +3004,40 @@
     <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
       <!-- ── Antra Access Key ──────────────────────────────────────────────── -->
-      <div id="access-key-section" class="field" style="background: rgba(0,255,204,0.04); border: 1px solid rgba(0,255,204,0.15); border-radius: 8px; padding: 14px 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px; color: var(--accent-color);">🔑 Antra Access Key</p>
-        <p style="font-size: 11px; color: #666; margin: 0 0 12px;">
-          Required to download music from Antra's shared lossless servers (Tidal, Apple Music, Amazon Music, Qobuz, Deezer).
-          Each key is valid for 24 hours or 2000 downloads — whichever comes first.
-        </p>
+      <div id="access-key-section" class="field" style="display:flex; flex-direction:column; gap:12px; padding:0; background:none; border:none;">
 
-        {#if config.antra_api_key && keyGen.phase !== 'success'}
-          <!-- Key already set — show masked key + status + refresh option -->
-          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
-            <input
-              type="password"
-              value={config.antra_api_key}
-              readonly
-              style="flex: 1; box-sizing: border-box; font-family: monospace; font-size: 12px; opacity: 0.7;"
-            />
-            <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Active</span>
-          </div>
+        <!-- Ko-fi promo box -->
+        {#if !config.antra_api_key}
+        <div style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 14px 16px;">
+          <p style="font-size: 13px; font-weight: 700; margin: 0 0 6px; color: var(--accent-color);">🎁 Want the full experience?</p>
+          <p style="font-size: 11.5px; color: var(--text-secondary); margin: 0 0 12px; line-height: 1.5;">
+            Need <strong>unlimited downloads</strong>, <strong>2× faster speed</strong>, and <strong>concurrent downloads</strong>? Support on Ko-fi to get a 30-day key with no limits, then message me on Telegram or Ko-fi and I’ll send your key over.
+          </p>
+          <button
+            on:click={() => BrowserOpenURL('https://ko-fi.com/antraverse')}
+            style="font-size: 12px; padding: 7px 14px; background: var(--accent-color); color: #000; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;"
+          >☕ Support on Ko-fi →</button>
+        </div>
+        {/if}
+
+        <!-- Key input -->
+        <div style="background: rgba(0,255,204,0.03); border: 1px solid rgba(0,255,204,0.12); border-radius: 10px; padding: 14px 16px;">
+          <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px; color: var(--accent-color);">🔑 Supporter Key</p>
+          <p style="font-size: 11px; color: #666; margin: 0 0 12px; line-height: 1.45;">
+            Already a supporter? Message me on Ko-fi or Telegram after supporting to receive your key. Paste it below.
+          </p>
           <div style="display: flex; gap: 8px; align-items: center;">
-            <button
-              on:click={requestKey}
-              disabled={keyGen.phase === 'loading'}
-              style="font-size: 12px; padding: 6px 14px; opacity: {keyGen.phase === 'loading' ? 0.6 : 1};"
-            >
-              {keyGen.phase === 'loading' ? '⏳ Generating…' : '↻ Get New Key'}
-            </button>
-            <span style="font-size: 11px; color: #555;">Key expires after 24h or 2000 downloads</span>
-          </div>
-          {#if keyGen.phase === 'error'}
-            <p style="font-size: 11px; color: #f87171; margin: 8px 0 0;">{keyGen.error}</p>
-          {/if}
-
-        {:else if keyGen.phase === 'success'}
-          <!-- Just generated a new key -->
-          <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
             <input
               type="password"
-              value={config.antra_api_key}
-              readonly
+              bind:value={config.antra_api_key}
+              placeholder="Paste your supporter key here…"
               style="flex: 1; box-sizing: border-box; font-family: monospace; font-size: 12px;"
             />
-            <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Ready</span>
+            {#if config.antra_api_key}
+              <span style="font-size: 11px; color: #86efac; white-space: nowrap; flex-shrink: 0;">✓ Supporter</span>
+            {/if}
           </div>
-          <p style="font-size: 11px; color: #86efac; margin: 0;">
-            ✓ Key saved automatically.
-            {#if keyGen.expiresAt} Valid for {formatKeyExpiry(keyGen.expiresAt)}.{/if}
-            {#if keyGen.downloadLimit} Up to {keyGen.downloadLimit} downloads.{/if}
-          </p>
-
-        {:else}
-          <!-- No key yet — show the Get Key button prominently -->
-          <button
-            on:click={requestKey}
-            disabled={keyGen.phase === 'loading'}
-            style="width: 100%; padding: 10px; font-size: 13px; font-weight: 600; background: rgba(0,255,204,0.12); border: 1px solid rgba(0,255,204,0.3); color: var(--accent-color); border-radius: 6px; cursor: pointer; opacity: {keyGen.phase === 'loading' ? 0.6 : 1};"
-          >
-            {keyGen.phase === 'loading' ? '⏳ Generating your key…' : '✦ Get Access Key'}
-          </button>
-          {#if keyGen.phase === 'error'}
-            <p style="font-size: 11px; color: #f87171; margin: 8px 0 0;">{keyGen.error}</p>
-          {/if}
-          <p style="font-size: 11px; color: #444; margin: 8px 0 0;">
-            One click — no account needed. Key is saved automatically.
-          </p>
-        {/if}
+        </div>
       </div>
 
       <div class="field">
@@ -2653,6 +3050,16 @@
         </label>
 
         <div style="margin-top: 14px;">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" bind:checked={config.strict_matching} style="margin-top: 2px;" />
+            <div>
+              <span style="font-weight: 500; font-size: 13px;">Strict matching mode</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Opt-in safety mode for niche music. Antra uses stricter duration and confidence checks, and will fail uncertain tracks instead of downloading risky matches.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="margin-top: 14px;">
           <label for="maxRetriesModal">Failed track retries</label>
           <p style="font-size: 11px; color: #555; margin: 4px 0 8px;">Automatic retries for transient failures like truncated downloads before a track is marked failed.</p>
           <input
@@ -2663,6 +3070,34 @@
             bind:value={config.max_retries}
             style="width: 96px;"
           />
+        </div>
+      </div>
+
+      <!-- ── Download Source ──────────────────────────────────────────────── -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 6px;">Download Source</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 10px;">Force all downloads through a single service. Auto uses the full resolver chain.</p>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          {#each [
+            { value: 'auto',    label: 'Auto',        icon: null },
+            { value: 'tidal',   label: 'Tidal',       icon: '/icons/tidal.webp' },
+            { value: 'qobuz',   label: 'Qobuz',       icon: '/icons/qobuz.png' },
+            { value: 'apple',   label: 'Apple Music', icon: '/icons/apple-music.png' },
+            { value: 'amazon',  label: 'Amazon',      icon: '/icons/amazon-music.jpg' },
+            { value: 'deezer',  label: 'Deezer',      icon: '/icons/deezer.webp' },
+          ] as src}
+            <button
+              on:click={() => { config.download_source = src.value; }}
+              style="display:inline-flex; align-items:center; gap:5px; padding:5px 10px; font-size:12px; border-radius:99px; border: 1px solid {config.download_source === src.value ? 'var(--accent-color)' : 'rgba(255,255,255,0.12)'}; background:{config.download_source === src.value ? 'rgba(0,255,204,0.1)' : 'transparent'}; color:{config.download_source === src.value ? 'var(--accent-color)' : 'inherit'}; cursor:pointer;"
+            >
+              {#if src.icon}
+                <img src={src.icon} alt="" style="width:14px; height:14px; border-radius:50%; object-fit:contain;" />
+              {:else}
+                <span style="font-weight:700; font-size:11px; width:14px; height:14px; display:inline-flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.15); border-radius:50%;">A</span>
+              {/if}
+              {src.label}
+            </button>
+          {/each}
         </div>
       </div>
 
@@ -2732,8 +3167,14 @@
 
     </div>
 
-    <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.5</p>
+    <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px; display:flex; flex-direction:column; gap:8px; align-items:center;">
+      {#if playlistArtwork}
+        <button
+          on:click={saveCoverArtToLibrary}
+          style="width:100%; font-size:12px; padding:8px; border-color:rgba(0,255,204,0.3); color:var(--accent-color); background:rgba(0,255,204,0.05);"
+        >🖼 Save Cover Art</button>
+      {/if}
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.6</p>
     </div>
   </div>
 </div>
@@ -2741,11 +3182,11 @@
 
 <!-- ── Folder & Library Settings Modal ───────────────────────────────────── -->
 {#if showFolderSettings}
-<div class="modal-overlay" on:click={() => { saveSettings(); showFolderSettings = false; }}>
-  <div class="modal-content" on:click|stopPropagation style="max-height: 88vh; display: flex; flex-direction: column;">
+<div class="modal-overlay" on:click|self={closeFolderSettings} on:keydown={(e) => e.key === 'Escape' && closeFolderSettings()} role="dialog" aria-modal="true" tabindex="-1">
+  <div class="modal-content" on:click|stopPropagation on:keydown|stopPropagation style="max-height: 88vh; display: flex; flex-direction: column;">
     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,204,0.2); padding-bottom: 16px; margin-bottom: 16px; flex-shrink: 0;">
       <h3 style="margin:0; color:var(--accent-color);">📁 Folder Structure</h3>
-      <button on:click={() => { saveSettings(); showFolderSettings = false; }} style="padding: 4px 8px; font-size: 12px;">Save & Close</button>
+      <button on:click={saveFolderSettings} disabled={folderSettingsSaving} style="padding: 4px 8px; font-size: 12px;">{folderSettingsSaving ? 'Saving…' : 'Save & Close'}</button>
     </div>
     <div style="display: flex; flex-direction: column; gap: 16px; overflow-y: auto; flex: 1; padding-right: 4px;">
 
@@ -2780,104 +3221,127 @@
         </div>
       </div>
 
-      <!-- Folder Structure -->
+      <!-- Filenames -->
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Library Layout</p>
-        <p style="font-size: 11px; color: #555; margin: 6px 0 0;">
-          Albums, playlists, and single-track links now have separate layout rules. The filename style below still controls whether files are saved as
-          <code>101 - Title</code>, <code>Title</code>, or <code>Artist - Title</code>.
-        </p>
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 12px;">Filenames</p>
 
-        <div style="display: flex; flex-direction: column; gap: 16px; margin-top: 12px;">
-          <div class="settings-section">
-            <div class="settings-section-title">Albums</div>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="standard" bind:group={config.album_folder_structure} style="margin-top: 2px;" />
-              <div>
-                Artist / Album
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/...</code> Best for Navidrome, Jellyfin, and Plex.</p>
-              </div>
-            </label>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="flat" bind:group={config.album_folder_structure} style="margin-top: 2px;" />
-              <div>
-                Album only
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Album (Year)/...</code> No artist wrapper folder.</p>
-              </div>
-            </label>
+        <div style="display:flex; flex-direction:column; gap:14px;">
+          <div>
+            <label for="singleTplInput" style="font-size:12px; font-weight:500; opacity:0.8; margin-bottom:5px; display:block;">Single track filename</label>
+            <input
+              id="singleTplInput"
+              type="text"
+              bind:value={config.single_track_filename_template}
+              placeholder={'{artist} - {title}'}
+              style="width:100%; box-sizing:border-box; font-family:monospace; font-size:12px;"
+              on:focus={(e) => focusedTemplateEl = e.currentTarget}
+            />
+            {#if config.single_track_filename_template}
+              <p class="tpl-preview">Preview: {renderPreview(config.single_track_filename_template)}.flac</p>
+            {/if}
           </div>
 
-          <div class="settings-section">
-            <div class="settings-section-title">Playlists</div>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="standard" bind:group={config.playlist_folder_structure} style="margin-top: 2px;" />
-              <div>
-                Playlists folder
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Playlists/Playlist Name/...</code> Keeps playlist copies grouped together.</p>
-              </div>
-            </label>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="flat" bind:group={config.playlist_folder_structure} style="margin-top: 2px;" />
-              <div>
-                Root folder
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Playlist Name/...</code> Stores playlist folders directly in your library root.</p>
-              </div>
-            </label>
-          </div>
-
-          <div class="settings-section">
-            <div class="settings-section-title">Single Track Links</div>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="album_numbered" bind:group={config.single_track_structure} style="margin-top: 2px;" />
-              <div>
-                Album folder, numbered
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/101 - Title</code> Single links start at <code>101</code> instead of reusing the original album track number.</p>
-              </div>
-            </label>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="album" bind:group={config.single_track_structure} style="margin-top: 2px;" />
-              <div>
-                Album folder, no forced numbering
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Albums/Artist/Album (Year)/Title</code> Good if you want single links to still live with the album.</p>
-              </div>
-            </label>
-            <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
-              <input type="radio" value="file" bind:group={config.single_track_structure} style="margin-top: 2px;" />
-              <div>
-                Standalone file
-                <p style="font-size: 11px; color: #555; margin: 4px 0 0;"><code>Title</code> or <code>Artist - Title</code> directly in the library root, depending on the filename format you choose below.</p>
-              </div>
-            </label>
+          <div>
+            <label for="albumTplInput" style="font-size:12px; font-weight:500; opacity:0.8; margin-bottom:5px; display:block;">Track filename inside album folder</label>
+            <input
+              id="albumTplInput"
+              type="text"
+              bind:value={config.album_track_filename_template}
+              placeholder={'{track} - {title}'}
+              style="width:100%; box-sizing:border-box; font-family:monospace; font-size:12px;"
+              on:focus={(e) => focusedTemplateEl = e.currentTarget}
+            />
+            {#if config.album_track_filename_template}
+              <p class="tpl-preview">Preview: {renderPreview(config.album_track_filename_template)}.flac</p>
+            {/if}
           </div>
         </div>
       </div>
 
-      <!-- Filename Format -->
+      <!-- Folder Structure -->
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 0;">Filename Format</p>
-        <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="default" bind:group={config.filename_format} />
-            <div>Default <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">01 - Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_only" bind:group={config.filename_format} />
-            <div>Title only <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="artist_title" bind:group={config.filename_format} />
-            <div>Artist – Title <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Artist - Title.flac</span></div>
-          </label>
-          <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
-            <input type="radio" value="title_artist" bind:group={config.filename_format} />
-            <div>Title – Artist <span style="font-size: 11px; opacity: 0.6; margin-left: 4px;">Title - Artist.flac</span></div>
-          </label>
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 12px;">Folder Structure</p>
+
+        <div>
+          <label for="folderTplInput" style="font-size:12px; font-weight:500; opacity:0.8; margin-bottom:5px; display:block;">Folder / directory structure</label>
+          <input
+            id="folderTplInput"
+            type="text"
+            bind:value={config.folder_structure_template}
+            placeholder={'{album_artist}/{year} - {album}'}
+            style="width:100%; box-sizing:border-box; font-family:monospace; font-size:12px;"
+            on:focus={(e) => focusedTemplateEl = e.currentTarget}
+          />
+          {#if config.folder_structure_template}
+            <p class="tpl-preview">Preview: {renderPreview(config.folder_structure_template)}/</p>
+          {/if}
         </div>
+      </div>
+
+      <!-- Formatting & Sanitization -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 12px;">Formatting &amp; Sanitization</p>
+
+        <div style="display:flex; flex-direction:column; gap:12px;">
+          <div style="display:flex; gap:12px; align-items:flex-start;">
+            <div style="flex:1;">
+              <label for="multiDiscHandlingSelect" style="font-size:12px; opacity:0.7; display:block; margin-bottom:4px;">Multi-disc handling</label>
+              <select id="multiDiscHandlingSelect" bind:value={config.multi_disc_handling} style="width:100%;">
+                <option value="">Prefix (2-05 dash format)</option>
+                <option value="dash">2-05 (disc-dash-track)</option>
+                <option value="track_only">05 (track only, no disc)</option>
+                <option value="offset">101 / 201 (disc as leading digit)</option>
+              </select>
+            </div>
+            <div style="flex-shrink:0;">
+              <label for="padInput2" style="font-size:12px; opacity:0.7; display:block; margin-bottom:4px;">Padding digits</label>
+              <input id="padInput2" type="number" min="1" max="4" bind:value={config.track_number_padding} placeholder="2" style="width:64px;" />
+            </div>
+          </div>
+
+          <div style="display:flex; gap:12px; align-items:flex-start;">
+            <div style="flex:1;">
+              <label for="illegalCharReplacementInput" style="font-size:12px; opacity:0.7; display:block; margin-bottom:4px;">Illegal character replacement</label>
+              <input id="illegalCharReplacementInput" type="text" bind:value={config.illegal_character_replacement} placeholder="_" maxlength="4" style="width:100%; box-sizing:border-box; font-family:monospace;" />
+            </div>
+            <div style="flex:1;">
+              <label for="whitespaceHandlingSelect" style="font-size:12px; opacity:0.7; display:block; margin-bottom:4px;">Whitespace handling</label>
+              <select id="whitespaceHandlingSelect" bind:value={config.whitespace_handling} style="width:100%;">
+                <option value="keep">Preserve spaces</option>
+                <option value="underscore">Replace with _</option>
+                <option value="dash">Replace with -</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Variables / token chips -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 6px;">Variables</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 10px;">Click a token to insert it at the cursor in the focused template field above.</p>
+        <div style="display:flex; flex-wrap:wrap; gap:6px;">
+          {#each ['{title}','{artist}','{album_artist}','{album}','{year}','{track}','{disc}','{genre}','{composer}','{isrc}','{codec}','{bitrate}','{quality}'] as tok}
+            <button
+              on:click={() => insertToken(tok)}
+              style="font-family:monospace; font-size:11px; padding:3px 9px; border-radius:6px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.12); cursor:pointer; color:var(--accent-color);"
+            >{tok}</button>
+          {/each}
+        </div>
+      </div>
+
+      <!-- Restore defaults -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 12px;">
+        <button
+          on:click={restoreFolderDefaults}
+          disabled={folderSettingsSaving}
+          style="width:100%; font-size:12px; padding:8px; border-color:rgba(255,255,255,0.15); color:#888; background:rgba(255,255,255,0.02);"
+        >↺ Restore folder defaults</button>
       </div>
 
     </div>
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px;">
-      <button style="width: 100%;" on:click={() => { saveSettings(); showFolderSettings = false; }}>Save & Close</button>
+      <button style="width: 100%;" on:click={saveFolderSettings} disabled={folderSettingsSaving}>{folderSettingsSaving ? 'Saving…' : 'Save Preferences'}</button>
     </div>
   </div>
 </div>
@@ -3016,6 +3480,7 @@
           isDownloading = true;
           logs = [];
           trackOrder = [];
+          trackLabels = {};
           playlistTitle = '';
           playlistArtwork = '';
           playlistArtists = '';
@@ -3026,6 +3491,8 @@
           playlistTotalTracks = 0;
           Object.keys(activeTracks).forEach(clearTrackInterval);
           activeTracks = {};
+          currentPlaylistTrackKeysByIndex = {};
+          currentPlaylistTrackCount = 0;
           separatorMeta = {};
           shouldAutoScroll = true;
           addLog('info', `━━━ Building your music library ━━━`);
@@ -3130,6 +3597,9 @@
             {analyzerExportStatus || 'Export All'}
           </button>
         {/if}
+        {#if analyzerTracks.length > 0}
+          <button class="az-btn-sm" on:click={analyzerReset} title="Remove all files" style="color:#f87171;border-color:rgba(248,113,113,0.25);">Clear All</button>
+        {/if}
         <button class="az-btn-sm" on:click={() => { analyzerReset(); showAnalyzer = false; }}>✕</button>
       </div>
     </div>
@@ -3154,6 +3624,7 @@
               class:dot-done={track.status === 'done'}
               class:dot-error={track.status === 'error'}
             ></span>
+            <button class="az-remove-btn" on:click|stopPropagation={() => analyzerRemoveTrack(i)} title="Remove">✕</button>
           </div>
         {/each}
       </div>
@@ -3221,6 +3692,17 @@
                   <span class="az-meta-value">{row.value}</span>
                 {/each}
               </div>
+              {#if track.stats}
+                <div class="az-stats-panel">
+                  <div class="az-stats-title">📊 Audio Stats</div>
+                  <div class="az-stats-grid">
+                    {#each analyzerFormatStats(track) as row}
+                      <span class="az-stat-label">{row.label}</span>
+                      <span class="az-stat-value">{row.value}</span>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
             {/if}
           </div>
 
@@ -3822,6 +4304,46 @@
   }
   .az-meta-label { color: #555; }
   .az-meta-value { color: #94a3b8; font-family: monospace; font-size: 11px; }
+
+  /* Stats panel */
+  .az-stats-panel {
+    border: 1px solid rgba(0,255,204,0.1);
+    border-radius: 6px;
+    padding: 12px 14px;
+    background: rgba(0,255,204,0.02);
+  }
+  .az-stats-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #555;
+    letter-spacing: 0.06em;
+    margin-bottom: 8px;
+  }
+  .az-stats-grid {
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 4px 12px;
+    font-size: 12px;
+  }
+  .az-stat-label { color: #555; }
+  .az-stat-value { color: var(--accent-color); font-family: monospace; font-size: 11px; }
+
+  /* Remove button in sidebar */
+  .az-remove-btn {
+    background: none;
+    border: none;
+    color: #444;
+    font-size: 10px;
+    padding: 1px 3px;
+    cursor: pointer;
+    border-radius: 3px;
+    flex-shrink: 0;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity 0.12s, color 0.12s;
+  }
+  .az-sidebar-item:hover .az-remove-btn { opacity: 1; }
+  .az-remove-btn:hover { color: #f87171 !important; }
 
   /* Loading */
   .az-loading {
@@ -4750,16 +5272,23 @@
   .discover-select {
     padding: 5px 10px;
     border-radius: 4px;
-    border: 1px solid rgba(255,255,255,0.1);
-    background: var(--surface-light, rgba(255,255,255,0.05));
-    color: white;
+    border: 1px solid rgba(255,255,255,0.15);
+    background: var(--bg-elevated, #1a1a1a);
+    color: var(--text-primary, #fff);
     font-family: inherit;
     font-size: 12px;
+    appearance: none;
+    -webkit-appearance: none;
+    cursor: pointer;
+  }
+  .discover-select:focus {
+    outline: none;
+    border-color: var(--accent-color, rgba(0,255,204,0.5));
   }
 
   .discover-select-genre {
     flex: 1;
-    min-width: 0;
+    min-width: 120px;
   }
 
   .discover-refresh-btn {
@@ -4929,5 +5458,205 @@
   @keyframes fadeIn {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Template preview ───────────────────────────────────────────────────── */
+  .tpl-preview {
+    font-size: 11px;
+    font-family: monospace;
+    color: var(--accent-color);
+    opacity: 0.7;
+    margin: 5px 0 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── Themes Panel ────────────────────────────────────────────────────────── */
+  .themes-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.70);
+    backdrop-filter: blur(6px);
+    z-index: 9990;
+    display: flex;
+    align-items: stretch;
+    justify-content: stretch;
+  }
+  .themes-panel {
+    background: var(--bg-color);
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .themes-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 24px 32px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    flex-shrink: 0;
+  }
+  .themes-title {
+    margin: 0 0 4px;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+  .themes-subtitle {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-muted);
+  }
+  .themes-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 32px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 36px;
+  }
+  .themes-section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .themes-section-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    color: var(--accent-color);
+    text-transform: uppercase;
+  }
+  .themes-section-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .themes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(155px, 1fr));
+    gap: 12px;
+  }
+  .theme-card {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding: 14px 14px 13px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02)),
+      rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 16px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease, box-shadow 0.18s ease;
+    position: relative;
+    box-shadow: 0 14px 30px rgba(0,0,0,0.16);
+  }
+  .theme-card:hover {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03)),
+      rgba(255,255,255,0.035);
+    border-color: rgba(255,255,255,0.18);
+    transform: translateY(-3px);
+    box-shadow: 0 18px 34px rgba(0,0,0,0.22);
+    color: inherit;
+  }
+  .theme-card--active {
+    border-color: var(--accent-color) !important;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03)),
+      rgba(255,255,255,0.04) !important;
+    box-shadow: 0 0 0 1px var(--accent-color) inset, 0 18px 34px rgba(0,0,0,0.2);
+  }
+  .theme-card-preview {
+    height: 74px;
+    border-radius: 12px;
+    padding: 10px 11px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: relative;
+    overflow: hidden;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.12);
+  }
+  .theme-card-preview::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(circle at top right, rgba(255,255,255,0.18), transparent 38%),
+      linear-gradient(180deg, rgba(255,255,255,0.08), transparent 55%);
+    pointer-events: none;
+  }
+  .theme-card-preview-top {
+    display: flex;
+    gap: 5px;
+    position: relative;
+    z-index: 1;
+  }
+  .theme-card-preview-pill {
+    width: 18px;
+    height: 5px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.28;
+  }
+  .theme-card-preview-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    position: relative;
+    z-index: 1;
+  }
+  .theme-card-preview-lines span {
+    display: block;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    opacity: 0.18;
+  }
+  .theme-card-swatches {
+    display: flex;
+    gap: 4px;
+    height: 10px;
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+  .theme-card-swatch {
+    flex: 1;
+  }
+  .theme-card-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+  .theme-card-desc {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.45;
+  }
+  .theme-card-icon {
+    width: 14px;
+    height: 14px;
+    object-fit: contain;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .theme-card-active-badge {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--accent-color);
+    border: 1px solid var(--accent-color);
+    border-radius: 4px;
+    padding: 2px 6px;
+    align-self: flex-start;
+    opacity: 0.9;
   }
 </style>

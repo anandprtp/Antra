@@ -26,6 +26,10 @@ export function ConfirmAmazonLogin() {
   return window['go']['main']['App']['ConfirmAmazonLogin']();
 }
 
+export function GetAlbumAvailability(arg1) {
+  return window['go']['main']['App']['GetAlbumAvailability'](arg1);
+}
+
 export function GetArtistDiscography(arg1) {
   return window['go']['main']['App']['GetArtistDiscography'](arg1);
 }
@@ -52,6 +56,10 @@ export function GetDownloadedRelease(arg1) {
 
 export function GetHistory() {
   return window['go']['main']['App']['GetHistory']();
+}
+
+export function GetKeyInfo() {
+  return window['go']['main']['App']['GetKeyInfo']();
 }
 
 export function GetSlskdWebUIInfo() {
@@ -86,16 +94,16 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
-export function RequestAccessKey() {
-  return window['go']['main']['App']['RequestAccessKey']();
-}
-
 export function RetryTrackDownload(arg1) {
   return window['go']['main']['App']['RetryTrackDownload'](arg1);
 }
 
 export function SaveConfig(arg1) {
   return window['go']['main']['App']['SaveConfig'](arg1);
+}
+
+export function SaveCoverArt(arg1, arg2) {
+  return window['go']['main']['App']['SaveCoverArt'](arg1, arg2);
 }
 
 export function ScanFolder(arg1) {

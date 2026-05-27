@@ -2162,6 +2162,8 @@ def main():
                         help="Generate spectrogram PNG for FILE and print base64 JSON, then exit")
     parser.add_argument("--discography", metavar="ARTIST_URL",
                         help="Fetch artist discography info as JSON and exit")
+    parser.add_argument("--availability-url", metavar="ALBUM_URL",
+                        help="Fetch Spotify/Deezer album availability intel as JSON and exit")
     parser.add_argument("--search-artists", metavar="QUERY",
                         help="Search for artists by name and return scored results as JSON, then exit")
     parser.add_argument("--search-source", default="spotify", choices=["spotify", "apple"],
@@ -2218,6 +2220,17 @@ def main():
                 )
                 info = sp.fetch_artist_discography_info(url)
             print(json.dumps({"type": "discography", "data": info}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.availability_url:
+        try:
+            from antra.core.config import load_config
+            from antra.core.availability import lookup_album_availability
+            cfg = load_config()
+            info = lookup_album_availability(args.availability_url, cfg)
+            print(json.dumps({"type": "availability", "data": info}), flush=True)
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
         sys.exit(0)
@@ -2433,20 +2446,37 @@ def main():
             os.environ["PLAYLIST_FOLDER_STRUCTURE"] = settings.get("playlist_folder_structure") or settings.get("folder_structure") or "standard"
             os.environ["SINGLE_TRACK_STRUCTURE"] = settings.get("single_track_structure") or "album_numbered"
             os.environ["FILENAME_FORMAT"] = settings.get("filename_format") or "default"
+            os.environ["SINGLE_TRACK_FILENAME_TEMPLATE"] = settings.get("single_track_filename_template") or ""
+            os.environ["ALBUM_ZIP_NAME_TEMPLATE"] = settings.get("album_zip_name_template") or ""
+            os.environ["ALBUM_TRACK_FILENAME_TEMPLATE"] = settings.get("album_track_filename_template") or ""
+            os.environ["FOLDER_STRUCTURE_TEMPLATE"] = settings.get("folder_structure_template") or ""
+            os.environ["MULTI_DISC_HANDLING"] = settings.get("multi_disc_handling") or "prefix"
+            os.environ["TRACK_NUMBER_PADDING"] = str(settings.get("track_number_padding") or 2)
+            illegal_character_replacement = settings.get("illegal_character_replacement")
+            os.environ["ILLEGAL_CHARACTER_REPLACEMENT"] = "" if illegal_character_replacement is None else str(illegal_character_replacement)
+            os.environ["WHITESPACE_HANDLING"] = settings.get("whitespace_handling") or "preserve"
+            os.environ["FILENAME_CONFLICT_BEHAVIOR"] = settings.get("filename_conflict_behavior") or "skip"
+            os.environ["FETCH_LYRICS"] = "true" if settings.get("fetch_lyrics", True) else "false"
 
             if "prefer_explicit" in settings:
                 os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
+            if "strict_matching" in settings:
+                os.environ["STRICT_MATCHING"] = "true" if settings["strict_matching"] else "false"
 
             # API key for self-hosted mirror servers
             if settings.get("antra_api_key") is not None:
                 os.environ["ANTRA_API_KEY"] = str(settings.get("antra_api_key") or "")
 
+            # Download source override — routes all downloads through a single service.
+            # "auto" (default) preserves existing quality-aware multi-source behavior.
+            if "download_source" in settings:
+                os.environ["SOURCE_PREFERENCE"] = str(settings.get("download_source") or "auto")
 
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Failed to load config: {e}"}))
 
-    # Source preference is now driven by sources_enabled; keep auto as the resolver default.
-    os.environ["SOURCE_PREFERENCE"] = "auto"
+    # Fall back to "auto" if download_source was not set by the config block above.
+    os.environ.setdefault("SOURCE_PREFERENCE", "auto")
 
     from antra.core.config import load_config
     from antra.utils.organizer import LibraryOrganizer
@@ -2473,7 +2503,7 @@ def main():
     service = AntraService(cfg)
     options = RuntimeOptions(
         output_dir=cfg.output_dir,
-        source_preference="auto",
+        source_preference=cfg.source_preference,
         output_format=cfg.output_format
     )
 
@@ -2487,6 +2517,14 @@ def main():
                 playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
                 single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
+                single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
+                album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
+                folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+                multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
+                track_number_padding=getattr(cfg, "track_number_padding", 2),
+                illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
+                whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
+                filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
             )
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
@@ -2530,6 +2568,14 @@ def main():
             playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
             single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
             filename_format=getattr(cfg, "filename_format", "default"),
+            single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
+            album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
+            folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+            multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
+            track_number_padding=getattr(cfg, "track_number_padding", 2),
+            illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
+            whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
+            filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
         )
     except Exception as e:
         print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
@@ -2570,11 +2616,61 @@ def main():
 
         try:
             print(json.dumps({"type": "log", "level": "info", "message": f"Syncing playlist to library: {url}"}))
-            tracks = service.fetch_playlist_tracks(url, options=options, enrich_override=False)
+            # Progressive page callback — fires after each 1000-track GraphQL page.
+            # First call emits playlist_loaded (partial), subsequent calls emit tracks_appended.
+            _page_state = {"sent": 0}
+            _quality_badge_map = {
+                'lossless': 'LOSSLESS', 'flac': 'LOSSLESS',
+                'alac': 'ALAC',
+                'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
+            }
+
+            def _on_page(tracks_so_far):
+                new_tracks = tracks_so_far[_page_state["sent"]:]
+                if not new_tracks:
+                    return
+                if _page_state["sent"] == 0:
+                    _artwork_p = (
+                        getattr(tracks_so_far[0], "playlist_artwork_url", None)
+                        or getattr(tracks_so_far[0], "artwork_url", None)
+                        or ""
+                    )
+                    _title_p = (
+                        getattr(tracks_so_far[0], "playlist_name", None)
+                        or getattr(tracks_so_far[0], "album", None)
+                        or ""
+                    )
+                    print(json.dumps({
+                        "type": "playlist_loaded",
+                        "partial": True,
+                        "title": _title_p,
+                        "artwork_url": _artwork_p,
+                        "content_type": _infer_playlist_content_type(url, tracks_so_far),
+                        "artists_string": _playlist_artists_string(tracks_so_far),
+                        "release_date": _format_track_release_date(tracks_so_far),
+                        "quality_badge": _quality_badge_map.get(cfg.output_format or '', ''),
+                        "track_count": len(tracks_so_far),
+                        "tracks": [
+                            {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
+                            for t in tracks_so_far
+                        ],
+                    }), flush=True)
+                else:
+                    print(json.dumps({
+                        "type": "tracks_appended",
+                        "tracks": [
+                            {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
+                            for t in new_tracks
+                        ],
+                    }), flush=True)
+                _page_state["sent"] = len(tracks_so_far)
+
+            tracks = service.fetch_playlist_tracks(url, options=options, enrich_override=False, page_callback=_on_page)
 
             # Emit the full tracklist immediately after metadata is fetched,
             # before any individual downloads begin.
-            if tracks:
+            # Skip if progressive callback already sent everything.
+            if tracks and _page_state["sent"] == 0:
                 # Prefer playlist-level artwork (distinct cover) over track album art
                 _artwork_early = (
                     getattr(tracks[0], "playlist_artwork_url", None)
