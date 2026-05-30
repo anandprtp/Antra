@@ -26,6 +26,7 @@ htmlcov/
 # Desktop app build artifacts
 antra-wails/build/bin/
 antra-wails/runtime/backend/
+antra-wails/_pyinstaller_work/
 antra-wails/frontend/dist/
 antra-wails/frontend/node_modules/
 antra-wails/frontend/package.json.md5
