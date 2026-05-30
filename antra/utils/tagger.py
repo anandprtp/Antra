@@ -20,6 +20,8 @@ from mutagen.id3 import (
     TRCK,  # Track number
     TPOS,  # Disc number
     TCON,  # Genre
+    TCOM,  # Composer
+    TPUB,  # Publisher/Label
     APIC,  # Artwork
     USLT,  # Unsynced lyrics
     SYLT,  # Synced lyrics
@@ -54,10 +56,12 @@ def _sniff_image_mime(data: bytes, response_mime: Optional[str]) -> str:
 
 
 class FileTagger:
+    _MAX_EMBEDDED_ART_EDGE = 1000
+
     def __init__(self):
         # Cache artwork by URL so albums only hit the CDN once regardless of
         # how many tracks share the same artwork_url.
-        self._artwork_cache: dict[str, Optional[tuple[bytes, str]]] = {}
+        self._artwork_cache: dict[str, Optional[tuple[bytes, str, int, int, int]]] = {}
 
     def tag(
         self,
@@ -133,16 +137,25 @@ class FileTagger:
             audio["audio_traits"] = track.audio_traits
         if track.spotify_id:
             audio["spotify_id"] = track.spotify_id
+        if track.composer:
+            audio["composer"] = [track.composer]
+        lbl = getattr(track, "label", None)
+        if lbl:
+            audio["organization"] = [lbl]
 
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
-            artwork_data, mime = artwork
+            artwork_data, mime, width, height, depth = artwork
             audio.clear_pictures()
             pic = Picture()
             pic.type = 3  # Cover (front)
             pic.mime = mime
             pic.desc = "Cover"
             pic.data = artwork_data
+            pic.width = width
+            pic.height = height
+            pic.depth = depth
+            pic.colors = 0
             audio.add_picture(pic)
 
         audio.save()
@@ -183,11 +196,16 @@ class FileTagger:
             audio.add(TXXX(encoding=3, desc="AUDIO_TRAITS", text=", ".join(track.audio_traits)))
         if track.spotify_id:
             audio.add(TXXX(encoding=3, desc="SPOTIFYID", text=track.spotify_id))
+        if track.composer:
+            audio.add(TCOM(encoding=3, text=track.composer))
+        lbl = getattr(track, "label", None)
+        if lbl:
+            audio.add(TPUB(encoding=3, text=lbl))
 
         # Artwork
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
-            artwork_data, mime = artwork
+            artwork_data, mime, _width, _height, _depth = artwork
             audio.delall("APIC")
             audio.add(APIC(
                 encoding=3,
@@ -225,10 +243,15 @@ class FileTagger:
             audio["----:com.apple.iTunes:SPOTIFYID"] = [MP4FreeForm(track.spotify_id.encode("utf-8"))]
         if track.isrc:
             audio["----:com.apple.iTunes:ISRC"] = [MP4FreeForm(track.isrc.encode("utf-8"))]
+        if track.composer:
+            audio["\xa9wrt"] = [track.composer]
+        lbl = getattr(track, "label", None)
+        if lbl:
+            audio["----:com.apple.iTunes:LABEL"] = [MP4FreeForm(lbl.encode("utf-8"))]
 
         artwork = self._fetch_artwork(track.artwork_url)
         if artwork:
-            artwork_data, mime = artwork
+            artwork_data, mime, _width, _height, _depth = artwork
             image_format = MP4Cover.FORMAT_PNG if mime == "image/png" else MP4Cover.FORMAT_JPEG
             audio["covr"] = [MP4Cover(artwork_data, imageformat=image_format)]
 
@@ -236,7 +259,7 @@ class FileTagger:
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _fetch_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str]]:
+    def _fetch_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str, int, int, int]]:
         if not url:
             return None
         if url in self._artwork_cache:
@@ -260,21 +283,39 @@ class FileTagger:
         return result
 
     @staticmethod
-    def _normalize_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str]:
+    def _normalize_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str, int, int, int]:
         mime = _sniff_image_mime(data, response_mime)
-        if mime in {"image/jpeg", "image/png"}:
-            return data, mime
-
         if Image is None:
-            return data, mime
+            return data, mime, 0, 0, 0
 
         image = Image.open(BytesIO(data))
-        if image.mode not in ("RGB", "L"):
+        image.load()
+        width, height = image.size
+        if max(width, height) > FileTagger._MAX_EMBEDDED_ART_EDGE:
+            resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            image.thumbnail(
+                (FileTagger._MAX_EMBEDDED_ART_EDGE, FileTagger._MAX_EMBEDDED_ART_EDGE),
+                resampling,
+            )
+            width, height = image.size
+
+        if mime == "image/png" and image.mode in ("RGBA", "LA"):
             image = image.convert("RGB")
+            mime = "image/jpeg"
+        elif image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+            mime = "image/jpeg"
+
+        if mime == "image/png":
+            out = BytesIO()
+            image.save(out, format="PNG", optimize=True)
+            depth = 32 if image.mode == "RGBA" else 8
+            return out.getvalue(), "image/png", width, height, depth
 
         out = BytesIO()
-        image.save(out, format="JPEG", quality=92)
-        return out.getvalue(), "image/jpeg"
+        image = image.convert("RGB")
+        image.save(out, format="JPEG", quality=90, optimize=True)
+        return out.getvalue(), "image/jpeg", width, height, 24
 
     @staticmethod
     def _write_lyrics_sidecars(file_path: str, track: TrackMetadata):

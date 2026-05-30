@@ -29,7 +29,7 @@ from mutagen import File as MutagenFile
 
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter
-from antra.utils.matching import duration_close, score_similarity
+from antra.utils.matching import duration_close, score_similarity, strip_collab
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +166,31 @@ class HifiAdapter(BaseSourceAdapter):
         if not endpoints:
             return None
 
+        # Direct track-ID shortcut — when the source URL was a Tidal URL we already
+        # know the exact Tidal track ID. Skip search and return a result directly
+        # using the best available endpoint (premium first, then community mirrors).
+        if track.tidal_track_id:
+            endpoint = endpoints[0]
+            logger.info("[HiFi] Using known Tidal track ID %s for '%s' via %s", track.tidal_track_id, track.title, endpoint)
+            from antra.core.models import SearchResult, AudioFormat
+            return SearchResult(
+                source=self.name,
+                title=track.title,
+                artists=track.artists,
+                album=track.album,
+                duration_ms=track.duration_ms,
+                audio_format=AudioFormat.FLAC,
+                quality_kbps=None,
+                is_lossless=True,
+                bit_depth=None,
+                sample_rate_hz=None,
+                download_url=None,
+                stream_id=f"{endpoint}|{track.tidal_track_id}",
+                similarity_score=1.0,
+                isrc_match=bool(track.isrc),
+                is_explicit=None,  # Don't copy track.is_explicit — False would trigger _result_looks_clean
+            )
+
         # Try ISRC first (exact match, much faster)
         if track.isrc:
             result = self._search_by_isrc(track, endpoints)
@@ -256,8 +281,8 @@ class HifiAdapter(BaseSourceAdapter):
         self, track: TrackMetadata, endpoints: list[str]
     ) -> Optional[SearchResult]:
         """Text search with similarity scoring."""
-        # Strip parenthetical suffixes for better matching
-        clean_title = re.sub(r"\s*\(.*?\)\s*", "", track.title).strip()
+        # Strip collab credits and parenthetical suffixes for better catalog matching
+        clean_title = strip_collab(re.sub(r"\s*\(.*?\)\s*", "", track.title).strip())
         query = f"{clean_title} {track.primary_artist}"
 
         def _fetch(ep: str) -> Optional[list[dict]]:
@@ -342,6 +367,28 @@ class HifiAdapter(BaseSourceAdapter):
             bit_depth = self._infer_bit_depth(item)
             # Store both the track ID and the endpoint so download() knows where to go
             stream_id = f"{endpoint}|{item['id']}"
+            bit_depth = HifiAdapter._infer_bit_depth(item)
+            source_meta = {}
+            isrc = (item.get("isrc") or "").strip()
+            if isrc:
+                source_meta["isrc"] = isrc
+            if isinstance(item.get("explicit"), bool):
+                source_meta["is_explicit"] = item["explicit"]
+            tn = item.get("track_number") or item.get("trackNumber")
+            if tn is not None:
+                try:
+                    source_meta["track_number"] = int(tn)
+                except (TypeError, ValueError):
+                    pass
+            dn = item.get("disc_number") or item.get("volumeNumber")
+            if dn is not None:
+                try:
+                    source_meta["disc_number"] = int(dn)
+                except (TypeError, ValueError):
+                    pass
+            art = item.get("album", {}).get("imageCoverUrl") or item.get("album", {}).get("cover")
+            if art:
+                source_meta["artwork_url"] = art
             return SearchResult(
                 source=self.name,
                 title=item.get("title", ""),
@@ -356,6 +403,7 @@ class HifiAdapter(BaseSourceAdapter):
                 similarity_score=score,
                 isrc_match=isrc_match,
                 bit_depth=bit_depth,
+                source_metadata=source_meta,
             )
         except Exception as e:
             logger.debug(f"[HiFi] Failed to build SearchResult: {e}")

@@ -94,6 +94,25 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
     def _reset_availability(self):
         self._available = None
 
+    @staticmethod
+    def _has_severe_duration_mismatch(
+        expected_duration_ms: Optional[int],
+        candidate_duration_ms: Optional[int],
+    ) -> bool:
+        if not expected_duration_ms or not candidate_duration_ms:
+            return False
+        expected_s = expected_duration_ms / 1000.0
+        candidate_s = candidate_duration_ms / 1000.0
+        shorter = (
+            candidate_s < expected_s * 0.8
+            and (expected_s - candidate_s) >= 20
+        )
+        longer = (
+            candidate_s > expected_s * 1.3
+            and (candidate_s - expected_s) >= 45
+        )
+        return shorter or longer
+
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         deezer_track_id = getattr(track, "deezer_track_id", None)
         if deezer_track_id:
@@ -131,6 +150,15 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
                 if r.status_code == 200:
                     data = r.json()
                     result_duration_ms = data.get("duration_ms")
+                    if self._has_severe_duration_mismatch(track.duration_ms, result_duration_ms):
+                        logger.info(
+                            "[DeezerMirror] ISRC match for '%s' rejected — severe duration mismatch "
+                            "(expected %.0fs, got %.0fs)",
+                            track.title,
+                            (track.duration_ms or 0) / 1000,
+                            (result_duration_ms or 0) / 1000,
+                        )
+                        return self._text_search(track)
                     # Sanity-check duration to catch cases where two ISRCs
                     # (e.g. Pt. 1 / Pt. 2) resolve to the same catalog track.
                     if track.duration_ms and result_duration_ms:
@@ -162,6 +190,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
                         stream_id=str(data["track_id"]),
                         similarity_score=1.0,
                         isrc_match=True,
+                        source_metadata=_extract_deezer_mirror_source_meta(data),
                     )
             except RateLimitedError:
                 raise
@@ -222,6 +251,8 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
             )
             dur_ms = item.get("duration_ms")
             if dur_ms and track.duration_ms:
+                if self._has_severe_duration_mismatch(track.duration_ms, dur_ms):
+                    continue
                 if not duration_close(track.duration_ms / 1000, dur_ms / 1000, tolerance=5):
                     score *= 0.8
             if score > best_score:
@@ -241,6 +272,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
                     stream_id=str(item["track_id"]),
                     similarity_score=score,
                     isrc_match=False,
+                    source_metadata=_extract_deezer_mirror_source_meta(item),
                 )
 
         if best and best_score >= MIN_SIMILARITY:
@@ -296,3 +328,36 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
 
         logger.info("[DeezerMirror] Downloaded %s (%d bytes)", os.path.basename(final_path), len(decrypted))
         return final_path
+
+    def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
+        msg = str(error).lower()
+        if "duration mismatch" in msg or "preview clip" in msg:
+            return False
+        return True
+
+
+def _extract_deezer_mirror_source_meta(data: dict) -> dict:
+    meta: dict = {}
+    if data.get("isrc"):
+        meta["isrc"] = str(data["isrc"])
+    tn = data.get("track_position") or data.get("trackNumber")
+    if tn is not None:
+        try:
+            meta["track_number"] = int(tn)
+        except (TypeError, ValueError):
+            pass
+    dn = data.get("disk_number") or data.get("discNumber")
+    if dn is not None:
+        try:
+            meta["disc_number"] = int(dn)
+        except (TypeError, ValueError):
+            pass
+    rd = data.get("release_date") or ""
+    if rd:
+        meta["release_date"] = rd[:10] if len(rd) >= 10 else rd
+    if data.get("genre"):
+        g = data["genre"]
+        meta["genres"] = [str(g)] if isinstance(g, str) else list(g)
+    if data.get("label"):
+        meta["label"] = str(data["label"])
+    return meta

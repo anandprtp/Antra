@@ -114,17 +114,25 @@ class ISRCEnricher:
                 if isrc:
                     track_obj.isrc = isrc
                     enriched_count += 1
-                if t.get("album", {}).get("release_date"):
+                preserve_apple_album_identity = (
+                    (getattr(track_obj, "source_service", "") or "").lower() == "apple"
+                    and (getattr(track_obj, "request_kind", "") or "").lower() == "album"
+                )
+                if t.get("album", {}).get("release_date") and not preserve_apple_album_identity:
                     rel = t["album"]["release_date"]
                     track_obj.release_date = rel
                     track_obj.release_year = int(rel[:4]) if len(rel) >= 4 else None
-                if t.get("track_number"):
+                if t.get("track_number") and not preserve_apple_album_identity:
                     track_obj.track_number = t["track_number"]
                 # Spotify v1 /tracks includes disc_number — fill it in
                 # when missing so _stamp_disc_totals() can compute total_discs
                 # correctly for multi-disc albums (e.g. anonymous Spotify path
                 # or Amazon Music tracks whose spotify_id was resolved).
-                if track_obj.disc_number is None and t.get("disc_number"):
+                if (
+                    not preserve_apple_album_identity
+                    and track_obj.disc_number is None
+                    and t.get("disc_number")
+                ):
                     track_obj.disc_number = t["disc_number"]
 
         enriched_count = 0

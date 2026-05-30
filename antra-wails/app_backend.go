@@ -23,49 +23,62 @@ import (
 )
 
 type Config struct {
-	DownloadPath            string   `json:"download_path"`
-	AppleEnabled            bool     `json:"apple_enabled"`
-	AppleAuthorizationToken string   `json:"apple_authorization_token,omitempty"`
-	AppleMusicUserToken     string   `json:"apple_music_user_token,omitempty"`
-	AppleStorefront         string   `json:"apple_storefront,omitempty"`
-	AppleWVDPath            string   `json:"apple_wvd_path,omitempty"`
-	AmazonEnabled           bool     `json:"amazon_enabled"`
-	AmazonDirectCredsJSON   string   `json:"amazon_direct_creds_json,omitempty"`
-	AmazonWVDPath           string   `json:"amazon_wvd_path,omitempty"`
-	AmazonRegion            string   `json:"amazon_region,omitempty"`
-	QobuzEnabled            bool     `json:"qobuz_enabled"`
-	QobuzEmail              string   `json:"qobuz_email,omitempty"`
-	QobuzPassword           string   `json:"qobuz_password,omitempty"`
-	QobuzAppID              string   `json:"qobuz_app_id,omitempty"`
-	QobuzAppSecret          string   `json:"qobuz_app_secret,omitempty"`
-	QobuzUserAuthToken      string   `json:"qobuz_user_auth_token,omitempty"`
-	DeezerARLToken          string   `json:"deezer_arl_token,omitempty"`
-	DeezerBFSecret          string   `json:"deezer_bf_secret,omitempty"`
-	SoulseekEnabled         bool     `json:"soulseek_enabled"`
-	SoulseekUsername        string   `json:"soulseek_username,omitempty"`
-	SoulseekPassword        string   `json:"soulseek_password,omitempty"`
-	SoulseekSeedAfterDL     bool     `json:"soulseek_seed_after_download"`
-	SourcesEnabled          []string `json:"sources_enabled,omitempty"`
-	FirstRunComplete        bool     `json:"first_run_complete"`
-	OutputFormat            string   `json:"output_format,omitempty"`
-	MaxRetries              int      `json:"max_retries,omitempty"`
-	LibraryMode             string   `json:"library_mode,omitempty"`
-	PreferExplicit          *bool    `json:"prefer_explicit,omitempty"`
-	FolderStructure         string   `json:"folder_structure,omitempty"`
-	AlbumFolderStructure    string   `json:"album_folder_structure,omitempty"`
-	PlaylistFolderStructure string   `json:"playlist_folder_structure,omitempty"`
-	SingleTrackStructure    string   `json:"single_track_structure,omitempty"`
-	FilenameFormat          string   `json:"filename_format,omitempty"`
-	SpotifySpDc             string   `json:"spotify_sp_dc,omitempty"`
-	TidalEnabled            bool     `json:"tidal_enabled"`
-	TidalAuthMode           string   `json:"tidal_auth_mode,omitempty"`
-	TidalSessionJSON        string   `json:"tidal_session_json,omitempty"`
-	TidalAccessToken        string   `json:"tidal_access_token,omitempty"`
-	TidalRefreshToken       string   `json:"tidal_refresh_token,omitempty"`
-	TidalSessionID          string   `json:"tidal_session_id,omitempty"`
-	TidalTokenType          string   `json:"tidal_token_type,omitempty"`
-	TidalCountryCode        string   `json:"tidal_country_code,omitempty"`
-	AntraApiKey             string   `json:"antra_api_key,omitempty"`
+	DownloadPath                string   `json:"download_path"`
+	AppleEnabled                bool     `json:"apple_enabled"`
+	AppleAuthorizationToken     string   `json:"apple_authorization_token,omitempty"`
+	AppleMusicUserToken         string   `json:"apple_music_user_token,omitempty"`
+	AppleStorefront             string   `json:"apple_storefront,omitempty"`
+	AppleWVDPath                string   `json:"apple_wvd_path,omitempty"`
+	AmazonEnabled               bool     `json:"amazon_enabled"`
+	AmazonDirectCredsJSON       string   `json:"amazon_direct_creds_json,omitempty"`
+	AmazonWVDPath               string   `json:"amazon_wvd_path,omitempty"`
+	AmazonRegion                string   `json:"amazon_region,omitempty"`
+	QobuzEnabled                bool     `json:"qobuz_enabled"`
+	QobuzEmail                  string   `json:"qobuz_email,omitempty"`
+	QobuzPassword               string   `json:"qobuz_password,omitempty"`
+	QobuzAppID                  string   `json:"qobuz_app_id,omitempty"`
+	QobuzAppSecret              string   `json:"qobuz_app_secret,omitempty"`
+	QobuzUserAuthToken          string   `json:"qobuz_user_auth_token,omitempty"`
+	DeezerARLToken              string   `json:"deezer_arl_token,omitempty"`
+	DeezerBFSecret              string   `json:"deezer_bf_secret,omitempty"`
+	SoulseekEnabled             bool     `json:"soulseek_enabled"`
+	SoulseekUsername            string   `json:"soulseek_username,omitempty"`
+	SoulseekPassword            string   `json:"soulseek_password,omitempty"`
+	SoulseekSeedAfterDL         bool     `json:"soulseek_seed_after_download"`
+	SourcesEnabled              []string `json:"sources_enabled,omitempty"`
+	FirstRunComplete            bool     `json:"first_run_complete"`
+	OutputFormat                string   `json:"output_format,omitempty"`
+	MaxRetries                  int      `json:"max_retries,omitempty"`
+	LibraryMode                 string   `json:"library_mode,omitempty"`
+	PreferExplicit              *bool    `json:"prefer_explicit,omitempty"`
+	StrictMatching              bool     `json:"strict_matching"`
+	FolderStructure             string   `json:"folder_structure,omitempty"`
+	AlbumFolderStructure        string   `json:"album_folder_structure,omitempty"`
+	PlaylistFolderStructure     string   `json:"playlist_folder_structure,omitempty"`
+	SingleTrackStructure        string   `json:"single_track_structure,omitempty"`
+	FilenameFormat              string   `json:"filename_format,omitempty"`
+	SingleTrackFilenameTemplate string   `json:"single_track_filename_template,omitempty"`
+	AlbumZipNameTemplate        string   `json:"album_zip_name_template,omitempty"`
+	AlbumTrackFilenameTemplate  string   `json:"album_track_filename_template,omitempty"`
+	FolderStructureTemplate     string   `json:"folder_structure_template,omitempty"`
+	MultiDiscHandling           string   `json:"multi_disc_handling,omitempty"`
+	TrackNumberPadding          int      `json:"track_number_padding,omitempty"`
+	IllegalCharacterReplacement string   `json:"illegal_character_replacement,omitempty"`
+	WhitespaceHandling          string   `json:"whitespace_handling,omitempty"`
+	FilenameConflictBehavior    string   `json:"filename_conflict_behavior,omitempty"`
+	FetchLyrics                 bool     `json:"fetch_lyrics"`
+	SpotifySpDc                 string   `json:"spotify_sp_dc,omitempty"`
+	TidalEnabled                bool     `json:"tidal_enabled"`
+	TidalAuthMode               string   `json:"tidal_auth_mode,omitempty"`
+	TidalSessionJSON            string   `json:"tidal_session_json,omitempty"`
+	TidalAccessToken            string   `json:"tidal_access_token,omitempty"`
+	TidalRefreshToken           string   `json:"tidal_refresh_token,omitempty"`
+	TidalSessionID              string   `json:"tidal_session_id,omitempty"`
+	TidalTokenType              string   `json:"tidal_token_type,omitempty"`
+	TidalCountryCode            string   `json:"tidal_country_code,omitempty"`
+	AntraApiKey                 string   `json:"antra_api_key,omitempty"`
+	Theme                       string   `json:"theme,omitempty"`
+	DownloadSource              string   `json:"download_source,omitempty"`
 }
 
 type HistoryItem struct {
@@ -123,6 +136,12 @@ func (a *App) GetConfig() Config {
 		cfg.AlbumFolderStructure = "standard"
 		cfg.PlaylistFolderStructure = "standard"
 		cfg.SingleTrackStructure = "album_numbered"
+		cfg.MultiDiscHandling = "prefix"
+		cfg.TrackNumberPadding = 2
+		cfg.IllegalCharacterReplacement = "_"
+		cfg.WhitespaceHandling = "preserve"
+		cfg.FilenameConflictBehavior = "skip"
+		cfg.FetchLyrics = true
 		return cfg
 	}
 
@@ -134,6 +153,9 @@ func (a *App) GetConfig() Config {
 	}
 
 	json.Unmarshal(data, &cfg)
+	if !bytes.Contains(data, []byte(`"fetch_lyrics"`)) {
+		cfg.FetchLyrics = true
+	}
 	if cfg.DownloadPath == "" {
 		userProfile := os.Getenv("USERPROFILE")
 		if userProfile == "" {
@@ -171,6 +193,21 @@ func (a *App) GetConfig() Config {
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"
 	}
+	if cfg.MultiDiscHandling == "" {
+		cfg.MultiDiscHandling = "prefix"
+	}
+	if cfg.TrackNumberPadding <= 0 {
+		cfg.TrackNumberPadding = 2
+	}
+	if cfg.IllegalCharacterReplacement == "" {
+		cfg.IllegalCharacterReplacement = "_"
+	}
+	if cfg.WhitespaceHandling == "" {
+		cfg.WhitespaceHandling = "preserve"
+	}
+	if cfg.FilenameConflictBehavior == "" {
+		cfg.FilenameConflictBehavior = "skip"
+	}
 	return cfg
 }
 
@@ -206,6 +243,21 @@ func (a *App) SaveConfig(cfg Config) error {
 	}
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"
+	}
+	if cfg.MultiDiscHandling == "" {
+		cfg.MultiDiscHandling = "prefix"
+	}
+	if cfg.TrackNumberPadding <= 0 {
+		cfg.TrackNumberPadding = 2
+	}
+	if cfg.IllegalCharacterReplacement == "" {
+		cfg.IllegalCharacterReplacement = "_"
+	}
+	if cfg.WhitespaceHandling == "" {
+		cfg.WhitespaceHandling = "preserve"
+	}
+	if cfg.FilenameConflictBehavior == "" {
+		cfg.FilenameConflictBehavior = "skip"
 	}
 	dir := getAppDataDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -398,6 +450,9 @@ func (a *App) startBackendProcess(
 
 	go func() {
 		scanner := bufio.NewScanner(stdout)
+		// Large playlist metadata events can exceed Scanner's default 64 KiB cap.
+		// Raise it so 1000+ track payloads still reach the frontend intact.
+		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
 			a.mu.Lock()
 			stopping := a.isStopping
@@ -1000,6 +1055,54 @@ func (a *App) GetDiscoveryGenres(region string) string {
 	return string(bytes.TrimSpace(out))
 }
 
+// GetAlbumAvailability fetches country-by-country availability for a Spotify or
+// Deezer album URL. Returns a JSON string with service, segments, stats, and
+// artwork. Takes ~5-30s for Spotify (probes every market in parallel).
+func (a *App) GetAlbumAvailability(url string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	backend, err := ensureBundledBackend()
+	var out []byte
+	if err == nil {
+		cmd := exec.CommandContext(ctx, backend, "--availability-url", url, "--config", getConfigPath())
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	} else {
+		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
+		if resolveErr != nil {
+			return `{"error":"could not resolve backend"}`
+		}
+		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--availability-url", url, "--config", getConfigPath())
+		cmd.Dir = workDir
+		cmd.Env = env
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	}
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"availability lookup timed out (120s)"}`
+		}
+		errMsg := strings.ReplaceAll(strings.TrimSpace(string(out)), `"`, `'`)
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		return `{"error":"` + errMsg + `"}`
+	}
+
+	var wrapper map[string]interface{}
+	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
+		return string(out)
+	}
+	if wrapper["type"] == "error" {
+		msg, _ := wrapper["message"].(string)
+		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+	}
+	result, _ := json.Marshal(wrapper["data"])
+	return string(result)
+}
+
 func (a *App) GetSpotifyStatus() string {
 	output, err := a.runPythonCommand([]string{"spotify", "status", "--json"})
 	if err != nil {
@@ -1049,11 +1152,27 @@ func (a *App) SetSpotifyToken(token string) string {
 	return `{"success": true, "message": "` + strings.TrimSpace(output) + `"}`
 }
 
+// isSupporterKey returns true when the configured API key is a supporter (admin)
+// key.  The check is lightweight: it calls GET /api/keys/validate on the Tidal
+// mirror.  A failure (offline server, no key) returns false so downloads still
+// work — they just use the single-worker default.
+func (a *App) isSupporterKey() bool {
+	info := a.GetKeyInfo()
+	return info.Valid && info.IsSupporter
+}
+
 func (a *App) resolveBackendCommand(playlists []string) (string, []string, string, []string, error) {
+	// Determine concurrent-worker count: 2 for supporter keys, 1 for everyone else.
+	maxWorkers := "1"
+	if a.isSupporterKey() {
+		maxWorkers = "2"
+	}
+	extraEnv := []string{"PYTHONUTF8=1", "ANTRA_MAX_WORKERS=" + maxWorkers}
+
 	if bundledBackend, err := ensureBundledBackend(); err == nil {
 		args := append([]string{}, playlists...)
 		args = append(args, "--config", getConfigPath())
-		return bundledBackend, args, filepath.Dir(bundledBackend), append(os.Environ(), "PYTHONUTF8=1"), nil
+		return bundledBackend, args, filepath.Dir(bundledBackend), append(os.Environ(), extraEnv...), nil
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", nil, "", nil, fmt.Errorf("failed to prepare bundled backend: %w", err)
 	}
@@ -1095,7 +1214,7 @@ func (a *App) resolveBackendCommand(playlists []string) (string, []string, strin
 	args := []string{jsonCliScript}
 	args = append(args, playlists...)
 	args = append(args, "--config", getConfigPath())
-	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir), "PYTHONUTF8=1")
+	env := append(os.Environ(), fmt.Sprintf("PYTHONPATH=%s", parentDir), "PYTHONUTF8=1", "ANTRA_MAX_WORKERS="+maxWorkers)
 	return pythonExe, args, parentDir, env, nil
 }
 
@@ -1526,86 +1645,140 @@ func (a *App) CheckSourceHealth(source string) string {
 	return string(b)
 }
 
-// ── Self-serve key generation ─────────────────────────────────────────────────
+// ── Key info ──────────────────────────────────────────────────────────────────
 
-// KeyGenResult is returned by RequestAccessKey to the Svelte frontend.
-type KeyGenResult struct {
-	OK            bool   `json:"ok"`
-	Key           string `json:"key,omitempty"`
-	ExpiresAt     string `json:"expires_at,omitempty"`
-	DownloadLimit int    `json:"download_limit,omitempty"`
-	Error         string `json:"error,omitempty"`
+// KeyInfoResult is returned by GetKeyInfo to the Svelte frontend.
+// It tells the app whether the current key is a supporter (admin) key and
+// exposes the daily usage so the UI can show remaining quota.
+type KeyInfoResult struct {
+	Valid         bool                   `json:"valid"`
+	IsSupporter   bool                   `json:"is_supporter"`
+	KeyType       string                 `json:"key_type,omitempty"`
+	ExpiresAt     string                 `json:"expires_at,omitempty"`
+	DownloadLimit int                    `json:"download_limit,omitempty"`
+	DownloadCount int                    `json:"download_count,omitempty"`
+	UsageToday    map[string]interface{} `json:"usage_today,omitempty"`
+	Error         string                 `json:"error,omitempty"`
 }
 
-// RequestAccessKey calls the VPS key-generation endpoint, saves the returned
-// key into the local config, and returns the result to the frontend.
-//
-// The VPS URL is read from the endpoint manifest (mirrors.tidal field).
-// If the manifest is unavailable, the function returns an error.
-func (a *App) RequestAccessKey() KeyGenResult {
-	// 1. Load the manifest to discover the Tidal mirror URL.
+// GetKeyInfo validates the currently configured Antra API key against the VPS
+// and returns supporter status + daily usage.  The result is used by the
+// frontend to show quota info and by resolveBackendCommand to enable 2-worker
+// mode for supporter keys.
+func (a *App) GetKeyInfo() KeyInfoResult {
+	cfg := a.GetConfig()
+	key := strings.TrimSpace(cfg.AntraApiKey)
+	if key == "" {
+		// Try manifest key as fallback
+		manifest := loadEndpointManifest()
+		key = strings.TrimSpace(manifest.ApiKey)
+	}
+	if key == "" {
+		return KeyInfoResult{Valid: false, Error: "No API key configured."}
+	}
+
 	manifest := loadEndpointManifest()
 	tidalURL := strings.TrimRight(manifest.Mirrors.Tidal, "/")
 	if tidalURL == "" {
-		return KeyGenResult{
-			OK:    false,
-			Error: "Could not reach Antra servers. Check your internet connection and try again.",
-		}
+		return KeyInfoResult{Valid: false, Error: "Could not reach Antra servers."}
 	}
 
-	// 2. POST to the key-generation endpoint.
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(tidalURL+"/api/keys/generate", "application/json", nil)
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, tidalURL+"/api/keys/validate", nil)
 	if err != nil {
-		return KeyGenResult{
-			OK:    false,
-			Error: "Could not reach Antra servers. Check your internet connection and try again.",
-		}
+		return KeyInfoResult{Valid: false, Error: err.Error()}
+	}
+	req.Header.Set("X-API-Key", key)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return KeyInfoResult{Valid: false, Error: "Could not reach Antra servers."}
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 403 {
+		return KeyInfoResult{Valid: false, Error: "API key is invalid or expired."}
+	}
+	if resp.StatusCode != 200 {
+		return KeyInfoResult{Valid: false, Error: fmt.Sprintf("Server returned %d.", resp.StatusCode)}
+	}
 
-	if resp.StatusCode == 429 {
-		// Rate-limited — parse the detail message from the VPS response.
-		var detail struct {
-			Detail string `json:"detail"`
+	var result KeyInfoResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return KeyInfoResult{Valid: false, Error: "Unexpected response from server."}
+	}
+	return result
+}
+
+// SaveCoverArt downloads the album/playlist cover art at maximum resolution
+// and saves it to the library root folder.
+func (a *App) SaveCoverArt(artworkUrl string, title string) string {
+	cfg := a.GetConfig()
+	libraryRoot := strings.TrimSpace(cfg.DownloadPath)
+	if libraryRoot == "" {
+		return "error: no music library folder configured"
+	}
+
+	// Upgrade URL to 3000x3000 hi-res
+	// Apple Music: {w}x{h}bb → 3000x3000bb
+	// Spotify: no dimension tokens — use as-is (largest available)
+	hiResURL := regexp.MustCompile(`\{\w\}x\{\w\}bb`).ReplaceAllString(artworkUrl, "3000x3000bb")
+	hiResURL = regexp.MustCompile(`\d+x\d+bb`).ReplaceAllString(hiResURL, "3000x3000bb")
+
+	// Sanitize title for filename
+	safeTitle := strings.Map(func(r rune) rune {
+		if strings.ContainsRune(`<>:"/\|?*`, r) {
+			return '_'
 		}
-		if json.Unmarshal(body, &detail) == nil && detail.Detail != "" {
-			return KeyGenResult{OK: false, Error: detail.Detail}
-		}
-		return KeyGenResult{OK: false, Error: "You already have an active key. Try again in 24 hours."}
+		return r
+	}, strings.TrimSpace(title))
+	if safeTitle == "" {
+		safeTitle = "cover"
+	}
+	safeTitle = strings.TrimRight(safeTitle, ". ")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(hiResURL)
+	if err != nil {
+		return fmt.Sprintf("error: failed to download cover art — %v", err)
 	}
 
 	if resp.StatusCode != 200 {
-		return KeyGenResult{
-			OK:    false,
-			Error: fmt.Sprintf("Server returned an error (%d). Try again later.", resp.StatusCode),
+		resp.Body.Close()
+		resp2, err2 := client.Get(artworkUrl)
+		if err2 != nil {
+			return fmt.Sprintf("error: failed to download cover art — %v", err2)
 		}
+		resp = resp2
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			return fmt.Sprintf("error: server returned %d", resp.StatusCode)
+		}
+		hiResURL = artworkUrl
+	}
+	defer resp.Body.Close()
+
+	// Determine extension from content-type or URL
+	contentType := resp.Header.Get("Content-Type")
+	ext := ".jpg"
+	if strings.Contains(contentType, "png") {
+		ext = ".png"
+	} else if strings.Contains(contentType, "webp") {
+		ext = ".webp"
 	}
 
-	// 3. Parse the response.
-	var result struct {
-		Key           string `json:"key"`
-		ExpiresAt     string `json:"expires_at"`
-		DownloadLimit int    `json:"download_limit"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil || result.Key == "" {
-		return KeyGenResult{OK: false, Error: "Unexpected response from server. Try again later."}
+	outPath := filepath.Join(libraryRoot, safeTitle+ext)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Sprintf("error: failed to read cover art — %v", err)
 	}
 
-	// 4. Save the key into the local config so it takes effect immediately.
-	cfg := a.GetConfig()
-	cfg.AntraApiKey = result.Key
-	if err := a.SaveConfig(cfg); err != nil {
-		wailsRuntime.LogErrorf(a.ctx, "RequestAccessKey: failed to save config: %v", err)
-		// Still return the key — user can paste it manually.
+	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		return fmt.Sprintf("error: %v", err)
+	}
+	if err := os.WriteFile(outPath, data, 0644); err != nil {
+		return fmt.Sprintf("error: failed to save cover art — %v", err)
 	}
 
-	return KeyGenResult{
-		OK:            true,
-		Key:           result.Key,
-		ExpiresAt:     result.ExpiresAt,
-		DownloadLimit: result.DownloadLimit,
-	}
+	return fmt.Sprintf("ok: %s", outPath)
 }

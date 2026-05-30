@@ -504,12 +504,16 @@ class AppleAdapter(BaseSourceAdapter):
     """
     Apple Music adapter.
 
-    When the mirror API is available, this can download Apple lossless ALAC.
-    Direct-account fallback may still return AAC depending on the available path.
+    When the mirror API is available AND wrapper is running on the server,
+    this downloads true lossless ALAC via /api/stream/{track_id}.
+    Falls back to the Widevine/CENC AAC path when wrapper is unavailable.
     """
 
     name = "apple"
-    always_lossy = True  # Apple only used in AAC mode; skipped entirely in lossless mode
+    # always_lossy is set dynamically in __init__ based on whether the mirror
+    # has wrapper (lossless) available.  Default True = skip in lossless mode
+    # until we confirm the mirror can serve ALAC.
+    always_lossy = True
 
     def __init__(
         self,
@@ -529,6 +533,11 @@ class AppleAdapter(BaseSourceAdapter):
         })
         self._preferred_output_format = (preferred_output_format or "source").lower()
         self._prefer_lossy_download = self._preferred_output_format in {"aac", "mp3", "m4a"}
+        self._require_lossless_download = self._preferred_output_format in {
+            "flac", "lossless", "alac",
+            "lossless-16", "lossless-24",
+            "alac-16", "alac-24",
+        }
         if mirror_api_key:
             self._session.headers["X-API-Key"] = mirror_api_key
         self._odesli = OdesliEnricher(api_key=api_key)
@@ -623,36 +632,94 @@ class AppleAdapter(BaseSourceAdapter):
         except Exception:
             return False
 
-        if self._direct and self._direct.is_configured():
-            return True
+        # Always probe mirrors for wrapper availability when mirrors are configured,
+        # even when direct credentials are present. Without this, always_lossy stays
+        # True and the wrapper ALAC path is never used for Apple Music URLs in ALAC mode.
         if self._mirrors:
             try:
                 self._get_working_mirror()
-                return True
+                self._probe_wrapper_availability()
             except Exception:
-                return False
+                pass  # Mirror unreachable — keep always_lossy as-is; direct may still work
+
+        if self._direct and self._direct.is_configured():
+            return True
+        if self._mirrors:
+            return bool(self._current_mirror or self._mirrors)
         return False
+
+    def _probe_wrapper_availability(self) -> None:
+        """
+        Ask the mirror's /status endpoint whether wrapper is running.
+        If yes, flip always_lossy=False so the resolver includes Apple in
+        lossless mode and the download path uses /api/stream/.
+        """
+        try:
+            mirror = self._get_working_mirror()
+            r = self._session.get(f"{mirror}/status", timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("wrapper_lossless_available"):
+                    if self.always_lossy:
+                        logger.info(
+                            "[Apple] Wrapper detected on mirror — enabling lossless ALAC mode"
+                        )
+                    self.always_lossy = False
+                    return
+        except Exception as e:
+            logger.debug("[Apple] Wrapper probe failed: %s", e)
+        # No wrapper — stay lossy-only
+        self.always_lossy = True
 
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         apple_id = None
         bit_depth: Optional[int] = None
         sample_rate: Optional[int] = None
         isrc_match = False
+        lossless_hint = False
         track_traits = [str(trait).lower() for trait in (getattr(track, "audio_traits", None) or [])]
 
         # Preserve quality information already discovered from the Apple URL itself.
+        # Apple catalog traits are not precise enough to infer 16/44 vs 24/48 vs 24/96
+        # reliably, so only keep a generic lossless hint unless an exact proxy/header
+        # value later fills in the concrete numbers.
         if "hi-res-lossless" in track_traits:
+            lossless_hint = True
             bit_depth = 24
-            sample_rate = 96000
         elif "lossless" in track_traits:
-            bit_depth = 16
-            sample_rate = 44100
+            lossless_hint = True
 
         # Fast path: Apple Music ID is already known (track came from an Apple Music URL).
         if getattr(track, "apple_music_id", None):
             apple_id = track.apple_music_id
             isrc_match = True
             logger.info(f"[Apple] Using known Apple Music ID {apple_id} for '{track.title}'")
+
+        # Even when the Apple Music ID is already known, still ask the proxy for
+        # ISRC-level quality metadata when available. Apple catalog traits often
+        # only tell us "lossless" vs "hi-res-lossless", while the proxy can
+        # return the concrete bit depth / sample rate that the desktop UI should
+        # show before the actual download begins.
+        if track.isrc and self._mirrors and not self._prefer_lossy_download:
+            try:
+                mirror = self._get_working_mirror()
+                r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    proxy_track_id = str(data.get("track_id") or "")
+                    if not apple_id and proxy_track_id:
+                        apple_id = proxy_track_id
+                    if not apple_id or not proxy_track_id or proxy_track_id == str(apple_id):
+                        bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
+                        isrc_match = True
+                        logger.info(
+                            f"[Apple] Enriched {track.isrc} with proxy quality metadata "
+                            f"for Apple Music ID {apple_id or proxy_track_id}"
+                        )
+                else:
+                    logger.warning(f"[Apple] ISRC mirror lookup HTTP {r.status_code} for {track.isrc}")
+            except Exception as e:
+                logger.warning(f"[Apple] ISRC proxy search failed: {e}")
 
         # Prefer direct account lookup when available so Apple downloads work
         # without a mirror dependency.
@@ -664,11 +731,10 @@ class AppleAdapter(BaseSourceAdapter):
                     apple_id = song.get("id")
                     traits = attrs.get("audioTraits", [])
                     if "hi-res-lossless" in traits:
+                        lossless_hint = True
                         bit_depth = 24
-                        sample_rate = 96000
                     elif "lossless" in traits:
-                        bit_depth = 16
-                        sample_rate = 44100
+                        lossless_hint = True
                     isrc_match = True
                     logger.info(f"[Apple-Direct] Resolved {track.isrc} → Apple Music ID: {apple_id}")
             except Exception as e:
@@ -743,29 +809,21 @@ class AppleAdapter(BaseSourceAdapter):
                     song = self._direct.get_catalog_song(str(apple_id))
                     traits = song.get("attributes", {}).get("audioTraits", [])
                     if "hi-res-lossless" in traits:
+                        lossless_hint = True
                         logger.debug(f"[Apple-Direct] Catalog confirmed hi-res lossless for Apple Music ID {apple_id}")
                         bit_depth = 24
-                        if (sample_rate or 0) < 48000:
-                            sample_rate = 96000
                     elif "lossless" in traits:
-                        if bit_depth is None or bit_depth < 16:
-                            bit_depth = 16
-                        if (sample_rate or 0) < 44100:
-                            sample_rate = 44100
+                        lossless_hint = True
                 else:
                     # _fetch_song queries the Catalog API via developer token (no Widevine overhead)
                     meta = self._apple_fetcher._fetch_song(str(apple_id))
                     traits = (meta.audio_traits or []) if meta else []
                     if "hi-res-lossless" in traits:
+                        lossless_hint = True
                         logger.debug(f"[Apple] Catalog confirmed hi-res lossless for Apple Music ID {apple_id}")
                         bit_depth = 24
-                        if (sample_rate or 0) < 48000:
-                            sample_rate = 96000  # Default assumption for hi-res if unknown
                     elif "lossless" in traits:
-                        if bit_depth is None or bit_depth < 16:
-                            bit_depth = 16
-                        if (sample_rate or 0) < 44100:
-                            sample_rate = 44100
+                        lossless_hint = True
             except Exception as e:
                 logger.debug(f"[Apple] Failed to check catalog for hi-res traits: {e}")
 
@@ -776,7 +834,7 @@ class AppleAdapter(BaseSourceAdapter):
             sample_rate = None
             quality_kbps = 256
         else:
-            is_lossless = bool(bit_depth and bit_depth >= 16)
+            is_lossless = lossless_hint or bool(bit_depth and bit_depth >= 16)
             audio_format = AudioFormat.ALAC if is_lossless else AudioFormat.AAC
             quality_kbps = None if is_lossless else 256
 
@@ -828,8 +886,86 @@ class AppleAdapter(BaseSourceAdapter):
         if not track_id:
             raise ValueError("[Apple] Missing Apple track_id in search result")
 
-        # Try direct WebPlayback + Widevine path first — avoids proxy latency
-        if self._direct and self._direct.is_configured():
+        # ── Path 1: wrapper lossless ALAC via /api/stream/ ────────────────────
+        # Only used when always_lossy=False (wrapper detected on mirror) and
+        # we're not in a lossy-preferred output mode.
+        if not self._prefer_lossy_download and not self.always_lossy and self._mirrors:
+            try:
+                mirror = self._get_working_mirror()
+                stream_url = f"{mirror}/api/stream/{track_id}"
+                logger.info(f"[Apple] Downloading ALAC via wrapper stream: {stream_url}")
+
+                resp = self._api_get(stream_url, timeout=300, stream=True)
+                if resp.status_code == 200:
+                    final_path = output_path + ".m4a"
+                    os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
+                    with open(final_path, "wb") as f:
+                        for chunk in resp.iter_content(131072):
+                            if chunk:
+                                f.write(chunk)
+
+                    # Update result metadata from response headers
+                    codec       = resp.headers.get("X-Codec", "alac").lower()
+                    quality     = resp.headers.get("X-Quality", "LOSSLESS").upper()
+                    bit_depth   = resp.headers.get("X-BitDepth")
+                    sample_rate = resp.headers.get("X-SampleRate")
+                    result.audio_format = AudioFormat.ALAC
+                    result.is_lossless  = True
+                    if bit_depth:
+                        try:
+                            result.bit_depth = int(bit_depth)
+                        except ValueError:
+                            pass
+                    if sample_rate:
+                        try:
+                            result.sample_rate_hz = int(sample_rate)
+                        except ValueError:
+                            pass
+                    if quality == "HIRES_LOSSLESS":
+                        result.bit_depth = result.bit_depth or 24
+
+                    logger.info(
+                        f"[Apple] ALAC download complete: {final_path} "
+                        f"({quality} {result.bit_depth}bit/{result.sample_rate_hz}Hz)"
+                    )
+                    return final_path
+
+                elif resp.status_code == 503:
+                    # Wrapper unavailable — fall through to /api/track/ (enhancedHls CENC ALAC)
+                    logger.info(
+                        "[Apple] /api/stream/ returned 503 (wrapper unavailable) — "
+                        "falling back to /api/track/ lossless path"
+                    )
+                elif resp.status_code == 404:
+                    # Wrapper doesn't have this track — /api/track/ may still serve it
+                    logger.info(
+                        "[Apple] Track %s not found via wrapper (404) — falling back to /api/track/",
+                        track_id,
+                    )
+                else:
+                    logger.warning(
+                        "[Apple] /api/stream/ returned %d — falling back to /api/track/ path",
+                        resp.status_code,
+                    )
+            except RateLimitedError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[Apple] wrapper stream failed (%s) — falling back to /api/track/ path", e
+                )
+
+        # Only give up on lossless if there are no mirrors to try /api/track/ on
+        if self._require_lossless_download and not self._mirrors:
+            raise RuntimeError(
+                f"[Apple] Lossless output requested for track {track_id}, "
+                "but no Apple mirror is configured for /api/track/ ALAC download"
+            )
+
+        # ── Path 2: direct WebPlayback + Widevine (AAC) ───────────────────────
+        # Try direct WebPlayback + Widevine path first — avoids proxy latency.
+        # Skipped in lossless/ALAC mode: WebPlayback only serves AAC; Path 3
+        # (/api/track/) handles lossless ALAC via enhancedHls + CENC decryption.
+        if not self._require_lossless_download and self._direct and self._direct.is_configured():
             try:
                 logger.info(f"[Apple-Direct] Fetching stream via WebPlayback API for track {track_id}...")
                 data = self._direct.process_track(track_id)
@@ -1445,11 +1581,11 @@ class AppleAdapter(BaseSourceAdapter):
             if "alac" in codec:
                 return
             # Apple-decrypted lossless files can still surface as mp4a via Mutagen
-            # even when the container carries lossless sample metadata.
-            losslessish = (
-                bits_per_sample in (16, 24, 32)
-                or (bitrate in (None, 0) and sample_rate and sample_rate >= 44100)
-            )
+            # even when the container carries lossless sample metadata. Require
+            # bits_per_sample to be set — DRM-encrypted files report bitrate=0
+            # and bits_per_sample=None, so the old (bitrate=0 and sample_rate>=44100)
+            # fallback was accepting DRM-locked AAC as "lossless".
+            losslessish = bits_per_sample in (16, 24, 32)
             if codec in ("mp4a", "mp4a.40.2", "mp4a.40.5", "") and losslessish:
                 logger.warning(
                     "[Apple] Mutagen reported codec=%r for a lossless Apple file; accepting due to bits_per_sample=%r sample_rate=%r bitrate=%r",

@@ -301,10 +301,10 @@ jobs:
 
             ## Downloads
 
-            [![Windows](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra.exe?display_name=true&logo=windows&label=Windows&style=for-the-badge&color=0078D6)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra.exe)
-            [![macOS Apple Silicon](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-macOS.dmg?display_name=true&logo=apple&label=macOS+Apple+Silicon&style=for-the-badge&color=111111)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-macOS.dmg)
-            [![macOS Intel](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-macOS-Intel.dmg?display_name=true&logo=apple&label=macOS+Intel&style=for-the-badge&color=555555)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-macOS-Intel.dmg)
-            [![Linux](https://img.shields.io/github/downloads/anandprtp/Antra/v1.1.5/Antra-Linux.AppImage?display_name=true&logo=linux&label=Linux&style=for-the-badge&color=FCC624&logoColor=black)](https://github.com/anandprtp/Antra/releases/download/v1.1.5/Antra-Linux.AppImage)
+            [![Windows](https://img.shields.io/github/downloads/anandprtp/Antra/${{ steps.tag.outputs.tag }}/Antra.exe?display_name=true&logo=windows&label=Windows&style=for-the-badge&color=0078D6)](https://github.com/anandprtp/Antra/releases/download/${{ steps.tag.outputs.tag }}/Antra.exe)
+            [![macOS Apple Silicon](https://img.shields.io/github/downloads/anandprtp/Antra/${{ steps.tag.outputs.tag }}/Antra-macOS.dmg?display_name=true&logo=apple&label=macOS+Apple+Silicon&style=for-the-badge&color=111111)](https://github.com/anandprtp/Antra/releases/download/${{ steps.tag.outputs.tag }}/Antra-macOS.dmg)
+            [![macOS Intel](https://img.shields.io/github/downloads/anandprtp/Antra/${{ steps.tag.outputs.tag }}/Antra-macOS-Intel.dmg?display_name=true&logo=apple&label=macOS+Intel&style=for-the-badge&color=555555)](https://github.com/anandprtp/Antra/releases/download/${{ steps.tag.outputs.tag }}/Antra-macOS-Intel.dmg)
+            [![Linux](https://img.shields.io/github/downloads/anandprtp/Antra/${{ steps.tag.outputs.tag }}/Antra-Linux.AppImage?display_name=true&logo=linux&label=Linux&style=for-the-badge&color=FCC624&logoColor=black)](https://github.com/anandprtp/Antra/releases/download/${{ steps.tag.outputs.tag }}/Antra-Linux.AppImage)
 
             ## Files
 

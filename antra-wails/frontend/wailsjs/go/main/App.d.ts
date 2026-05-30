@@ -14,6 +14,8 @@ export function ClearHistory():Promise<void>;
 
 export function ConfirmAmazonLogin():Promise<void>;
 
+export function GetAlbumAvailability(arg1:string):Promise<string>;
+
 export function GetArtistDiscography(arg1:string):Promise<string>;
 
 export function GetConfig():Promise<main.Config>;
@@ -27,6 +29,8 @@ export function GetDownloadedMusicLibrary():Promise<string>;
 export function GetDownloadedRelease(arg1:string):Promise<string>;
 
 export function GetHistory():Promise<Array<main.HistoryItem>>;
+
+export function GetKeyInfo():Promise<main.KeyInfoResult>;
 
 export function GetSlskdWebUIInfo():Promise<string>;
 
@@ -53,6 +57,8 @@ export function RequestAccessKey():Promise<main.KeyGenResult>;
 export function RetryTrackDownload(arg1:string):Promise<void>;
 
 export function SaveConfig(arg1:main.Config):Promise<void>;
+
+export function SaveCoverArt(arg1:string,arg2:string):Promise<string>;
 
 export function ScanFolder(arg1:string):Promise<Array<string>>;
 

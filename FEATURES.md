@@ -14,7 +14,7 @@
 
 ## Multi-Source Audio Engine
 
-Antra resolves links from Spotify, Apple Music, Amazon Music, Tidal, Qobuz, and Deezer. In lossless mode it queries all active lossless-capable sources and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
+Antra resolves links from Spotify, Apple Music, Amazon Music, Tidal, Qobuz, and Deezer. In lossless mode it queries all active lossless-capable sources in parallel and picks the result with the highest bit depth and sample rate — not just the first match found. Lossy formats (AAC, MP3) use dedicated lossy sources first; lossless adapters are only tried as a last resort.
 
 ```
 Source chain (per track):
@@ -24,15 +24,23 @@ Source chain (per track):
   Soulseek P2P          →  anything the community has, including rare and out-of-print releases
 ```
 
-Downloads from Antra mirror servers require an **Antra Access Key**, generated inside the app in Settings. Each key is valid for **24 hours or 2000 songs**, and a fresh key can be requested after 24 hours.
+Free tier works out of the box with rate-limited downloads. Support on Ko-fi to receive a 30-day supporter key with unlimited downloads and 2-3 concurrent downloads.
+
+---
+
+## Download Source Selector
+
+Force all downloads through a single service instead of letting the resolver decide. Six options: **Auto** (default), **Tidal**, **Qobuz**, **Apple Music**, **Amazon Music**, **Deezer**. When a specific source is selected, only adapters in that service family are used and no fallback to other services occurs.
+
+Accessible from the pill-style selector on the main screen — no need to open Settings.
 
 ---
 
 ## ISRC-Based Exact Matching
 
-Most tools match by title + artist and often grab the wrong version: a remaster, a radio edit, a regional pressing. Antra uses **ISRC codes** (the unique identifier of every recording) to guarantee you get the exact track from the exact release you requested.
+Most tools match by title and artist and often grab the wrong version: a remaster, a radio edit, a regional pressing. Antra uses **ISRC codes** (the unique identifier of every recording) to guarantee you get the exact track from the exact release you requested.
 
-When ISRCs are available, Antra uses them to match against source APIs directly. When they're not, it falls back to a scored similarity search with title-artist weighting.
+When ISRCs are available, Antra uses them to match against source APIs directly. When they are not, it falls back to a scored similarity search with title-artist weighting.
 
 ---
 
@@ -44,9 +52,17 @@ Configurable in Settings: **Prefer explicit versions** (on by default).
 
 ---
 
+## Strict Matching Mode
+
+Opt-in safety mode for niche music. When enabled, Antra requires stronger confidence for non-ISRC matches and applies tighter post-download duration validation, preferring a clean failure over a risky wrong-audio save. Default is off so current behaviour is unchanged unless you opt in.
+
+---
+
 ## Hi-Res Awareness
 
 Tidal and Qobuz expose per-track bit depth and sample rate in their search results. When a track has a hi-res master available (e.g. 24-bit/96kHz from Tidal, up to 24-bit/192kHz from Qobuz), Antra keeps searching all lossless-capable sources and selects the highest-resolution result — ranked by bit depth first, then sample rate. CD quality (16-bit/44.1kHz) is only used if no hi-res source can be located.
+
+Qobuz URLs also support a **strict 24-bit mode**: if no Qobuz account can produce a genuine 24-bit stream, the request fails cleanly instead of silently saving 16-bit audio under a 24-bit request.
 
 ---
 
@@ -59,11 +75,13 @@ Every downloaded file is tagged automatically. No manual editing, no missing art
 | Title, Artist, Album, Track # | Spotify / Apple Music / Amazon metadata |
 | Album artwork | Full-resolution cover from the streaming catalog |
 | Release date | Full ISO date where available; year as fallback |
-| Genre | MusicBrainz lookup via ISRC |
-| Lyrics | Genius + Musixmatch fallback |
+| Genre | Deezer album-level genre via ISRC, with MusicBrainz fallback |
+| Composer | Sourced from Qobuz, Tidal, or Deezer metadata |
+| Disc number | Correct disc tagging for multi-disc albums |
+| Lyrics | LRCLIB synced lyrics, Genius / Musixmatch fallback |
 | ISRC | Embedded for future matching |
 
-Tags are written in the correct format for every container: ID3v2 for MP3, Vorbis comments for FLAC, MP4 atoms for M4A, fully readable by Windows Media Player, VLC, foobar2000, and all major media servers.
+Tags are written in the correct format for every container: ID3v2 for MP3, Vorbis comments for FLAC, MP4 atoms for M4A — fully readable by Windows Media Player, VLC, foobar2000, and all major media servers.
 
 ---
 
@@ -73,32 +91,36 @@ Output is structured the way every media server expects:
 
 ```
 ~/Music/
-└── Artist Name/
-    └── Album Name (Year)/
-        ├── 101 - Track Title.flac
-        ├── 102 - Track Title.flac
-        └── cover.jpg
+  Artist Name/
+    Album Name (Year)/
+      101 - Track Title.flac
+      102 - Track Title.flac
+      cover.jpg
 ```
 
-All tracks use disc-prefixed numbering (`101`, `102`, ..., `201`, `202`, ...) so Plex, Navidrome, and Jellyfin always know which disc a track belongs to — single-disc albums use the `1xx` prefix, multi-disc albums use `1xx` / `2xx` / etc.
+Downloads land directly inside the library root — no intermediate `Albums/` or `Playlists/` subfolders. All tracks use disc-prefixed numbering (`101`, `102`, ..., `201`, `202`, ...) so Plex, Navidrome, and Jellyfin always know which disc a track belongs to.
 
-### Folder Structure Options
+### Template-Based Filenames and Folders
 
-| Mode | Layout |
-|---|---|
-| **Standard** (default) | `Artist / Album / files`. Optimal for Navidrome, Jellyfin, Plex. |
-| **Flat** | `Album / files` directly inside your Music folder. No artist or category subdirectories. |
+Set your own naming scheme using tokens. Three template fields in Folder Settings:
 
-### Filename Format Options
+| Template | Default | Example output |
+|---|---|---|
+| Single track filename | `{artist} - {title}` | `The Beatles - Come Together.flac` |
+| Album track filename | `{track} - {title}` | `07 - Come Together.flac` |
+| Folder structure | `{album_artist}/{year} - {album}` | `The Beatles/1969 - Abbey Road/` |
+
+Available tokens: `{title}` `{artist}` `{album_artist}` `{album}` `{year}` `{track}` `{disc}` `{genre}` `{composer}` `{isrc}` `{codec}` `{bitrate}` `{quality}`
+
+Each template field shows a live preview as you type. Click any token chip to insert it at the cursor position.
+
+### Multi-Disc Handling
 
 | Mode | Example |
 |---|---|
-| **Default** | `101 - Track Title.flac` |
-| **Title only** | `Track Title.flac` |
-| **Artist - Title** | `101 - Artist - Track Title.flac` |
-| **Title - Artist** | `101 - Track Title - Artist.flac` |
-
-Both options are set during first-run setup and adjustable later in Settings.
+| **Disc prefix** (default) | `2-05 - Track.flac` |
+| **Offset 101/201** | `205 - Track.flac` |
+| **Track only** | `05 - Track.flac` |
 
 ---
 
@@ -128,18 +150,33 @@ Already have a music collection? **Import Files** and **Import Folder** buttons 
 ---
 
 ## Artist Discography Download
+## Themes
 
-Search for any artist by Spotify or Apple Music URL. Antra fetches their full discography and presents it grouped by release type.
+11 built-in themes accessible from the full-screen theme picker (🎨 button in the header).
 
-- Browse **Albums**, **Singles**, **EPs & Compilations** separately
-- Bulk-select or deselect entire groups with one click
-- Queue individual albums or the full catalogue in one batch
+**Antra Originals:** Antra (default deep teal), Ember (warm amber), Ocean (deep navy), Graphite (monochrome), Sunset (magenta and gold), Linen (light mode)
+
+**Service-Inspired:** Spotify, TIDAL, Qobuz, Deezer, Apple Music, Amazon Music
+
+Each card shows three colour swatches, a name, and a description. Selecting a theme applies it instantly and saves it to config so it restores on next launch.
 
 ---
 
-## Spotify Podcast Downloads
+## Album Availability Studio
 
-Paste any Spotify podcast episode or show URL and Antra downloads the audio directly — no account required. Episodes are tagged with title, show name, description, and cover art, and saved alongside your music library.
+Paste a Spotify or Deezer album link to see country-by-country availability on a live world map. Shows full-access markets, partial access, region locks, label, UPC, and confirmed track counts. Useful for checking if a release is available in a specific territory before downloading.
+
+Accessible from the 🌍 button in the header.
+
+---
+
+## Artist Discography Download
+
+Search for any artist by Spotify or Apple Music URL. Antra fetches their full discography and presents it grouped by release type.
+
+- Browse **Albums**, **Singles**, **EPs and Compilations** separately
+- Bulk-select or deselect entire groups with one click
+- Queue individual albums or the full catalogue in one batch
 
 ---
 
@@ -158,7 +195,7 @@ Parallel:     track 1 ↘
 
 ## Rich Tracklist UI
 
-When a URL is pasted, the full tracklist appears immediately before any download starts.
+When a URL is pasted, the full tracklist appears immediately before any download starts. For playlists with 1000+ tracks, rows appear progressively as pages load — you are not waiting for the full fetch to complete.
 
 Each row shows the track title, artist, duration, and a real-time progress bar as the file downloads. The playlist header displays the cover art, type (ALBUM / PLAYLIST / SINGLE), artist, track count, total duration, and release date in the same layout as a streaming app.
 
@@ -170,57 +207,42 @@ A dedicated log panel (accessible via the 📋 button) shows verbose download ou
 
 ## Source Health Check
 
-Chips below the URL bar show the status of each configured source. Each chip displays whether the adapter is **enabled** (green glow, brand-tinted background) or **disabled** (dark red border, dimmed). Clicking a chip opens that adapter's settings section; clicking a disabled chip also toggles it on and saves the config. Parallel health probes confirm your account credentials are reachable and show a live/total count with per-endpoint status dots.
+Chips below the URL bar show the live status of each source from a public status endpoint. Green means online and active; darker red means currently unavailable. Antra checks the status on startup and continues working normally if the endpoint is unreachable.
 
 ---
 
 ## Library History
 
-Every completed download session is saved to history with its cover art thumbnail, album/playlist title, URL, track count, and timestamp, so you can quickly identify what you've downloaded without opening the folder.
+Every completed download session is saved to history with its cover art thumbnail, album/playlist title, URL, track count, and timestamp, so you can quickly identify what you have downloaded without opening the folder.
 
 ---
 
-## Built-in Spectrogram Analyzer
+## Built-in Audio Analyzer
 
-Not sure if a file is genuinely lossless or an MP3 in a FLAC wrapper? Drop any audio file into the Analyzer to see its full frequency spectrum. A real FLAC recorded from lossless masters looks unmistakably different from a transcoded lossy file.
+Not sure if a file is genuinely lossless or an MP3 in a FLAC wrapper? Drop any audio file into the Analyzer.
 
-Supports batch analysis with gallery view, side-by-side comparison, and PNG export.
+**Spectrogram:** Full frequency spectrum view. A real FLAC recorded from lossless masters looks unmistakably different from a transcoded lossy file.
 
----
+**Stats panel:**
 
-## Access Key & Optional Accounts
+| Metric | What it tells you |
+|---|---|
+| Peak dBFS | Loudest sample in the file |
+| RMS dBFS | Average loudness |
+| True Peak dBTP | Inter-sample peak (important for streaming delivery) |
+| Integrated Loudness | LUFS over the full file |
+| Loudness Range | LRA — dynamic range |
+| Frequency Cutoff | Highest frequency with meaningful content |
 
-Antra’s default download flow uses Antra mirror servers plus the in-app **Antra Access Key**. You generate the key once in Settings and Antra saves it automatically. For most users, that is all the setup required.
+**Quality badges** are assigned automatically: FLAC/ALAC files with a cutoff below 14 kHz are flagged as "Fake Lossless"; below 17 kHz as "Likely Transcode"; below 19.5 kHz as "Suspect Quality".
 
-Optional premium logins are still available for services that support direct account-based downloads or metadata workflows.
-
-| Item | What it does | Notes |
-|---|---|---|
-| **Antra Access Key** | Unlocks mirror-server downloads | Generated in Settings. Valid for 24 hours or 2000 songs. |
-| **Tidal login** | Optional direct premium integration | Useful for premium account flows and OAuth-based setup. |
-| **Qobuz login** | Optional direct Qobuz access | Used when you want your own Qobuz credentials active. |
-| **Amazon Music login** | Optional browser-based account capture | Requires an L3/L1-certified `.wvd` file for decryption. |
-| **Apple Music login** | Optional Apple browser session capture | Apple downloads in Antra are AAC-only. |
-| **Spotify** | Metadata + podcast audio | No music-track audio from Spotify itself. |
-| **Soulseek** | Optional P2P fallback | Good for rare or out-of-print releases. |
-
-Spotify, Apple Music, Amazon Music, Tidal, Qobuz, and Deezer links are all supported as input URLs.
-
----
-
-## TIDAL Premium OAuth Integration
-
-For users with a premium TIDAL account, Antra offers a native device-code OAuth flow to securely connect your account without dealing with fragile API keys or manual session tokens. 
-
-- **One-click login**: Click "Login with TIDAL" to generate a secure device code and verification URL.
-- **Auto-save**: Approve the login in your browser, and Antra will automatically capture, validate, and store your session tokens.
-- **Robust token handling**: Say goodbye to `SyntaxError`s from manually pasting JSON blobs. Antra sanitises all inputs and correctly manages the token lifecycle.
+Supports batch analysis with gallery view, per-item removal, and a Clear All button.
 
 ---
 
 ## Soulseek / P2P Integration
 
-For tracks that aren't available through any streaming-adjacent source (rare albums, limited pressings, out-of-print releases), Antra integrates with the Soulseek P2P network.
+For tracks not available through any streaming-adjacent source (rare albums, limited pressings, out-of-print releases), Antra integrates with the Soulseek P2P network.
 
 **Zero setup.** Antra downloads, configures, and manages the backend automatically. Just provide your Soulseek credentials once on first run.
 
@@ -234,7 +256,7 @@ Antra can download any Spotify podcast episode or entire show directly using you
 
 ### Account requirement
 
-A **free Spotify account is sufficient**. Podcast audio is not gated behind Spotify Premium. The 320 kbps OGG Vorbis format is available to all logged-in users. You only need to be signed in to Spotify in a browser to get the required cookie.
+A **free Spotify account is sufficient**. Podcast audio is not gated behind Spotify Premium. The 320 kbps OGG Vorbis format is available to all logged-in users.
 
 > The only exception is **subscriber-only episodes** — episodes paywalled by the podcast creator (separate from Spotify Premium). Those will fail with "no audio files available."
 
@@ -245,18 +267,15 @@ A **free Spotify account is sufficient**. Podcast audio is not gated behind Spot
 | Single episode | `https://open.spotify.com/episode/4rOoJ6Egrf8K2IrywzwOMk` |
 | Full show (all episodes) | `https://open.spotify.com/show/0ofXAdFIQQRsCYj9754UFx` |
 
-Paste either URL into the main input bar and click Download — the same as any music URL.
-
 ### Setup: getting your sp_dc cookie
 
-1. Open **[open.spotify.com](https://open.spotify.com)** in any browser while logged in to your Spotify account
-2. Open **DevTools** → **F12** (Chrome/Edge) or **Cmd+Option+I** (macOS)
+1. Open **[open.spotify.com](https://open.spotify.com)** in any browser while logged in
+2. Open **DevTools** (F12 on Chrome/Edge, Cmd+Option+I on macOS)
 3. Go to **Application** tab → **Cookies** → `https://open.spotify.com`
-4. Find the cookie named **`sp_dc`** — copy its value (starts with `AQ…`)
-5. In Antra, open **Settings → Spotify Podcasts** and paste the value into the **sp_dc cookie** field
-6. The indicator turns green: **● Cookie configured — podcast downloads enabled**
+4. Find the cookie named **`sp_dc`** and copy its value (starts with `AQ...`)
+5. In Antra, open **Settings → Spotify Podcasts** and paste it into the **sp_dc cookie** field
 
-The cookie is valid for approximately **one year**. If downloads start failing with an auth error, repeat the steps above to refresh it.
+The cookie is valid for approximately one year.
 
 ### Output and tagging
 
@@ -264,46 +283,15 @@ Episodes are saved inside your configured Music folder:
 
 ```
 ~/Music/
-└── Podcasts/
-    └── Show Name/
-        ├── 2024-03-15 - Episode Title.ogg
-        ├── 2024-03-22 - Another Episode.ogg
-        └── ...
+  Podcasts/
+    Show Name/
+      2024-03-15 - Episode Title.ogg
+      2024-03-22 - Another Episode.ogg
 ```
-
-Files are tagged automatically:
-
-| Tag | Value |
-|---|---|
-| Title | Episode title |
-| Artist | Show name |
-| Album | Show name |
-| Date | Publication date (YYYY-MM-DD) |
-| Track number | Episode number (where available) |
-| Comment/Description | Episode description (first 500 chars) |
-| Artwork | Episode or show cover image |
-
-### Audio quality
-
-Antra always picks the highest quality format the episode offers:
-
-| Format | Codec | Bitrate | Extension |
-|---|---|---|---|
-| OGG_VORBIS_320 | Ogg Vorbis | 320 kbps | `.ogg` |
-| OGG_VORBIS_160 | Ogg Vorbis | 160 kbps | `.ogg` |
-| MP4_128 | AAC | 128 kbps | `.m4a` |
-| OGG_VORBIS_96 | Ogg Vorbis | 96 kbps | `.ogg` |
-
-Most modern Spotify podcasts are available at 320 kbps OGG Vorbis. OGG and M4A are widely supported by VLC, foobar2000, Plex, Jellyfin, and all major podcast apps.
 
 ### Rate limiting
 
-To protect your Spotify account from being flagged, Antra applies automatic rate limiting:
-
-- **3–7 second random delay** between each episode download
-- **50 episodes per hour** hard cap — Antra pauses and resumes automatically if the limit is reached
-
-For large shows (100+ episodes) this means downloads take time. Leave Antra running in the background — it will complete the queue without any intervention.
+To protect your Spotify account from being flagged, Antra applies automatic rate limiting: a 3-7 second random delay between each episode and a 50 episodes/hour hard cap.
 
 ---
 
@@ -348,7 +336,7 @@ CI/CD           →  GitHub Actions, 4-platform matrix build on tag push
 
 <p align="center">
   <br/>
-  <strong>Antra is free and open source, maintained by one person in their spare time.</strong><br/>
+  <strong>Antra is free to use, maintained by one person in their spare time.</strong><br/>
   <em>If it saves you money on streaming, consider keeping it alive.</em>
   <br/><br/>
   <a href="https://ko-fi.com/antraverse">

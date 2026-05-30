@@ -14,6 +14,12 @@ from mutagen.id3 import ID3, TALB, TIT2, TPE1, TSRC, TXXX
 from mutagen.mp4 import MP4
 
 from antra.core.models import TrackMetadata
+from antra_shared.filename_prefs import (
+    build_folder_path,
+    build_single_track_stem,
+    build_track_stem,
+    migrate_legacy_templates,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +45,11 @@ ISRC_PATTERN = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$", re.IGNORECASE)
 
 class LibraryOrganizer:
     """
-    Library structure:
-      <root>/Albums/<Artist>/<Album (Year)>/<NN - Track Title>.<ext>
-      <root>/Playlists/<Playlist Name>/<NN - Track Title>.<ext>
-      <root>/Playlists/<Playlist Name>.m3u
+    Library structure (no Albums/ or Playlists/ wrappers):
+      <root>/<Artist>/<Album (Year)>/<NN - Track Title>.<ext>   (standard mode)
+      <root>/<Album (Year)>/<NN - Track Title>.<ext>            (flat mode)
+      <root>/<Playlist Name>/<NN - Track Title>.<ext>
+      <root>/<Playlist Name>.m3u
 
     Deduplication is global across the library. The first downloaded file path
     becomes canonical and later playlist/album/song downloads reuse that file.
@@ -57,6 +64,14 @@ class LibraryOrganizer:
         playlist_folder_structure: str = "",
         single_track_structure: str = "album_numbered",
         filename_format: str = "default",
+        single_track_filename_template: str = "",
+        album_track_filename_template: str = "",
+        folder_structure_template: str = "",
+        multi_disc_handling: str = "prefix",
+        track_number_padding: int = 2,
+        illegal_character_replacement: str = "",
+        whitespace_handling: str = "preserve",
+        filename_conflict_behavior: str = "skip",
     ):
         self.root = Path(root).resolve()
         self.full_albums = full_albums
@@ -66,11 +81,24 @@ class LibraryOrganizer:
         self.playlist_folder_structure = playlist_folder_structure or legacy_structure
         self.single_track_structure = single_track_structure or "album_numbered"
         self.filename_format = filename_format
+        self.filename_preferences = migrate_legacy_templates(
+            {
+                "single_track_filename_template": single_track_filename_template,
+                "album_track_filename_template": album_track_filename_template,
+                "folder_structure_template": folder_structure_template,
+                "multi_disc_handling": multi_disc_handling,
+                "track_number_padding": track_number_padding,
+                "illegal_character_replacement": illegal_character_replacement,
+                "whitespace_handling": whitespace_handling,
+                "filename_conflict_behavior": filename_conflict_behavior,
+            },
+            filename_format=filename_format,
+            album_folder_structure=self.album_folder_structure,
+        )
         self.root.mkdir(parents=True, exist_ok=True)
-        self.albums_root = self.root / "Albums"
-        self.playlists_root = self.root / "Playlists"
-        self.albums_root.mkdir(parents=True, exist_ok=True)
-        self.playlists_root.mkdir(parents=True, exist_ok=True)
+        # No Albums/ or Playlists/ wrappers — everything lives directly under root.
+        self.albums_root = self.root
+        self.playlists_root = self.root
         self._state_path = self.root / STATE_FILE
         self._state = self._load_state()
         self._identity_index: dict[str, str] = {}
@@ -90,7 +118,7 @@ class LibraryOrganizer:
             else:
                 folder = self.playlists_root / playlist_dir
             folder.mkdir(parents=True, exist_ok=True)
-            return str(folder / filename)
+            return str(self._resolve_conflict_path(folder, filename))
 
         if (track.request_kind or "").lower() == "track":
             return self._single_track_output_path(track)
@@ -98,22 +126,51 @@ class LibraryOrganizer:
         folder = self._album_folder(track)
         filename = self._format_filename(track, track.track_number)
         folder.mkdir(parents=True, exist_ok=True)
-        return str(folder / filename)
+        return str(self._resolve_conflict_path(folder, filename))
 
     def _single_track_output_path(self, track: TrackMetadata) -> str:
         if self.single_track_structure == "file":
             folder = self.root
-            filename = self._format_filename(track, None, disc_number=1)
+            filename = build_single_track_stem(track, self.filename_preferences)
         else:
             folder = self._album_folder(track)
-            if self.single_track_structure == "album_numbered":
-                filename = self._format_filename(track, 1, disc_number=1)
-            else:
-                filename = self._format_filename(track, None, disc_number=1)
+            filename = build_single_track_stem(track, self.filename_preferences)
         folder.mkdir(parents=True, exist_ok=True)
-        return str(folder / filename)
+        return str(self._resolve_conflict_path(folder, filename))
+
+    @staticmethod
+    def _extract_album_from_folder_leaf(leaf: str) -> str:
+        """Strip year decorations to get just the album name from a rendered folder leaf.
+
+        Handles all year formats produced by folder_structure_template:
+          "2011 - Zonoscope"   → "Zonoscope"
+          "Zonoscope (2011)"   → "Zonoscope"
+          "(2011) Zonoscope"   → "Zonoscope"
+        """
+        s = re.sub(r"^\d{4}\s*[-–—]\s*", "", leaf)
+        s = re.sub(r"^\(\d{4}\)\s*", "", s)
+        s = re.sub(r"\s*\(\d{4}\)$", "", s)
+        s = re.sub(r"\s*[-–—]\s*\d{4}$", "", s)
+        return s.strip()
 
     def _album_folder(self, track: TrackMetadata) -> Path:
+        custom_path = build_folder_path(track, self.filename_preferences)
+        if custom_path:
+            parts = custom_path.split("/")
+            target = self.root.joinpath(*parts)
+            # Year-variant dedup: when the exact target doesn't exist yet, look for
+            # a sibling folder whose name is the same album with a different year
+            # (e.g. "2010 - Zonoscope" already exists when we try to create
+            # "2011 - Zonoscope").  Different metadata sources often return slightly
+            # different release years for the same album, creating split folders.
+            if not target.exists() and len(parts) >= 1:
+                parent = target.parent
+                album_name = self._extract_album_from_folder_leaf(parts[-1])
+                if album_name:
+                    existing = self._find_existing_album_folder(parent, album_name)
+                    if existing is not None:
+                        return existing
+            return target
         # Use album-level artists for the folder name so joint albums
         # (e.g. "PARTYNEXTDOOR & Drake") land in one combined folder
         # instead of splitting by per-track artist.
@@ -123,13 +180,57 @@ class LibraryOrganizer:
             artist_dir = self._safe(", ".join(track.artists))
         album_part = self._safe(track.album)
         if track.release_year:
-            album_dir = f"{album_part} ({track.release_year})"
+            if self.album_folder_structure == "year_prefix":
+                album_dir = f"({track.release_year}) {album_part}"
+            else:
+                album_dir = f"{album_part} ({track.release_year})"
         else:
             album_dir = album_part
 
         if self.album_folder_structure == "flat":
-            return self.root / album_dir
-        return self.albums_root / artist_dir / album_dir
+            parent = self.root
+        else:
+            parent = self.albums_root / artist_dir
+
+        # If a year-variant of this album folder already exists on disk, reuse
+        # it instead of creating a new folder with a different year.  This
+        # prevents duplicate folders like "Anthology 1 (1963)" / "Anthology 1
+        # (1995)" / "Anthology 1 (1996)" when the same album is downloaded from
+        # different sources that report different release dates.
+        target = parent / album_dir
+        if not target.exists() and track.release_year:
+            existing = self._find_existing_album_folder(parent, album_part)
+            if existing is not None:
+                return existing
+
+        return target
+
+    def _find_existing_album_folder(self, parent: Path, album_part: str) -> Optional[Path]:
+        """Return an existing year-variant folder for *album_part* under *parent*.
+
+        Looks for directories whose name matches ``<album_part> (<year>)`` or
+        exactly ``<album_part>`` (no year).  Returns the first match found, or
+        ``None`` if the parent directory doesn't exist yet.
+        """
+        if not parent.exists():
+            return None
+        import re as _re
+        escaped = _re.escape(album_part)
+        # Match both "Album (Year)" / "Album" and "(Year) Album" naming styles
+        # so that switching between standard and year_prefix modes doesn't
+        # create duplicate folders for the same album.
+        pat_suffix = _re.compile(rf"^{escaped}(?:\s*\(\d{{4}}\))?$", _re.IGNORECASE)
+        pat_prefix = _re.compile(rf"^\(\d{{4}}\)\s*{escaped}$", _re.IGNORECASE)
+        # Also match "Year - Album" format used by the default folder_structure_template
+        pat_year_dash = _re.compile(rf"^\d{{4}}\s*[-–—]\s*{escaped}$", _re.IGNORECASE)
+        for child in parent.iterdir():
+            if child.is_dir() and (
+                pat_suffix.match(child.name)
+                or pat_prefix.match(child.name)
+                or pat_year_dash.match(child.name)
+            ):
+                return child
+        return None
 
     def _format_filename(
         self,
@@ -138,40 +239,7 @@ class LibraryOrganizer:
         *,
         disc_number: Optional[int] = None,
     ) -> str:
-        """Build the filename stem according to self.filename_format."""
-        title = self._safe(track.title)
-        artist = self._safe(track.primary_artist)
-
-        # Albums use the actual disc number or default to 1. Playlists and
-        # single-track numbering pass an explicit override so they remain 101/102/...
-        disc = disc_number if disc_number is not None else (track.disc_number or 1)
-
-        # title_only keeps its original behaviour (no number prefix at all,
-        # except when the album is explicitly multi-disc to avoid collisions).
-        if self.filename_format == "title_only":
-            is_multi_disc = (
-                (track.total_discs is not None and track.total_discs > 1)
-                or (track.disc_number is not None and track.disc_number >= 2)
-            )
-            if is_multi_disc and track.disc_number and track_number:
-                return f"{track.disc_number}{track_number:02d} - {title}"
-            return title
-
-        if self.filename_format == "artist_title":
-            if track_number:
-                return f"{disc}{track_number:02d} - {artist} - {title}"
-            return f"{artist} - {title}"
-
-        if self.filename_format == "title_artist":
-            if track_number:
-                return f"{disc}{track_number:02d} - {title} - {artist}"
-            return f"{title} - {artist}"
-
-        # default: disc-prefixed numbering (101, 102, 201, 202) for both
-        # albums and playlists. Playlists always use disc=1 → 101, 102, ...
-        if track_number:
-            return f"{disc}{track_number:02d} - {title}"
-        return title
+        return build_track_stem(track, self.filename_preferences, track_number=track_number, disc_number=disc_number)
 
     def is_already_downloaded(self, track: TrackMetadata) -> Optional[str]:
         """Return canonical file path if the track already exists in the library.
@@ -185,7 +253,7 @@ class LibraryOrganizer:
         This lets the same track appear in multiple album folders (e.g. studio
         album and a Best Of compilation) without one blocking the other.
         """
-        if not self.full_albums:
+        if self.filename_preferences.get("filename_conflict_behavior") == "skip" and not self.full_albums:
             for key in self._track_identity_keys(track):
                 existing = self._identity_index.get(key)
                 if existing and os.path.exists(existing):
@@ -196,6 +264,8 @@ class LibraryOrganizer:
         for ext in SUPPORTED_AUDIO_EXTENSIONS:
             candidate = base + ext
             if os.path.exists(candidate):
+                if self.filename_preferences.get("filename_conflict_behavior") == "overwrite":
+                    return None
                 self._mark_done(track, candidate)
                 return candidate
 
@@ -238,6 +308,17 @@ class LibraryOrganizer:
             lines.append(Path(relative).as_posix())
         manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return str(manifest_path)
+
+    def _resolve_conflict_path(self, folder: Path, stem: str) -> Path:
+        if self.filename_preferences.get("filename_conflict_behavior") != "append_counter":
+            return folder / stem
+        candidate = folder / stem
+        if not any((folder / f"{stem}{ext}").exists() for ext in SUPPORTED_AUDIO_EXTENSIONS):
+            return candidate
+        counter = 2
+        while any((folder / f"{stem} ({counter}){ext}").exists() for ext in SUPPORTED_AUDIO_EXTENSIONS):
+            counter += 1
+        return folder / f"{stem} ({counter})"
 
     # ── State / identity helpers ──────────────────────────────────────────
 

@@ -466,9 +466,13 @@ class AmazonAdapter(BaseSourceAdapter):
                 is_explicit=track.is_explicit,
             )
 
-        # Amazon's community proxy serves Ultra HD (24-bit lossless) streams.
-        # Explicitly marking bit_depth=24 so the resolver quality-tier comparison
-        # correctly ranks this as tier-4 (Hi-Res), equal to Apple/HiFi.
+        # Amazon's community proxy serves lossless streams that are SOMETIMES 24-bit
+        # and sometimes 16-bit depending on the track — Amazon does not expose the
+        # actual bit depth in its catalog API. Returning bit_depth=None lets the
+        # resolver's lossless sort correctly rank Amazon below any adapter that
+        # declares an actual bit depth (Qobuz declares 16-bit or 24-bit accurately).
+        # This ensures Qobuz / HiFi always win the quality sort when they find the
+        # track, and Amazon is used only as a fallback when those sources fail.
         return SearchResult(
             source="amazon",
             title=track.title,
@@ -478,7 +482,7 @@ class AmazonAdapter(BaseSourceAdapter):
             audio_format=AudioFormat.FLAC,
             quality_kbps=None,
             is_lossless=True,
-            bit_depth=24,
+            bit_depth=None,
             download_url=None,
             stream_id=amazon_id,
             similarity_score=1.0,
@@ -599,6 +603,15 @@ class AmazonAdapter(BaseSourceAdapter):
         # on the same mirror won't help.
         if "404" in err or "ContentNotAvailable" in err or "not available in any marketplace" in err:
             return False
+        # 403 = auth failure (bad creds, region block, session expired) — retrying
+        # the same mirror with the same credentials will always fail.
+        if "403" in err or "api error 403" in err.lower():
+            return False
+        # Quality mismatch: Amazon claimed 24-bit but delivered 16-bit. Retrying the
+        # same ASIN on the same mirror yields the same stream — give up immediately
+        # so the engine can try Qobuz/HiFi without wasting extra download cycles.
+        if "quality mismatch" in err.lower():
+            return False
         return True
 
     def _process_download(self, download_url: str, decryption_key: Optional[str], output_path: str) -> str:
@@ -606,46 +619,54 @@ class AmazonAdapter(BaseSourceAdapter):
         temp_enc_path = output_path + ".enc.m4a"
         logger.debug(f"[Amazon] Downloading encrypted stream: {temp_enc_path}")
         
-        with self._session.get(download_url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(temp_enc_path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    f.write(chunk)
+        try:
+            with self._session.get(download_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(temp_enc_path, "wb") as f:
+                    for chunk in r.iter_content(65536):
+                        f.write(chunk)
 
-        codec, duration_seconds = self._probe_audio_stream(temp_enc_path)
-        if codec:
-            logger.debug(
-                f"[Amazon] Probed codec: {codec}"
-                + (f" duration={duration_seconds:.2f}s" if duration_seconds else "")
-            )
-        else:
-            logger.debug("[Amazon] Probing failed — treating stream as generic M4A/MP4")
-        dec_ext = ".flac" if codec == "flac" else ".m4a"
+            codec, duration_seconds = self._probe_audio_stream(temp_enc_path)
+            if codec:
+                logger.debug(
+                    f"[Amazon] Probed codec: {codec}"
+                    + (f" duration={duration_seconds:.2f}s" if duration_seconds else "")
+                )
+            else:
+                logger.debug("[Amazon] Probing failed — treating stream as generic M4A/MP4")
+            dec_ext = ".flac" if codec == "flac" else ".m4a"
 
-        # Decrypt
-        final_path = output_path + dec_ext
-        if not decryption_key:
-            logger.warning(f"[Amazon] No decryption key provided — assuming track is unencrypted.")
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            os.replace(temp_enc_path, final_path)
-        else:
-            logger.debug(f"[Amazon] Decrypting {codec.upper()} stream using session key...")
-            ffmpeg_err = self._decrypt_file(temp_enc_path, final_path, decryption_key)
-            if ffmpeg_err is not None:
-                logger.warning(f"[Amazon] ffmpeg decryption failed: {ffmpeg_err} — trying Python fallback")
-            if ffmpeg_err is not None:
-                py_err = self._decrypt_cenc_python(temp_enc_path, final_path, decryption_key)
-                if py_err is not None:
-                    if os.path.exists(temp_enc_path):
-                        os.remove(temp_enc_path)
-                    raise RuntimeError(
-                        "[Amazon] Amazon returned an unreadable protected audio stream for this track."
-                    )
-                else:
-                    logger.debug("[Amazon] Python CENC fallback succeeded.")
+            # Decrypt
+            final_path = output_path + dec_ext
+            if not decryption_key:
+                logger.warning(f"[Amazon] No decryption key provided — assuming track is unencrypted.")
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.replace(temp_enc_path, final_path)
+            else:
+                logger.debug(f"[Amazon] Decrypting {codec.upper()} stream using session key...")
+                ffmpeg_err = self._decrypt_file(temp_enc_path, final_path, decryption_key)
+                if ffmpeg_err is not None:
+                    logger.warning(f"[Amazon] ffmpeg decryption failed: {ffmpeg_err} — trying Python fallback")
+                if ffmpeg_err is not None:
+                    py_err = self._decrypt_cenc_python(temp_enc_path, final_path, decryption_key)
+                    if py_err is not None:
+                        raise RuntimeError(
+                            "[Amazon] Amazon returned an unreadable protected audio stream for this track."
+                        )
+                    else:
+                        logger.debug("[Amazon] Python CENC fallback succeeded.")
+                if os.path.exists(temp_enc_path):
+                    os.remove(temp_enc_path)
+        except Exception:
+            # Always clean up the encrypted temp file on any failure path so it
+            # doesn't accumulate as a leftover .enc.m4a in the album folder.
             if os.path.exists(temp_enc_path):
-                os.remove(temp_enc_path)
+                try:
+                    os.remove(temp_enc_path)
+                except OSError:
+                    pass
+            raise
 
         # Post-process: Standardize extension and remux if needed
         final_audio_path = self._finalize_audio(final_path)

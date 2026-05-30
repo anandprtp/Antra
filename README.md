@@ -42,6 +42,8 @@
 
 Paste any Spotify, Apple Music, Amazon Music, Tidal, Qobuz, or Deezer link (playlist, album, artist, track, or podcast) and Antra resolves the best available source, gets it, tags it with full metadata (title, artist, artwork, genre, lyrics), and organises it into a clean `Artist / Album` folder structure ready for Navidrome, Jellyfin, or Plex.
 
+The desktop app now also includes custom themes, so users can pick the look and mood of Antra from Settings.
+
 No Python. No setup pain. One binary.
 
 ```

@@ -29,11 +29,22 @@ export namespace main {
 	    max_retries?: number;
 	    library_mode?: string;
 	    prefer_explicit?: boolean;
+	    strict_matching: boolean;
 	    folder_structure?: string;
 	    album_folder_structure?: string;
 	    playlist_folder_structure?: string;
 	    single_track_structure?: string;
 	    filename_format?: string;
+	    single_track_filename_template?: string;
+	    album_zip_name_template?: string;
+	    album_track_filename_template?: string;
+	    folder_structure_template?: string;
+	    multi_disc_handling?: string;
+	    track_number_padding?: number;
+	    illegal_character_replacement?: string;
+	    whitespace_handling?: string;
+	    filename_conflict_behavior?: string;
+	    fetch_lyrics: boolean;
 	    spotify_sp_dc?: string;
 	    tidal_enabled: boolean;
 	    tidal_auth_mode?: string;
@@ -44,6 +55,8 @@ export namespace main {
 	    tidal_token_type?: string;
 	    tidal_country_code?: string;
 	    antra_api_key?: string;
+	    theme?: string;
+	    download_source?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -79,11 +92,22 @@ export namespace main {
 	        this.max_retries = source["max_retries"];
 	        this.library_mode = source["library_mode"];
 	        this.prefer_explicit = source["prefer_explicit"];
+	        this.strict_matching = source["strict_matching"];
 	        this.folder_structure = source["folder_structure"];
 	        this.album_folder_structure = source["album_folder_structure"];
 	        this.playlist_folder_structure = source["playlist_folder_structure"];
 	        this.single_track_structure = source["single_track_structure"];
 	        this.filename_format = source["filename_format"];
+	        this.single_track_filename_template = source["single_track_filename_template"];
+	        this.album_zip_name_template = source["album_zip_name_template"];
+	        this.album_track_filename_template = source["album_track_filename_template"];
+	        this.folder_structure_template = source["folder_structure_template"];
+	        this.multi_disc_handling = source["multi_disc_handling"];
+	        this.track_number_padding = source["track_number_padding"];
+	        this.illegal_character_replacement = source["illegal_character_replacement"];
+	        this.whitespace_handling = source["whitespace_handling"];
+	        this.filename_conflict_behavior = source["filename_conflict_behavior"];
+	        this.fetch_lyrics = source["fetch_lyrics"];
 	        this.spotify_sp_dc = source["spotify_sp_dc"];
 	        this.tidal_enabled = source["tidal_enabled"];
 	        this.tidal_auth_mode = source["tidal_auth_mode"];
@@ -94,6 +118,8 @@ export namespace main {
 	        this.tidal_token_type = source["tidal_token_type"];
 	        this.tidal_country_code = source["tidal_country_code"];
 	        this.antra_api_key = source["antra_api_key"];
+	        this.theme = source["theme"];
+	        this.download_source = source["download_source"];
 	    }
 	}
 	export class HistoryItem {
@@ -126,23 +152,29 @@ export namespace main {
 	        this.sources = source["sources"];
 	    }
 	}
-	export class KeyGenResult {
-	    ok: boolean;
-	    key?: string;
+	export class KeyInfoResult {
+	    valid: boolean;
+	    is_supporter: boolean;
+	    key_type?: string;
 	    expires_at?: string;
 	    download_limit?: number;
+	    download_count?: number;
+	    usage_today?: Record<string, any>;
 	    error?: string;
 	
 	    static createFrom(source: any = {}) {
-	        return new KeyGenResult(source);
+	        return new KeyInfoResult(source);
 	    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.ok = source["ok"];
-	        this.key = source["key"];
+	        this.valid = source["valid"];
+	        this.is_supporter = source["is_supporter"];
+	        this.key_type = source["key_type"];
 	        this.expires_at = source["expires_at"];
 	        this.download_limit = source["download_limit"];
+	        this.download_count = source["download_count"];
+	        this.usage_today = source["usage_today"];
 	        this.error = source["error"];
 	    }
 	}

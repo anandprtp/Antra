@@ -91,9 +91,13 @@ func (a *App) GetDownloadedMusicLibrary() string {
 	}
 
 	_ = a.ensureMediaServer()
+	albumStructure := cfg.AlbumFolderStructure
+	if albumStructure == "" {
+		albumStructure = cfg.FolderStructure
+	}
 	payload := libraryPayload{
-		Albums:    a.scanReleaseSummaries(root, "album", cfg.FolderStructure),
-		Playlists: a.scanReleaseSummaries(root, "playlist", cfg.FolderStructure),
+		Albums:    a.scanReleaseSummaries(root, "album", albumStructure),
+		Playlists: a.scanReleaseSummaries(root, "playlist", cfg.PlaylistFolderStructure),
 	}
 
 	data, err := json.Marshal(payload)
@@ -323,9 +327,9 @@ func (a *App) scanReleaseSummaries(root, kind, folderStructure string) []library
 	var releaseDirs []string
 	switch kind {
 	case "playlist":
-		releaseDirs = collectTopLevelReleaseDirs(filepath.Join(root, "Playlists"))
+		releaseDirs = collectPlaylistReleaseDirs(root)
 	default:
-		releaseDirs = collectAlbumReleaseDirs(filepath.Join(root, "Albums"), folderStructure)
+		releaseDirs = collectAlbumReleaseDirs(root, folderStructure)
 	}
 
 	results := make([]libraryReleaseSummary, 0, len(releaseDirs))
@@ -373,6 +377,37 @@ func (a *App) artworkURLForRelease(releaseDir string, trackPaths []string) strin
 }
 
 func collectAlbumReleaseDirs(albumsRoot, folderStructure string) []string {
+	releases := orderedUniquePaths(
+		collectLegacyAlbumReleaseDirs(filepath.Join(albumsRoot, "Albums"), folderStructure),
+		collectRootAlbumReleaseDirs(albumsRoot),
+	)
+	return releases
+}
+
+func collectTopLevelReleaseDirs(root string) []string {
+	if !dirExists(root) {
+		return nil
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+
+	var releases []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		fullPath := filepath.Join(root, entry.Name())
+		if hasAudioFilesRecursive(fullPath) {
+			releases = append(releases, fullPath)
+		}
+	}
+	return releases
+}
+
+func collectLegacyAlbumReleaseDirs(albumsRoot, folderStructure string) []string {
 	if !dirExists(albumsRoot) {
 		return nil
 	}
@@ -401,7 +436,57 @@ func collectAlbumReleaseDirs(albumsRoot, folderStructure string) []string {
 	return releases
 }
 
-func collectTopLevelReleaseDirs(root string) []string {
+func collectRootAlbumReleaseDirs(root string) []string {
+	if !dirExists(root) {
+		return nil
+	}
+
+	var releases []string
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if strings.EqualFold(name, "Albums") || strings.EqualFold(name, "Playlists") {
+			continue
+		}
+
+		fullPath := filepath.Join(root, name)
+		if !hasAudioFilesRecursive(fullPath) {
+			continue
+		}
+
+		hasDirectAudio := hasAudioFilesDirect(fullPath)
+		if hasDirectAudio {
+			if !hasPlaylistManifest(root, name) {
+				releases = append(releases, fullPath)
+			}
+			continue
+		}
+
+		childReleases := collectTopLevelReleaseDirs(fullPath)
+		if len(childReleases) == 0 {
+			releases = append(releases, fullPath)
+			continue
+		}
+		releases = append(releases, childReleases...)
+	}
+	return releases
+}
+
+func collectPlaylistReleaseDirs(root string) []string {
+	releases := orderedUniquePaths(
+		collectTopLevelReleaseDirs(filepath.Join(root, "Playlists")),
+		collectRootPlaylistReleaseDirs(root),
+	)
+	return releases
+}
+
+func collectRootPlaylistReleaseDirs(root string) []string {
 	if !dirExists(root) {
 		return nil
 	}
@@ -416,12 +501,32 @@ func collectTopLevelReleaseDirs(root string) []string {
 		if !entry.IsDir() {
 			continue
 		}
-		fullPath := filepath.Join(root, entry.Name())
-		if hasAudioFilesRecursive(fullPath) {
+		name := entry.Name()
+		if strings.EqualFold(name, "Albums") || strings.EqualFold(name, "Playlists") {
+			continue
+		}
+		fullPath := filepath.Join(root, name)
+		if hasPlaylistManifest(root, name) && hasAudioFilesRecursive(fullPath) {
 			releases = append(releases, fullPath)
 		}
 	}
 	return releases
+}
+
+func orderedUniquePaths(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	var combined []string
+	for _, group := range groups {
+		for _, path := range group {
+			clean := filepath.Clean(path)
+			if _, ok := seen[clean]; ok {
+				continue
+			}
+			seen[clean] = struct{}{}
+			combined = append(combined, clean)
+		}
+	}
+	return combined
 }
 
 func collectAudioFiles(root string) []string {
@@ -453,22 +558,46 @@ func hasAudioFilesRecursive(root string) bool {
 	return found
 }
 
+func hasAudioFilesDirect(root string) bool {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if isAudioFile(entry.Name()) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPlaylistManifest(root, dirName string) bool {
+	base := strings.TrimSpace(dirName)
+	if base == "" {
+		return false
+	}
+	manifestPath := filepath.Join(root, base+".m3u")
+	info, err := os.Stat(manifestPath)
+	return err == nil && !info.IsDir()
+}
+
 func inferReleaseNames(releaseDir, kind, root string) (string, string, string) {
 	title := filepath.Base(releaseDir)
 	artist := ""
 	if kind == "album" {
-		parent := filepath.Base(filepath.Dir(releaseDir))
-		if !strings.EqualFold(parent, "Albums") {
+		parentDir := filepath.Dir(releaseDir)
+		parent := filepath.Base(parentDir)
+		rootClean := filepath.Clean(root)
+		if filepath.Clean(parentDir) != rootClean && !strings.EqualFold(parent, "Albums") {
 			artist = parent
 		}
 	}
 	year := ""
-	if idx := strings.LastIndex(title, "("); idx >= 0 && strings.HasSuffix(title, ")") {
-		candidate := strings.TrimSuffix(strings.TrimSpace(title[idx+1:]), ")")
-		if len(candidate) == 4 && allDigits(candidate) {
-			year = candidate
-			title = strings.TrimSpace(title[:idx])
-		}
+	if year, title = extractYearFromReleaseTitle(title); title == "" {
+		title = filepath.Base(releaseDir)
 	}
 	if kind == "playlist" && artist == "" {
 		artist = "Playlist"
@@ -480,6 +609,40 @@ func inferReleaseNames(releaseDir, kind, root string) (string, string, string) {
 		title = "Music"
 	}
 	return title, artist, year
+}
+
+func extractYearFromReleaseTitle(title string) (string, string) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		return "", ""
+	}
+
+	if idx := strings.LastIndex(title, "("); idx >= 0 && strings.HasSuffix(title, ")") {
+		candidate := strings.TrimSuffix(strings.TrimSpace(title[idx+1:]), ")")
+		if len(candidate) == 4 && allDigits(candidate) {
+			return candidate, strings.TrimSpace(title[:idx])
+		}
+	}
+
+	if len(title) >= 7 && allDigits(title[:4]) {
+		rest := strings.TrimSpace(title[4:])
+		rest = strings.TrimLeft(rest, "-–— ")
+		if rest != "" {
+			return title[:4], rest
+		}
+	}
+
+	if strings.HasPrefix(title, "(") && len(title) >= 7 {
+		if idx := strings.Index(title, ")"); idx == 5 {
+			candidate := strings.TrimSpace(title[1:idx])
+			rest := strings.TrimSpace(title[idx+1:])
+			if len(candidate) == 4 && allDigits(candidate) && rest != "" {
+				return candidate, rest
+			}
+		}
+	}
+
+	return "", title
 }
 
 func inferReleaseKind(relativePath string) string {

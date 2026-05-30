@@ -8,9 +8,10 @@ from typing import Optional
 
 try:
     from dotenv import load_dotenv
-    # Load with override=True to ensure manual edits to .env
-    # are picked up if load_config is called multiple times.
-    load_dotenv(override=True)
+    # Load .env as a fallback only. Runtime environment variables from the
+    # desktop app / tests / user shell must win over repo defaults so generated
+    # keys and temporary overrides are not clobbered at import time.
+    load_dotenv(override=False)
 except ImportError:
     pass
 
@@ -141,7 +142,7 @@ class Config:
 
     # Download behaviour
     max_retries: int = 3
-    retry_delay: float = 2.0
+    retry_delay: float = 1.0
     fetch_lyrics: bool = True
     enrich_album_data: bool = True
     source_preference: str = "auto"
@@ -166,6 +167,9 @@ class Config:
     # (or whose adapter confirms is_explicit=False) and keeps searching for the
     # explicit version rather than immediately accepting the clean one.
     prefer_explicit: bool = True
+    # Opt-in safety mode for niche catalogs. When enabled, Antra becomes more
+    # willing to fail a track than accept a lower-confidence match.
+    strict_matching: bool = False
 
     # Library deduplication mode:
     #   "smart_dedup"  — skip a track if the same ISRC/ID exists anywhere in the library (default)
@@ -199,6 +203,15 @@ class Config:
     #   "artist_title" — Artist - Title
     #   "title_artist" — Title - Artist
     filename_format: str = "default"
+    single_track_filename_template: str = ""
+    album_zip_name_template: str = ""
+    album_track_filename_template: str = ""
+    folder_structure_template: str = ""
+    multi_disc_handling: str = "prefix"
+    track_number_padding: int = 2
+    illegal_character_replacement: str = ""
+    whitespace_handling: str = "preserve"
+    filename_conflict_behavior: str = "skip"
 
     # Direct Amazon Music credentials (JSON blob from amazon_creds.json).
     # When set, Antra calls the Amazon DMLS API directly with the user's own
@@ -298,7 +311,7 @@ def load_config() -> Config:
         amazon_insecure_mirrors=os.getenv("AMAZON_INSECURE_MIRRORS", "true").lower() == "true",
         hifi_enabled=os.getenv("HIFI_ENABLED", "false").lower() == "true",
         max_retries=int(os.getenv("MAX_RETRIES", "3")),
-        retry_delay=float(os.getenv("RETRY_DELAY", "2.0")),
+        retry_delay=float(os.getenv("RETRY_DELAY", "1.0")),
         fetch_lyrics=os.getenv("FETCH_LYRICS", "true").lower() == "true",
         enrich_album_data=os.getenv("ENRICH_ALBUM_DATA", "true").lower() == "true",
         source_preference=os.getenv("SOURCE_PREFERENCE", "auto"),
@@ -311,12 +324,22 @@ def load_config() -> Config:
         soulseek_seed_after_download=os.getenv("SOULSEEK_SEED_AFTER_DOWNLOAD", "false").lower() == "true",
         sources_enabled=os.getenv("SOURCES_ENABLED", ""),
         prefer_explicit=os.getenv("PREFER_EXPLICIT", "true").lower() == "true",
+        strict_matching=os.getenv("STRICT_MATCHING", "false").lower() == "true",
         library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
         album_folder_structure=os.getenv("ALBUM_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
         playlist_folder_structure=os.getenv("PLAYLIST_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
         single_track_structure=os.getenv("SINGLE_TRACK_STRUCTURE", "album_numbered"),
         filename_format=os.getenv("FILENAME_FORMAT", "default"),
+        single_track_filename_template=os.getenv("SINGLE_TRACK_FILENAME_TEMPLATE", ""),
+        album_zip_name_template=os.getenv("ALBUM_ZIP_NAME_TEMPLATE", ""),
+        album_track_filename_template=os.getenv("ALBUM_TRACK_FILENAME_TEMPLATE", ""),
+        folder_structure_template=os.getenv("FOLDER_STRUCTURE_TEMPLATE", ""),
+        multi_disc_handling=os.getenv("MULTI_DISC_HANDLING", "prefix"),
+        track_number_padding=int(os.getenv("TRACK_NUMBER_PADDING", "2")),
+        illegal_character_replacement=os.getenv("ILLEGAL_CHARACTER_REPLACEMENT", ""),
+        whitespace_handling=os.getenv("WHITESPACE_HANDLING", "preserve"),
+        filename_conflict_behavior=os.getenv("FILENAME_CONFLICT_BEHAVIOR", "skip"),
         amazon_direct_creds_json=os.getenv("AMAZON_DIRECT_CREDS_JSON", ""),
         amazon_wvd_path=os.getenv("AMAZON_WVD_PATH", ""),
         apple_authorization_token=os.getenv("APPLE_AUTHORIZATION_TOKEN", ""),

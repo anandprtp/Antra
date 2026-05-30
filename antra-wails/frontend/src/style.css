@@ -1,7 +1,26 @@
-:root {
-  --bg-color: #0d1c1c;
-  --fg-color: #a0d8d8;
-  --accent-color: #00ffcc;
+/* ── Default theme (Antra) ───────────────────────────────────────────────── */
+:root,
+:root[data-theme="antra"] {
+  --bg-color: #081412;
+  --bg-elevated: #102320;
+  --bg-overlay: rgba(5, 12, 11, 0.92);
+  --fg-color: #a8d6cf;
+  --text-primary: #edfef8;
+  --text-secondary: #9dc7bf;
+  --text-muted: #658179;
+  --text-faint: #445b55;
+  --accent-color: #37e2c2;
+  --accent-strong: #78f0da;
+  --accent-soft: rgba(55, 226, 194, 0.16);
+  --accent-border: rgba(55, 226, 194, 0.32);
+  --surface-color: rgba(255, 255, 255, 0.045);
+  --surface-light: rgba(255, 255, 255, 0.085);
+  --surface-strong: rgba(255, 255, 255, 0.13);
+  --surface-accent: rgba(55, 226, 194, 0.11);
+  --border-color: rgba(226, 255, 248, 0.08);
+  --border-strong: rgba(226, 255, 248, 0.16);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
   --error-color: #ff5555;
   --border-radius: 8px;
   --font-mono: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
@@ -14,6 +33,327 @@
   padding: 0;
   height: 100vh;
   overflow: hidden;
+}
+
+/* ── Linen theme ─────────────────────────────────────────────────────────── */
+:root[data-theme="linen"] {
+  --bg-color: #f6f1e7;
+  --bg-elevated: #ebe2d2;
+  --bg-overlay: rgba(241, 233, 220, 0.92);
+  --fg-color: #4f5e52;
+  --text-primary: #233126;
+  --text-secondary: #5e6e61;
+  --text-muted: #7c897d;
+  --text-faint: #a8b1a6;
+  --accent-color: #6c8a62;
+  --accent-strong: #7c9d71;
+  --accent-soft: rgba(108, 138, 98, 0.14);
+  --accent-border: rgba(108, 138, 98, 0.24);
+  --surface-color: rgba(255, 255, 255, 0.55);
+  --surface-light: rgba(255, 255, 255, 0.82);
+  --surface-strong: rgba(255, 255, 255, 0.94);
+  --surface-accent: rgba(108, 138, 98, 0.1);
+  --border-color: rgba(87, 72, 45, 0.12);
+  --border-strong: rgba(87, 72, 45, 0.2);
+  --success-color: #3b8f58;
+  --warning-color: #b8831f;
+  --error-color: #c45a48;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Ember theme ─────────────────────────────────────────────────────────── */
+:root[data-theme="ember"] {
+  --bg-color: #16100d;
+  --bg-elevated: #231914;
+  --bg-overlay: rgba(15, 10, 8, 0.93);
+  --fg-color: #e0baa0;
+  --text-primary: #fff2e6;
+  --text-secondary: #d0a17f;
+  --text-muted: #8c654b;
+  --text-faint: #5f4332;
+  --accent-color: #cf7a3a;
+  --accent-strong: #ea9557;
+  --accent-soft: rgba(207, 122, 58, 0.15);
+  --accent-border: rgba(207, 122, 58, 0.29);
+  --surface-color: rgba(255, 233, 213, 0.045);
+  --surface-light: rgba(255, 233, 213, 0.085);
+  --surface-strong: rgba(255, 233, 213, 0.13);
+  --surface-accent: rgba(207, 122, 58, 0.11);
+  --border-color: rgba(255, 233, 213, 0.08);
+  --border-strong: rgba(255, 233, 213, 0.16);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Ocean theme ─────────────────────────────────────────────────────────── */
+:root[data-theme="ocean"] {
+  --bg-color: #07111d;
+  --bg-elevated: #102033;
+  --bg-overlay: rgba(4, 9, 18, 0.93);
+  --fg-color: #9dbfd7;
+  --text-primary: #eef6ff;
+  --text-secondary: #90aecd;
+  --text-muted: #5f7590;
+  --text-faint: #3d526b;
+  --accent-color: #71a8e8;
+  --accent-strong: #9fc7f0;
+  --accent-soft: rgba(113, 168, 232, 0.16);
+  --accent-border: rgba(113, 168, 232, 0.3);
+  --surface-color: rgba(240, 248, 255, 0.045);
+  --surface-light: rgba(240, 248, 255, 0.085);
+  --surface-strong: rgba(240, 248, 255, 0.13);
+  --surface-accent: rgba(113, 168, 232, 0.11);
+  --border-color: rgba(240, 248, 255, 0.08);
+  --border-strong: rgba(240, 248, 255, 0.16);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Graphite theme ──────────────────────────────────────────────────────── */
+:root[data-theme="graphite"] {
+  --bg-color: #101113;
+  --bg-elevated: #1a1c20;
+  --bg-overlay: rgba(8, 9, 10, 0.94);
+  --fg-color: #b2b6be;
+  --text-primary: #f2f4f7;
+  --text-secondary: #a0a5ae;
+  --text-muted: #707680;
+  --text-faint: #4a4f58;
+  --accent-color: #b7bcc6;
+  --accent-strong: #d8dde5;
+  --accent-soft: rgba(183, 188, 198, 0.15);
+  --accent-border: rgba(183, 188, 198, 0.28);
+  --surface-color: rgba(255, 255, 255, 0.04);
+  --surface-light: rgba(255, 255, 255, 0.08);
+  --surface-strong: rgba(255, 255, 255, 0.12);
+  --surface-accent: rgba(183, 188, 198, 0.1);
+  --border-color: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Sunset theme ────────────────────────────────────────────────────────── */
+:root[data-theme="sunset"] {
+  --bg-color: #150d1a;
+  --bg-elevated: #24132b;
+  --bg-overlay: rgba(10, 5, 13, 0.93);
+  --fg-color: #d7b4c0;
+  --text-primary: #fff1f5;
+  --text-secondary: #d2a1b0;
+  --text-muted: #8b6672;
+  --text-faint: #5f444e;
+  --accent-color: #e091a3;
+  --accent-strong: #f4b1c0;
+  --accent-soft: rgba(224, 145, 163, 0.16);
+  --accent-border: rgba(224, 145, 163, 0.29);
+  --surface-color: rgba(255, 239, 245, 0.045);
+  --surface-light: rgba(255, 239, 245, 0.085);
+  --surface-strong: rgba(255, 239, 245, 0.13);
+  --surface-accent: rgba(224, 145, 163, 0.11);
+  --border-color: rgba(255, 239, 245, 0.08);
+  --border-strong: rgba(255, 239, 245, 0.16);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Spotify theme ───────────────────────────────────────────────────────── */
+/*    Faithful to Spotify's actual dark UI: pure noir base, no green cast    */
+/*    in backgrounds. Their green lives only in accent, exactly as intended. */
+:root[data-theme="spotify"] {
+  --bg-color: #121212;           /* Exact Spotify app background */
+  --bg-elevated: #1b1b1b;        /* Spotify card / elevated surface */
+  --bg-overlay: rgba(0, 0, 0, 0.93);
+  --fg-color: #b3b3b3;
+  --text-primary: #ffffff;        /* Spotify uses pure white for primary text */
+  --text-secondary: #b3b3b3;      /* Spotify's secondary label colour */
+  --text-muted: #7a7a7a;
+  --text-faint: #464646;
+  --accent-color: #1ed760;        /* Exact Spotify hover green for premium contrast */
+  --accent-strong: #1ed760;       /* Spotify hover/active green */
+  --accent-soft: rgba(29, 185, 84, 0.13);
+  --accent-border: rgba(29, 185, 84, 0.32);
+  --surface-color: rgba(255, 255, 255, 0.06);
+  --surface-light: rgba(255, 255, 255, 0.09);
+  --surface-strong: rgba(255, 255, 255, 0.14);
+  --surface-accent: rgba(29, 185, 84, 0.1);
+  --border-color: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --success-color: #1ed760;
+  --warning-color: #facc15;
+  --error-color: #e8565e;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── TIDAL theme ─────────────────────────────────────────────────────────── */
+/*    TIDAL's post-2021 luxury look: near-pitch-black base, crisp white      */
+/*    text, and a precise cool-water cyan. Minimal, editorial, premium.      */
+:root[data-theme="tidal"] {
+  --bg-color: #050607;           /* TIDAL's near-black, slight cool cast */
+  --bg-elevated: #0d1014;
+  --bg-overlay: rgba(0, 0, 0, 0.94);
+  --fg-color: #c9d5df;
+  --text-primary: #f2f5fa;        /* Crisp, barely-warm white */
+  --text-secondary: #93a0ab;
+  --text-muted: #5a656f;
+  --text-faint: #333b43;
+  --accent-color: #8ae5ff;        /* Cleaner cool-aqua highlight */
+  --accent-strong: #b6f0ff;
+  --accent-soft: rgba(138, 229, 255, 0.11);
+  --accent-border: rgba(138, 229, 255, 0.26);
+  --surface-color: rgba(255, 255, 255, 0.04);
+  --surface-light: rgba(255, 255, 255, 0.07);
+  --surface-strong: rgba(255, 255, 255, 0.11);
+  --surface-accent: rgba(138, 229, 255, 0.09);
+  --border-color: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Qobuz theme ─────────────────────────────────────────────────────────── */
+/*    Qobuz's hi-fi editorial feel: deep blue-black, a rich royal blue       */
+/*    accent, no purple cross-contamination. Classical and serious.          */
+:root[data-theme="qobuz"] {
+  --bg-color: #08101c;           /* Deep blue-black, Qobuz's true base */
+  --bg-elevated: #0f1a2b;
+  --bg-overlay: rgba(2, 4, 8, 0.95);
+  --fg-color: #9eb4cf;
+  --text-primary: #edf3ff;
+  --text-secondary: #8da4c0;
+  --text-muted: #5f738d;
+  --text-faint: #38485e;
+  --accent-color: #3d7fe3;        /* Qobuz royal blue — their brand primary */
+  --accent-strong: #76abff;
+  --accent-soft: rgba(61, 127, 227, 0.12);
+  --accent-border: rgba(61, 127, 227, 0.27);
+  --surface-color: rgba(255, 255, 255, 0.04);
+  --surface-light: rgba(255, 255, 255, 0.075);
+  --surface-strong: rgba(255, 255, 255, 0.12);
+  --surface-accent: rgba(61, 127, 227, 0.1);
+  --border-color: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Deezer theme ────────────────────────────────────────────────────────── */
+/*    Deezer's energy: deep purple-charcoal base with their electric         */
+/*    violet — the exact gradient start colour from their brand system.      */
+:root[data-theme="deezer"] {
+  --bg-color: #120d18;           /* Deep violet-black — Deezer dark base */
+  --bg-elevated: #1d1526;
+  --bg-overlay: rgba(4, 2, 9, 0.95);
+  --fg-color: #c3addd;
+  --text-primary: #f5efff;
+  --text-secondary: #a691bc;
+  --text-muted: #6c597e;
+  --text-faint: #473857;
+  --accent-color: #A238FF;        /* Deezer electric violet — exact brand */
+  --accent-strong: #d082ff;
+  --accent-soft: rgba(162, 56, 255, 0.13);
+  --accent-border: rgba(162, 56, 255, 0.28);
+  --surface-color: rgba(255, 255, 255, 0.04);
+  --surface-light: rgba(255, 255, 255, 0.08);
+  --surface-strong: rgba(255, 255, 255, 0.13);
+  --surface-accent: rgba(162, 56, 255, 0.11);
+  --border-color: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Apple Music theme ───────────────────────────────────────────────────── */
+/*    A premium light interpretation based on Apple's current bright UI      */
+/*    language: porcelain surfaces, cool greys, and the exact rose accent.  */
+:root[data-theme="apple-music"] {
+  --bg-color: #fbfbfd;
+  --bg-elevated: #ececf1;
+  --bg-overlay: rgba(245, 245, 248, 0.92);
+  --fg-color: #5f6370;
+  --text-primary: #1d1d21;
+  --text-secondary: #555867;
+  --text-muted: #7b7d89;
+  --text-faint: #adb0ba;
+  --accent-color: #FF375F;        /* Exact Apple Music crimson-rose */
+  --accent-strong: #ff6d8b;
+  --accent-soft: rgba(255, 55, 95, 0.11);
+  --accent-border: rgba(255, 55, 95, 0.23);
+  --surface-color: rgba(255, 255, 255, 0.68);
+  --surface-light: rgba(255, 255, 255, 0.9);
+  --surface-strong: rgba(255, 255, 255, 0.98);
+  --surface-accent: rgba(255, 55, 95, 0.10);
+  --border-color: rgba(39, 41, 51, 0.09);
+  --border-strong: rgba(39, 41, 51, 0.14);
+  --success-color: #32a852;
+  --warning-color: #c99218;
+  --error-color: #d64a42;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
+}
+
+/* ── Amazon Music theme ──────────────────────────────────────────────────── */
+/*    Amazon Music's dark app — not Amazon orange, that's retail. The music  */
+/*    app uses a deep navy-charcoal base with their precise sky-blue #00A8E1 */
+/*    that lives in the waveform logo and primary interactive elements.      */
+:root[data-theme="amazon-music"] {
+  --bg-color: #0b1220;            /* Amazon Music dark navy base */
+  --bg-elevated: #101a2b;
+  --bg-overlay: rgba(2, 4, 10, 0.95);
+  --fg-color: #97b8d6;
+  --text-primary: #eef6ff;
+  --text-secondary: #8aa7c5;
+  --text-muted: #5d7691;
+  --text-faint: #3a4d64;
+  --accent-color: #18a8ff;        /* Amazon Music signature blue */
+  --accent-strong: #54c0ff;
+  --accent-soft: rgba(24, 168, 255, 0.11);
+  --accent-border: rgba(24, 168, 255, 0.27);
+  --surface-color: rgba(255, 255, 255, 0.04);
+  --surface-light: rgba(255, 255, 255, 0.075);
+  --surface-strong: rgba(255, 255, 255, 0.12);
+  --surface-accent: rgba(24, 168, 255, 0.09);
+  --border-color: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --success-color: #4ade80;
+  --warning-color: #facc15;
+  --error-color: #ff5555;
+  --border-radius: 8px;
+  background-color: var(--bg-color);
+  color: var(--fg-color);
 }
 
 body {
@@ -44,9 +384,9 @@ input, button {
 }
 
 button {
-  background-color: rgba(0, 255, 204, 0.1);
+  background-color: var(--accent-soft);
   color: var(--accent-color);
-  border: 1px solid var(--accent-color);
+  border: 1px solid var(--accent-border);
   border-radius: 4px;
   padding: 8px 16px;
   cursor: pointer;
@@ -58,15 +398,23 @@ button:hover {
   color: #000;
 }
 
-input[type="text"] {
-  background: rgba(0, 0, 0, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: white;
+input[type="text"],
+input[type="password"],
+input[type="number"],
+textarea,
+select {
+  background: color-mix(in srgb, var(--bg-color) 74%, black);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
   padding: 8px;
   border-radius: 4px;
   width: 100%;
 }
-input[type="text"]:focus {
+input[type="text"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+textarea:focus,
+select:focus {
   outline: none;
   border-color: var(--accent-color);
 }

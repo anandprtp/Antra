@@ -15,6 +15,25 @@ def normalize(text: str) -> str:
     return text
 
 
+# Matches collaboration credits that catalog search engines don't index:
+# "(with X)", "[with X]", "(feat. X)", "[feat. X]", "(ft. X)", "(featuring X)", etc.
+_COLLAB_CREDIT_RE = re.compile(
+    r"\s*[\(\[](with|feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]",
+    re.IGNORECASE,
+)
+
+
+def strip_collab(title: str) -> str:
+    """Remove collaboration credits from a track title before sending to catalog
+    search APIs. Catalogs index tracks under the clean title only — including
+    '(with Travis Scott)' or '[feat. Future]' breaks text search.
+
+    Used for search query construction only; raw title is still used for
+    similarity scoring so the match is validated against the full title.
+    """
+    return _COLLAB_CREDIT_RE.sub("", title).strip()
+
+
 def string_similarity(a: str, b: str) -> float:
     """0.0–1.0 similarity between two strings after normalization."""
     a, b = normalize(a), normalize(b)
@@ -56,12 +75,35 @@ def score_similarity(
     # below LOSSLESS_ACCEPT_THRESHOLD (0.55) so a perfect title match on a
     # common song title (e.g. "White Christmas") doesn't pull in the wrong artist.
     # Only bypass this when the result has no artist info at all (empty string).
+    # Exception: if the title match is very strong (≥ 0.85), the track is
+    # distinctive enough to trust the title alone — skip the hard cap.
     if best_artist_score < 0.45 and result_artist.strip():
-        return min(composite, 0.50)
+        if title_score >= 0.90:
+            pass  # distinctive title — trust it
+        elif title_score >= 0.75:
+            return min(composite, 0.55)  # moderate confidence — softer cap
+        else:
+            return min(composite, 0.50)
 
     return composite
 
 
 def duration_close(expected_s: float, actual_s: float, tolerance: int = 10) -> bool:
-    """Return True if durations are within `tolerance` seconds of each other."""
-    return abs(expected_s - actual_s) <= tolerance
+    """Return True if durations are within an adaptive tolerance window.
+
+    Cross-service catalogs often disagree by a few extra seconds because of
+    leading silence, trailing fade-outs, regional edits, or metadata rounding.
+    A hard 5-second cutoff is too strict for long tracks and DJ mixes, so we
+    keep the caller-provided tolerance as a floor and expand it slightly for
+    longer recordings.
+    """
+    try:
+        expected = float(expected_s)
+        actual = float(actual_s)
+    except (TypeError, ValueError):
+        return False
+
+    longer = max(expected, actual)
+    adaptive_tolerance = min(30.0, longer * 0.045)
+    effective_tolerance = max(float(tolerance), adaptive_tolerance)
+    return abs(expected - actual) <= effective_tolerance
