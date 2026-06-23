@@ -5,6 +5,7 @@ Embeds: title, artists, album, year, track number, genre, artwork, lyrics.
 """
 import logging
 import os
+import threading
 from io import BytesIO
 from typing import Optional
 
@@ -62,6 +63,8 @@ class FileTagger:
         # Cache artwork by URL so albums only hit the CDN once regardless of
         # how many tracks share the same artwork_url.
         self._artwork_cache: dict[str, Optional[tuple[bytes, str, int, int, int]]] = {}
+        self._raw_artwork_cache: dict[str, Optional[tuple[bytes, str]]] = {}
+        self._sidecar_lock = threading.Lock()
 
     def tag(
         self,
@@ -100,6 +103,35 @@ class FileTagger:
         except Exception as e:
             logger.error(f"Failed to tag {file_path}: {e}")
             return False
+
+    def save_cover_art_sidecar(self, file_path: str, track: TrackMetadata) -> Optional[str]:
+        if not track.artwork_url:
+            return None
+
+        folder = os.path.dirname(file_path)
+        if not folder:
+            return None
+
+        with self._sidecar_lock:
+            existing = self._existing_cover_sidecar(folder)
+            if existing:
+                return existing
+
+            artwork = self._fetch_raw_artwork(track.artwork_url)
+            if not artwork:
+                return None
+
+            data, mime = artwork
+            ext = ".png" if mime == "image/png" else ".jpg"
+            out_path = os.path.join(folder, f"cover{ext}")
+            try:
+                with open(out_path, "wb") as fh:
+                    fh.write(data)
+                logger.debug("Saved cover art sidecar: %s", out_path)
+                return out_path
+            except Exception as e:
+                logger.warning("Failed to save cover art sidecar for %s: %s", file_path, e)
+                return None
 
     # ── FLAC ──────────────────────────────────────────────────────────────
 
@@ -281,6 +313,64 @@ class FileTagger:
 
         self._artwork_cache[url] = result
         return result
+
+    @staticmethod
+    def _existing_cover_sidecar(folder: str) -> Optional[str]:
+        for name in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png"):
+            path = os.path.join(folder, name)
+            if os.path.exists(path):
+                return path
+        return None
+
+    def _fetch_raw_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str]]:
+        if not url:
+            return None
+        if url in self._raw_artwork_cache:
+            return self._raw_artwork_cache[url]
+
+        result: Optional[tuple[bytes, str]] = None
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                result = FileTagger._prepare_sidecar_artwork(resp.content, resp.headers.get("Content-Type"))
+                break
+            except Exception as e:
+                if attempt < 2:
+                    import time
+                    time.sleep(1.5 ** attempt)
+                else:
+                    logger.warning(f"Failed to download sidecar artwork from {url}: {e}")
+
+        self._raw_artwork_cache[url] = result
+        return result
+
+    @staticmethod
+    def _prepare_sidecar_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str]:
+        mime = _sniff_image_mime(data, response_mime)
+        if Image is None:
+            return data, mime
+
+        image = Image.open(BytesIO(data))
+        image.load()
+        if mime == "image/png" and image.mode in ("RGBA", "LA"):
+            out = BytesIO()
+            image.save(out, format="PNG", optimize=True)
+            return out.getvalue(), "image/png"
+
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+            mime = "image/jpeg"
+
+        if mime == "image/png":
+            out = BytesIO()
+            image.save(out, format="PNG", optimize=True)
+            return out.getvalue(), "image/png"
+
+        out = BytesIO()
+        image = image.convert("RGB")
+        image.save(out, format="JPEG", quality=95, optimize=True)
+        return out.getvalue(), "image/jpeg"
 
     @staticmethod
     def _normalize_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str, int, int, int]:

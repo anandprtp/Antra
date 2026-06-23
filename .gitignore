@@ -108,6 +108,7 @@ antra/test_format.py
 README\ -\ Copy.md
 CHANGELOG_v1.1.4.md
 CHANGELOG_v1.1.6.md
+CHANGELOG_v1.1.7.md
 PERSONAL_CREDS_FEATURE.md
 V116_RECOVERY.md
 
@@ -120,3 +121,8 @@ context.md
 # Dev scratch
 engine_patch.py
 supporter_keys.xlsx
+backup-vps.ps1
+fix_amazon_opus.py
+
+# Source art for health-check chips (processed copies live in frontend/public/icons/)
+healthtabicons/

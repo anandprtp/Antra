@@ -91,7 +91,6 @@ def setup_logging(log_dir: str | None = None, level: int = logging.INFO, verbose
         for logger_name in [
             "antra.sources.hifi",
             "antra.sources.yams",
-            "antra.sources.dab",
             "antra.sources.jiosaavn",
             "antra.sources.amazon",
             "antra.sources.apple",

@@ -104,7 +104,7 @@ class LibraryOrganizer:
             else:
                 folder = self.playlists_root / playlist_dir
             folder.mkdir(parents=True, exist_ok=True)
-            return str(self._resolve_conflict_path(folder, filename))
+            return str(self._resolve_conflict_path(folder, filename, track=track))
 
         if (track.request_kind or "").lower() == "track":
             return self._single_track_output_path(track)
@@ -112,7 +112,7 @@ class LibraryOrganizer:
         folder = self._album_folder(track)
         filename = self._format_filename(track, track.track_number)
         folder.mkdir(parents=True, exist_ok=True)
-        return str(self._resolve_conflict_path(folder, filename))
+        return str(self._resolve_conflict_path(folder, filename, track=track))
 
     def _single_track_output_path(self, track: TrackMetadata) -> str:
         if self.single_track_structure == "file":
@@ -122,7 +122,7 @@ class LibraryOrganizer:
             folder = self._album_folder(track)
             filename = build_single_track_stem(track, self.filename_preferences)
         folder.mkdir(parents=True, exist_ok=True)
-        return str(self._resolve_conflict_path(folder, filename))
+        return str(self._resolve_conflict_path(folder, filename, track=track))
 
     @staticmethod
     def _extract_album_from_folder_leaf(leaf: str) -> str:
@@ -252,6 +252,8 @@ class LibraryOrganizer:
             if os.path.exists(candidate):
                 if self.filename_preferences.get("filename_conflict_behavior") == "overwrite":
                     return None
+                if not self._file_matches_track_identity(track, Path(candidate)):
+                    continue
                 self._mark_done(track, candidate)
                 return candidate
 
@@ -295,9 +297,25 @@ class LibraryOrganizer:
         manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return str(manifest_path)
 
-    def _resolve_conflict_path(self, folder: Path, stem: str) -> Path:
-        if self.filename_preferences.get("filename_conflict_behavior") != "append_counter":
-            return folder / stem
+    def _resolve_conflict_path(self, folder: Path, stem: str, track: Optional[TrackMetadata] = None) -> Path:
+        behavior = self.filename_preferences.get("filename_conflict_behavior")
+        if behavior != "append_counter":
+            if not track:
+                return folder / stem
+            existing_paths = [
+                folder / f"{stem}{ext}"
+                for ext in SUPPORTED_AUDIO_EXTENSIONS
+                if (folder / f"{stem}{ext}").exists()
+            ]
+            if not existing_paths:
+                return folder / stem
+            if any(self._file_matches_track_identity(track, path) for path in existing_paths):
+                return folder / stem
+            counter = 2
+            while any((folder / f"{stem} ({counter}){ext}").exists() for ext in SUPPORTED_AUDIO_EXTENSIONS):
+                counter += 1
+            return folder / f"{stem} ({counter})"
+
         candidate = folder / stem
         if not any((folder / f"{stem}{ext}").exists() for ext in SUPPORTED_AUDIO_EXTENSIONS):
             return candidate
@@ -410,6 +428,20 @@ class LibraryOrganizer:
         if ext in {".m4a", ".mp4"}:
             return self._extract_mp4_identity_keys(path)
         return self._extract_filename_identity_keys(path)
+
+    def _file_matches_track_identity(self, track: TrackMetadata, path: Path) -> bool:
+        """Return True only when an existing file is the same logical track.
+
+        A path collision alone is not enough to skip. Playlists can contain
+        distinct covers with the same title, and title-only filename templates
+        render those tracks to the same stem.
+        """
+        try:
+            existing_keys = set(self._extract_identity_keys_from_file(path))
+        except Exception as e:
+            logger.debug(f"Could not inspect existing file identity for {path}: {e}")
+            return False
+        return bool(existing_keys.intersection(self._track_identity_keys(track)))
 
     def _extract_flac_identity_keys(self, path: Path) -> list[str]:
         audio = FLAC(path)

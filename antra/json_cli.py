@@ -1742,6 +1742,94 @@ async def _capture_amazon_session_headless_async(playwright_cookies: list[dict])
         )
     return captured
 
+def _run_capture_sp_dc() -> None:
+    """Open a browser, navigate to Spotify login, and poll CDP cookies until sp_dc appears."""
+    import asyncio as _asyncio
+
+    async def _runner():
+        print(json.dumps({
+            "type": "sp_dc_status",
+            "status": "launching",
+            "message": "Opening browser for Spotify login...",
+        }), flush=True)
+
+        # open.spotify.com/login now 404s ("Page not found"). Use the canonical
+        # accounts.spotify.com login page, which after sign-in redirects back to
+        # open.spotify.com and sets the sp_dc cookie we poll for below.
+        launch_state = _launch_debug_browser_process(
+            "Spotify",
+            "https://accounts.spotify.com/en/login?continue=https%3A%2F%2Fopen.spotify.com%2F",
+        )
+        port = int(launch_state["debug_port"])
+
+        try:
+            session = await _cdp_connect(port, timeout=30.0)
+            try:
+                # Wait for a page tab to attach
+                import requests as _req
+                sid = None
+                for _ in range(20):
+                    try:
+                        tabs = _req.get(f"http://127.0.0.1:{port}/json", timeout=2).json()
+                        page_tabs = [t for t in tabs if t.get("type") == "page"]
+                        if page_tabs:
+                            sid = await _cdp_attach_tab(session, page_tabs[0]["id"])
+                            await session.send("Network.enable", {}, session_id=sid)
+                            break
+                    except Exception:
+                        pass
+                    await _asyncio.sleep(1)
+
+                if not sid:
+                    raise RuntimeError("Could not attach to browser tab.")
+
+                print(json.dumps({
+                    "type": "sp_dc_status",
+                    "status": "waiting",
+                    "message": "Sign in to Spotify in the browser. Antra will capture your session automatically.",
+                }), flush=True)
+
+                # Poll for up to 5 minutes for sp_dc cookie
+                sp_dc = None
+                for _ in range(300):
+                    try:
+                        cookies = await _cdp_get_cookies(session, sid, ["https://open.spotify.com"])
+                        for c in cookies:
+                            if c.get("name") == "sp_dc" and c.get("value", "").startswith("AQ"):
+                                sp_dc = c["value"]
+                                break
+                    except Exception:
+                        pass
+                    if sp_dc:
+                        break
+                    await _asyncio.sleep(1)
+
+                if not sp_dc:
+                    raise RuntimeError("Timed out waiting for Spotify login. Please try again.")
+
+                print(json.dumps({
+                    "type": "sp_dc_captured",
+                    "sp_dc": sp_dc,
+                }), flush=True)
+
+            finally:
+                await session.stop()
+        except Exception as exc:
+            print(json.dumps({
+                "type": "sp_dc_error",
+                "message": str(exc),
+            }), flush=True)
+        finally:
+            try:
+                proc = launch_state.get("proc")
+                if proc:
+                    proc.terminate()
+            except Exception:
+                pass
+
+    _asyncio.run(_runner())
+
+
 def _run_apple_browser_login(cfg, config_path: str | None) -> None:
     async def _runner():
         print(json.dumps({
@@ -2148,6 +2236,124 @@ def _run_amazon_browser_login(cfg, config_path):
         "message": _message,
     }), flush=True)
 
+def _run_auto_sync(cfg) -> None:
+    """Download new tracks from all tracked playlists.
+
+    Reads ``cfg.tracked_playlists`` (a list of dicts with ``url``, ``name``,
+    ``last_track_ids``).  For each playlist, fetches current tracks, finds
+    the diff against ``last_track_ids``, downloads new tracks only, and
+    writes back the updated ``last_track_ids`` and ``last_sync_ts`` to the
+    config file so subsequent runs are incremental.
+    """
+    import json as _json
+    # tracked_playlists can't travel via env vars — read from config.json directly.
+    config_path = os.environ.get("ANTRA_CONFIG_PATH", "")
+    tracked = []
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as _f:
+                _raw = _json.load(_f)
+            tracked = _raw.get("tracked_playlists") or []
+        except Exception:
+            pass
+    if not tracked:
+        print(_json.dumps({
+            "type": "auto_sync_summary",
+            "message": "No tracked playlists configured.",
+            "synced": 0,
+            "new_tracks": 0,
+        }), flush=True)
+        return
+
+    service = AntraService(cfg)
+    options = RuntimeOptions(
+        output_dir=cfg.output_dir,
+        output_format=cfg.output_format,
+        source_preference=cfg.source_preference,
+    )
+    total_new = 0
+    synced = 0
+
+    for entry in tracked:
+        # sync_enabled defaults True for legacy entries created before Stash-model migration
+        if not entry.get("sync_enabled", True):
+            continue
+        url = (entry.get("url") or "").strip()
+        if not url:
+            continue
+        name = entry.get("name") or url
+        known_ids: set[str] = set(entry.get("last_track_ids") or [])
+
+        try:
+            tracks = service.fetch_playlist_tracks(url)
+        except Exception as e:
+            print(_json.dumps({
+                "type": "auto_sync_playlist_error",
+                "url": url,
+                "name": name,
+                "message": str(e),
+            }), flush=True)
+            continue
+
+        def _track_id(t):
+            if t.isrc:
+                return t.isrc
+            return f"{t.artist_string}:{t.title}".lower()
+
+        current_ids = {_track_id(t): t for t in tracks}
+        new_tracks = [t for tid, t in current_ids.items() if tid not in known_ids]
+
+        print(_json.dumps({
+            "type": "auto_sync_playlist_start",
+            "url": url,
+            "name": name,
+            "total_tracks": len(tracks),
+            "new_tracks": len(new_tracks),
+        }), flush=True)
+
+        if new_tracks:
+            def _on_event(ev):
+                print(_json.dumps({
+                    "type": ev.event_type.value,
+                    "track": getattr(ev, "track_title", None),
+                    "status": getattr(ev, "status", None),
+                }), flush=True)
+
+            service.download_tracks(new_tracks, options=options, event_callback=_on_event)
+            total_new += len(new_tracks)
+
+        # Update entry in-place so caller can persist
+        entry["last_track_ids"] = list(current_ids.keys())
+        entry["last_sync_ts"] = int(time.time())
+        entry["name"] = (tracks[0].playlist_name if tracks and tracks[0].playlist_name else name)
+        synced += 1
+
+    # Persist updated tracked_playlists back to config.json
+    _persist_tracked_playlists(tracked)
+
+    print(_json.dumps({
+        "type": "auto_sync_summary",
+        "synced": synced,
+        "new_tracks": total_new,
+    }), flush=True)
+
+
+def _persist_tracked_playlists(tracked: list) -> None:
+    """Write updated tracked_playlists back to config.json."""
+    import json as _json
+    config_path = os.environ.get("ANTRA_CONFIG_PATH", "")
+    if not config_path or not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        data["tracked_playlists"] = tracked
+        with open(config_path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Could not persist tracked_playlists to config: %s", e)
+
+
 def main():
 
     _start_time = time.time()
@@ -2188,6 +2394,14 @@ def main():
                         help="Open a browser and capture the Apple Music session automatically")
     parser.add_argument("--amazon-browser-login", action="store_true",
                         help="Open a browser and capture the Amazon Music session automatically")
+    parser.add_argument("--capture-sp-dc", action="store_true",
+                        help="Open a browser to Spotify login and auto-capture the sp_dc cookie")
+    parser.add_argument("--spotify-library", action="store_true",
+                        help="Fetch user's Spotify library (playlists + Liked Songs count) and exit")
+    parser.add_argument("--apple-library", action="store_true",
+                        help="Fetch user's Apple Music library (playlists + saved songs count) and exit")
+    parser.add_argument("--auto-sync", action="store_true",
+                        help="Run auto-sync: download new tracks from all tracked playlists, then exit")
     args = parser.parse_args()
 
     ensure_runtime_environment()
@@ -2467,10 +2681,30 @@ def main():
             if settings.get("antra_api_key") is not None:
                 os.environ["ANTRA_API_KEY"] = str(settings.get("antra_api_key") or "")
 
-            # Download source override — routes all downloads through a single service.
-            # "auto" (default) preserves existing quality-aware multi-source behavior.
-            if "download_source" in settings:
-                os.environ["SOURCE_PREFERENCE"] = str(settings.get("download_source") or "auto")
+            # Download source override. "auto" preserves the full quality-aware
+            # resolver chain; a list limits downloads to the selected services.
+            download_sources = settings.get("download_sources")
+            if isinstance(download_sources, list):
+                cleaned_sources = [str(src).strip() for src in download_sources if str(src).strip()]
+                os.environ["SOURCE_PREFERENCES"] = ",".join(cleaned_sources) if cleaned_sources else "auto"
+            elif "download_source" in settings:
+                os.environ["SOURCE_PREFERENCES"] = str(settings.get("download_source") or "auto")
+
+            if "save_cover_art_sidecar" in settings:
+                os.environ["SAVE_COVER_ART_SIDECAR"] = "true" if settings["save_cover_art_sidecar"] else "false"
+
+            # Auto-sync settings
+            if "auto_sync_enabled" in settings:
+                os.environ["AUTO_SYNC_ENABLED"] = "true" if settings["auto_sync_enabled"] else "false"
+            if "auto_sync_hour" in settings:
+                os.environ["AUTO_SYNC_HOUR"] = str(settings.get("auto_sync_hour") or 6)
+            if "auto_sync_minute" in settings:
+                os.environ["AUTO_SYNC_MINUTE"] = str(settings.get("auto_sync_minute") or 0)
+            if "auto_sync_days" in settings:
+                os.environ["AUTO_SYNC_DAYS"] = str(settings.get("auto_sync_days") or 127)
+
+            # Store config file path so _persist_tracked_playlists can write back
+            os.environ["ANTRA_CONFIG_PATH"] = args.config
 
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Failed to load config: {e}"}))
@@ -2490,12 +2724,61 @@ def main():
         _run_tidal_oauth_login(cfg, args.config)
         sys.exit(0)
 
+    if args.capture_sp_dc:
+        _run_capture_sp_dc()
+        sys.exit(0)
+
     if args.apple_browser_login:
         _run_apple_browser_login(cfg, args.config)
         sys.exit(0)
 
     if args.amazon_browser_login:
         _run_amazon_browser_login(cfg, args.config)
+        sys.exit(0)
+
+    if args.spotify_library:
+        try:
+            sp_dc = cfg.spotify_sp_dc
+            if not sp_dc:
+                raise RuntimeError(
+                    "No Spotify sp_dc cookie configured. "
+                    "Add it in Settings → Spotify Podcasts to enable library access."
+                )
+            from antra.core.spotify_library import SpotifyLibraryClient
+            client = SpotifyLibraryClient(sp_dc)
+            data = client.get_library()
+            print(json.dumps({"type": "spotify_library", "data": data}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.apple_library:
+        try:
+            authorization = (cfg.apple_authorization_token or "").strip()
+            music_user_token = (cfg.apple_music_user_token or "").strip()
+            storefront = (cfg.apple_storefront or "us").strip() or "us"
+            if not authorization or not music_user_token:
+                raise RuntimeError(
+                    "No Apple Music web session configured. "
+                    "Connect Apple Music in Settings to enable library access."
+                )
+            from antra.core.apple_library import AppleLibraryClient
+            client = AppleLibraryClient(
+                authorization_token=authorization,
+                music_user_token=music_user_token,
+                storefront=storefront,
+            )
+            data = client.get_library()
+            print(json.dumps({"type": "apple_library", "data": data}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.auto_sync:
+        try:
+            _run_auto_sync(cfg)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
         sys.exit(0)
 
     print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Album layout: {getattr(cfg, 'album_folder_structure', cfg.folder_structure)} | Playlist layout: {getattr(cfg, 'playlist_folder_structure', cfg.folder_structure)} | Single layout: {getattr(cfg, 'single_track_structure', 'album_numbered')} | Output format: {cfg.output_format}"}))

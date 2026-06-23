@@ -33,6 +33,7 @@ class YouTubeAdapter(BaseSourceAdapter):
     name = "youtube"
     priority = 5
     always_lossy = True
+    is_last_resort = True  # placed after all lossless adapters even in MP3 mode
 
     def is_available(self) -> bool:
         try:

@@ -83,13 +83,8 @@ class Config:
     yams_enabled: bool = True
     yams_auth_token: str = ""
 
-    # DAB Music download adapter (optional — community Qobuz proxy based).
-    # Disabled by default because these public endpoints are no longer used
-    # for downloads. The adapter remains available as an explicit opt-in.
-    dab_enabled: bool = False
-
     # Qobuz Proxy (optional — no credentials needed, free FLAC via community
-    # Qobuz proxy endpoints: dab.yeet.su/api/stream, dabmusic.xyz, qobuz.squid.wtf)
+    # Qobuz proxy endpoints: qobuz.squid.wtf, etc.)
     qobuz_proxy_enabled: bool = True
 
     # JioSaavn (optional — no credentials needed, India-focused AAC 320kbps)
@@ -147,6 +142,7 @@ class Config:
     enrich_album_data: bool = True
     source_preference: str = "auto"
     output_format: str = "flac"
+    save_cover_art_sidecar: bool = False
 
     # Soulseek / slskd (optional)
     soulseek_base_url: str = ""
@@ -255,6 +251,23 @@ class Config:
     # Override with ANTRA_API_KEY if you want to bypass the manifest for testing.
     antra_api_key: str = ""
 
+    # Auto-sync / scheduled downloads
+    auto_sync_enabled: bool = False
+    # Hour (0–23) and minute (0–59) in local time when auto-sync fires.
+    auto_sync_hour: int = 6
+    auto_sync_minute: int = 0
+    # Bitmask of days: bit 0 = Monday … bit 6 = Sunday. 127 = every day.
+    auto_sync_days: int = 127
+    # List of tracked playlist dicts: {url, last_track_ids: [...], last_sync: ISO}
+    # Stored directly in config.json — too complex for env var encoding.
+    tracked_playlists: list = field(default_factory=list)
+
+    # Persistent provider priority (SF-1). When enabled, the resolver remembers
+    # which adapters recently delivered (or failed) and reorders them within each
+    # quality tier across sessions. Empty db_path → default user-data location.
+    provider_stats_enabled: bool = True
+    provider_stats_db_path: str = ""
+
 
 def load_config() -> Config:
     """Load configuration from environment variables."""
@@ -287,7 +300,6 @@ def load_config() -> Config:
         tidal_country_code=os.getenv("TIDAL_COUNTRY_CODE", ""),
         yams_enabled=os.getenv("YAMS_ENABLED", "true").lower() == "true",
         yams_auth_token=os.getenv("YAMS_AUTH_TOKEN", ""),
-        dab_enabled=os.getenv("DAB_ENABLED", "false").lower() == "true",
         qobuz_proxy_enabled=os.getenv("QOBUZ_PROXY_ENABLED", "true").lower() == "true",
         jiosaavn_enabled=os.getenv("JIOSAAVN_ENABLED", "true").lower() == "true",
         jiosaavn_quality=os.getenv("JIOSAAVN_QUALITY", "320"),
@@ -314,8 +326,9 @@ def load_config() -> Config:
         retry_delay=float(os.getenv("RETRY_DELAY", "1.0")),
         fetch_lyrics=os.getenv("FETCH_LYRICS", "true").lower() == "true",
         enrich_album_data=os.getenv("ENRICH_ALBUM_DATA", "true").lower() == "true",
-        source_preference=os.getenv("SOURCE_PREFERENCE", "auto"),
+        source_preference=os.getenv("SOURCE_PREFERENCES", os.getenv("SOURCE_PREFERENCE", "auto")),
         output_format=os.getenv("OUTPUT_FORMAT", "flac"),
+        save_cover_art_sidecar=os.getenv("SAVE_COVER_ART_SIDECAR", "false").lower() == "true",
         soulseek_base_url=os.getenv("SLSKD_BASE_URL", ""),
         soulseek_api_key=os.getenv("SLSKD_API_KEY", ""),
         soulseek_username=os.getenv("SOULSEEK_USERNAME", ""),
@@ -350,5 +363,15 @@ def load_config() -> Config:
         qobuz_mirror_url=os.getenv("QOBUZ_MIRROR_URL", ""),
         deezer_mirror_url=os.getenv("DEEZER_MIRROR_URL", ""),
         antra_api_key=os.getenv("ANTRA_API_KEY", ""),
+        auto_sync_enabled=os.getenv("AUTO_SYNC_ENABLED", "false").lower() == "true",
+        auto_sync_hour=int(os.getenv("AUTO_SYNC_HOUR", "6")),
+        auto_sync_minute=int(os.getenv("AUTO_SYNC_MINUTE", "0")),
+        auto_sync_days=int(os.getenv("AUTO_SYNC_DAYS", "127")),
+        # tracked_playlists cannot come from env vars — read from config.json directly.
+        # It is populated by _run_auto_sync() and the Go binding reads it from the
+        # JSON config file before spawning the Python process.
+        tracked_playlists=[],
+        provider_stats_enabled=os.getenv("PROVIDER_STATS_ENABLED", "true").lower() == "true",
+        provider_stats_db_path=os.getenv("PROVIDER_STATS_DB_PATH", ""),
     )
     return cfg

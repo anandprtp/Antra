@@ -1179,6 +1179,7 @@ class SpotifyClient:
                     isrc=None,
                     spotify_id=t["id"],
                     album_id=album_id,
+                    spotify_url=f"https://open.spotify.com/track/{t['id']}",
                     artwork_url=artwork_url,
                     genres=album_genres,
                     available_markets=markets,
@@ -1594,9 +1595,14 @@ class SpotifyClient:
         ]
         if track_playability and not any(track_playability):
             title = album_name or album_id
-            raise SpotifyAvailabilityError(
-                f"Spotify album '{title}' is not playable in {self._current_market()}. "
-                "Spotify's partner API reports every track as region-locked in the current market."
+            # Do NOT hard-block here. Spotify's playability flag is market-specific
+            # (defaults to US for anonymous TOTP tokens). A German-only album will show
+            # playable=false for every track in the US context, but Tidal/Qobuz/Deezer
+            # may still have it regardless. Log and continue — let the download adapters decide.
+            logger.debug(
+                "[Spotify] Album '%s': all tracks report playable=false in %s market "
+                "(likely region-locked on Spotify). Proceeding — download sources are independent.",
+                title, self._current_market(),
             )
         if not markets and track_playability:
             available_in_market = any(track_playability)

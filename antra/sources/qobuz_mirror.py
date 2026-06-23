@@ -48,10 +48,18 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
         if self._available is not None:
             return self._available
         try:
-            r = self._session.get(f"{self._base}/", timeout=5)
+            r = self._session.get(f"{self._base}/", timeout=15)
             self._available = r.status_code == 200
         except Exception:
-            self._available = False
+            # Retry once after a short delay — handles brief restart windows where
+            # the server is healthy but momentarily mid-restart.
+            import time
+            time.sleep(3)
+            try:
+                r = self._session.get(f"{self._base}/", timeout=15)
+                self._available = r.status_code == 200
+            except Exception:
+                self._available = False
         return self._available
 
     def _reset_availability(self):
@@ -60,15 +68,52 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
     @staticmethod
     def _text_search_queries(track: TrackMetadata) -> list[dict[str, str]]:
         clean_title = strip_collab(track.title)
-        queries = [{"title": clean_title, "artist": track.primary_artist}]
-        # If the title had collab credits stripped, also try the original as a fallback
+        artist_candidates: list[str] = []
+
+        def add_artist(value: str) -> None:
+            value = (value or "").strip()
+            if value and value.lower() not in {a.lower() for a in artist_candidates}:
+                artist_candidates.append(value)
+
+        add_artist(track.primary_artist)
+        add_artist(track.artist_string)
+        for artist in track.artists:
+            add_artist(artist)
+        for artist in getattr(track, "album_artists", None) or []:
+            add_artist(artist)
+
+        title_candidates = [clean_title]
         if clean_title.lower() != track.title.lower():
-            queries.append({"title": track.title, "artist": track.primary_artist})
+            title_candidates.append(track.title)
+
+        queries: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add_query(title: str, artist: str) -> None:
+            title = (title or "").strip()
+            artist = (artist or "").strip()
+            if not title:
+                return
+            key = (title.lower(), artist.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            queries.append({"title": title, "artist": artist})
+
+        for title in title_candidates:
+            for artist in artist_candidates:
+                add_query(title, artist)
+        # Some catalog search endpoints rank a distinctive title better without
+        # a partial/reversed artist credit. The result is still validated below.
+        for title in title_candidates:
+            add_query(title, "")
         album = (track.album or "").strip()
         if album:
-            augmented_title = f"{clean_title} {album}".strip()
-            if augmented_title.lower() != clean_title.lower():
-                queries.append({"title": augmented_title, "artist": track.primary_artist})
+            for title in title_candidates:
+                augmented_title = f"{title} {album}".strip()
+                if augmented_title.lower() != title.lower():
+                    for artist in artist_candidates:
+                        add_query(augmented_title, artist)
         return queries
 
     @staticmethod
@@ -272,6 +317,11 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
         msg = str(error).lower()
         if "duration mismatch" in msg or "preview clip" in msg:
+            return False
+        # Cloudflare/VPS 5xx during the relay stream is usually not fixed by
+        # hammering the same signed URL 2 more times. Fall through immediately
+        # so the engine can try Tidal/Amazon/Apple instead.
+        if any(code in msg for code in (" 524 ", "524 server error", "502", "503", "504")):
             return False
         return True
 

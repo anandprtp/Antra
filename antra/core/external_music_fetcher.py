@@ -578,7 +578,7 @@ class ExternalMusicFetcher:
             if kind == "album":
                 r = self._session.get(
                     f"{mirror_url}/api/album/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=60,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(
@@ -637,7 +637,7 @@ class ExternalMusicFetcher:
             if kind == "track":
                 r = self._session.get(
                     f"{mirror_url}/api/meta/track/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=60,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(f"Track {item_id} not found on Tidal")
@@ -651,14 +651,14 @@ class ExternalMusicFetcher:
                     raise RuntimeError(
                         f"Mirror error for track {item_id}: {data.get('error') or data.get('message', 'unknown')}"
                     )
-                tracks = [self._tidal_track_from_public(data)]
+                tracks = [self._tidal_track_from_public(data, artwork_url=data.get("artwork_url"), release_date=data.get("releaseDate"))]
                 self._stamp_request_kind(tracks, "track")
                 return tracks
 
             if kind == "playlist":
                 r = self._session.get(
                     f"{mirror_url}/api/playlist/{item_id}",
-                    headers=headers, timeout=20,
+                    headers=headers, timeout=60,
                 )
                 if r.status_code == 404:
                     raise RuntimeError(f"Playlist {item_id} not found on Tidal")
@@ -946,7 +946,10 @@ class ExternalMusicFetcher:
         rd = release_date or album.get("releaseDate") or ""
         release_year = int(rd[:4]) if rd and rd[:4].isdigit() else None
 
-        # Cover art from track's album if not provided
+        # Cover art: check data-level artwork_url first (returned by /api/meta/track/),
+        # then fall back to album.cover (returned by /api/album/ track list)
+        if not artwork_url:
+            artwork_url = data.get("artwork_url") or None
         if not artwork_url:
             cover = album.get("cover", "")
             if cover:

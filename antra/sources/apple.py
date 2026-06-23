@@ -542,7 +542,7 @@ class AppleAdapter(BaseSourceAdapter):
             self._session.headers["X-API-Key"] = mirror_api_key
         self._odesli = OdesliEnricher(api_key=api_key)
         self._apple_fetcher = AppleFetcher()
-        self.priority = 2
+        self.priority = 0 if self._preferred_output_format in {"alac", "alac-16", "alac-24"} else 2
 
         self._mirrors = [m.rstrip("/") for m in mirrors if m]
         self._current_mirror: Optional[str] = None
@@ -574,7 +574,7 @@ class AppleAdapter(BaseSourceAdapter):
             if mirror == self._current_mirror and force_rotate:
                 continue
             try:
-                resp = self._session.get(mirror + "/", timeout=5)
+                resp = self._session.get(mirror + "/", timeout=15)
                 if resp.status_code in (200, 404):
                     self._current_mirror = mirror
                     logger.debug(f"[Apple] Using mirror: {mirror}")
@@ -624,6 +624,47 @@ class AppleAdapter(BaseSourceAdapter):
 
         return bit_depth, sample_rate
 
+    def _public_itunes_search(self, title: str, artist: str = "") -> Optional[dict]:
+        """Resolve title+artist → best-matching song via Apple's public iTunes
+        Search API (no auth, no mirror). Returns the iTunes result dict (with
+        `trackId`) or None. Used as a last-resort ID resolver for tracks with no
+        ISRC when Odesli and the mirror text-search proxy are unavailable."""
+        term = f"{title} {artist}".strip()
+        if not term:
+            return None
+        r = self._session.get(
+            "https://itunes.apple.com/search",
+            params={"term": term, "entity": "song", "media": "music", "limit": 10},
+            headers={
+                "User-Agent": "iTunes/12.13.0 (Windows; Microsoft Windows 11 x64) AppleWebKit/7614.5.9.1.9",
+                "Accept": "application/json",
+            },
+            timeout=10,
+        )
+        if not r.ok:
+            return None
+        songs = [s for s in r.json().get("results", []) if s.get("kind") == "song"]
+        if not songs:
+            return None
+        title_lower = title.lower()
+        artist_lower = artist.lower()
+
+        def _score(song: dict) -> int:
+            song_title = song.get("trackName", "").lower()
+            song_artist = song.get("artistName", "").lower()
+            score = 0
+            if title_lower == song_title:
+                score += 3
+            elif title_lower in song_title or song_title in title_lower:
+                score += 2
+            if artist_lower and (artist_lower in song_artist or song_artist in artist_lower):
+                score += 1
+            return score
+
+        best = max(songs, key=_score)
+        # Require at least a title overlap so we don't return a random hit.
+        return best if _score(best) >= 2 else None
+
     def is_available(self) -> bool:
         try:
             from antra.utils.runtime import get_ffmpeg_exe
@@ -656,7 +697,7 @@ class AppleAdapter(BaseSourceAdapter):
         """
         try:
             mirror = self._get_working_mirror()
-            r = self._session.get(f"{mirror}/status", timeout=5)
+            r = self._session.get(f"{mirror}/status", timeout=15)
             if r.status_code == 200:
                 data = r.json()
                 if data.get("wrapper_lossless_available"):
@@ -798,6 +839,24 @@ class AppleAdapter(BaseSourceAdapter):
             except Exception as e:
                 logger.warning(f"[Apple] Text search fallback failed: {e}")
 
+        # Last resort: Apple's own PUBLIC iTunes Search API. No auth, no mirror,
+        # no proxy — resolves title+artist → Apple track ID directly from Apple.
+        # This is the only ID path that works when the track has no ISRC (Spotify
+        # public-embed fallback), Odesli is unreachable, and the mirror's /api/search
+        # proxy can't be reached (e.g. Cloudflare-tunnel DNS timeouts from India).
+        # The track ID still feeds the mirror /api/track/ download path for AAC.
+        if not apple_id:
+            try:
+                song = self._public_itunes_search(track.title, track.primary_artist)
+                if song:
+                    apple_id = str(song.get("trackId") or "")
+                    if apple_id:
+                        logger.info(
+                            f"[Apple] Public iTunes search found track_id={apple_id} for '{track.title}'"
+                        )
+            except Exception as e:
+                logger.warning(f"[Apple] Public iTunes search failed: {e}")
+
         if not apple_id:
             logger.warning(f"[Apple] No Apple Music ID found for '{track.title}' — skipping")
             return None
@@ -887,9 +946,13 @@ class AppleAdapter(BaseSourceAdapter):
             raise ValueError("[Apple] Missing Apple track_id in search result")
 
         # ── Path 1: wrapper lossless ALAC via /api/stream/ ────────────────────
-        # Only used when always_lossy=False (wrapper detected on mirror) and
-        # we're not in a lossy-preferred output mode.
-        if not self._prefer_lossy_download and not self.always_lossy and self._mirrors:
+        # Skipped for alac / alac-24: the wrapper bridge fetches enhancedHls
+        # (standard 16-bit ALAC). Path 3 uses highResLossless → 24-bit ALAC.
+        # For alac-16, or when not in lossless mode, the wrapper is fine.
+        _want_hires_alac = self._preferred_output_format in {"alac", "alac-24"}
+        if not self._prefer_lossy_download and self._mirrors and (
+            not self.always_lossy and not _want_hires_alac
+        ):
             try:
                 mirror = self._get_working_mirror()
                 stream_url = f"{mirror}/api/stream/{track_id}"

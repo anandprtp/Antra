@@ -9,10 +9,6 @@ Schema (v2 — includes private mirror servers):
 {
   "hifi": ["https://..."],
   "amazon": ["https://...", "https://..."],
-  "dab": {
-    "search": ["https://..."],
-    "stream": ["https://...", "https://..."]
-  },
   "mirrors": {
     "tidal":  "https://your-tidal-host.example",
     "qobuz":  "https://your-qobuz-host.example",
@@ -81,8 +77,6 @@ class EndpointManifest:
     hifi: list[str]
     amazon: list[str]
     apple: list[str]
-    dab_search: list[str]
-    dab_stream: list[str]
     # Private mirror server URLs (optional — only present in your personal manifest)
     mirror_tidal: str = ""
     mirror_qobuz: str = ""
@@ -99,8 +93,6 @@ class EndpointManifest:
             return list(self.amazon)
         if source == "apple":
             return list(self.apple)
-        if source == "dab":
-            return list(self.dab_search)
         return []
 
 
@@ -113,7 +105,7 @@ def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
         if cached is not None:
             return cached
         logger.info("[Endpoints] No manifest URL configured; endpoint manifest loader is idle")
-        return EndpointManifest(hifi=[], amazon=[], apple=[], dab_search=[], dab_stream=[])
+        return EndpointManifest(hifi=[], amazon=[], apple=[])
 
     remote_data = _fetch_remote_manifest(manifest_url)
     if remote_data is not None:
@@ -126,7 +118,7 @@ def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
         return cached
 
     logger.warning("[Endpoints] No remote manifest and no cache available")
-    return EndpointManifest(hifi=[], amazon=[], apple=[], dab_search=[], dab_stream=[])
+    return EndpointManifest(hifi=[], amazon=[], apple=[])
 
 
 def _fetch_remote_manifest(manifest_url: str) -> Any | None:
@@ -215,22 +207,10 @@ def _parse_manifest(payload: Any) -> EndpointManifest:
             hifi=_normalize_url_list(payload),
             amazon=[],
             apple=[],
-            dab_search=[],
-            dab_stream=[],
         )
     if not isinstance(payload, dict):
         logger.warning("[Endpoints] Manifest payload is not a supported JSON shape")
-        return EndpointManifest(hifi=[], amazon=[], apple=[], dab_search=[], dab_stream=[])
-
-    dab = payload.get("dab")
-    dab_search: list[str]
-    dab_stream: list[str]
-    if isinstance(dab, dict):
-        dab_search = _normalize_url_list(dab.get("search"))
-        dab_stream = _normalize_url_list(dab.get("stream"))
-    else:
-        dab_search = _normalize_url_list(dab)
-        dab_stream = []
+        return EndpointManifest(hifi=[], amazon=[], apple=[])
 
     # Parse optional private mirror block
     mirrors = payload.get("mirrors") or {}
@@ -246,8 +226,6 @@ def _parse_manifest(payload: Any) -> EndpointManifest:
         hifi=_normalize_url_list(payload.get("hifi")),
         amazon=_normalize_url_list(payload.get("amazon")),
         apple=_normalize_url_list(payload.get("apple")),
-        dab_search=dab_search,
-        dab_stream=dab_stream,
         mirror_tidal=mirror_tidal,
         mirror_qobuz=mirror_qobuz,
         mirror_deezer=mirror_deezer,
@@ -282,10 +260,6 @@ def _write_cache(manifest: EndpointManifest) -> None:
                     "hifi": manifest.hifi,
                     "amazon": manifest.amazon,
                     "apple": manifest.apple,
-                    "dab": {
-                        "search": manifest.dab_search,
-                        "stream": manifest.dab_stream,
-                    },
                     "mirrors": {
                         "tidal":  manifest.mirror_tidal,
                         "qobuz":  manifest.mirror_qobuz,

@@ -8,6 +8,8 @@ export function AnalyzeAudio(arg1:string):Promise<Record<string, any>>;
 
 export function CancelDownload():Promise<void>;
 
+export function CaptureSpDC():Promise<void>;
+
 export function CheckSourceHealth(arg1:string):Promise<string>;
 
 export function ClearHistory():Promise<void>;
@@ -15,6 +17,8 @@ export function ClearHistory():Promise<void>;
 export function ConfirmAmazonLogin():Promise<void>;
 
 export function GetAlbumAvailability(arg1:string):Promise<string>;
+
+export function GetAppleMusicLibrary():Promise<string>;
 
 export function GetArtistDiscography(arg1:string):Promise<string>;
 
@@ -34,11 +38,15 @@ export function GetKeyInfo():Promise<main.KeyInfoResult>;
 
 export function GetSlskdWebUIInfo():Promise<string>;
 
+export function GetSpotifyLibrary():Promise<string>;
+
 export function GetSpotifyPlaylists():Promise<string>;
 
 export function GetSpotifyStatus():Promise<string>;
 
 export function GetSupportStatus():Promise<string>;
+
+export function GetTrackLyrics(arg1:string):Promise<string>;
 
 export function LoginSpotify():Promise<string>;
 
@@ -49,6 +57,8 @@ export function PickAnalyzerFiles():Promise<Array<string>>;
 export function PickDirectory():Promise<string>;
 
 export function RetryTrackDownload(arg1:string):Promise<void>;
+
+export function RunAutoSync():Promise<string>;
 
 export function SaveConfig(arg1:main.Config):Promise<void>;
 

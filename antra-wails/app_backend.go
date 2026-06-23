@@ -76,9 +76,16 @@ type Config struct {
 	TidalSessionID              string   `json:"tidal_session_id,omitempty"`
 	TidalTokenType              string   `json:"tidal_token_type,omitempty"`
 	TidalCountryCode            string   `json:"tidal_country_code,omitempty"`
-	AntraApiKey                 string   `json:"antra_api_key,omitempty"`
-	Theme                       string   `json:"theme,omitempty"`
-	DownloadSource              string   `json:"download_source,omitempty"`
+	AntraApiKey                 string        `json:"antra_api_key,omitempty"`
+	Theme                       string        `json:"theme,omitempty"`
+	DownloadSource              string        `json:"download_source,omitempty"`
+	DownloadSources             []string      `json:"download_sources,omitempty"`
+	SaveCoverArtSidecar         bool          `json:"save_cover_art_sidecar"`
+	AutoSyncEnabled             bool          `json:"auto_sync_enabled"`
+	AutoSyncHour                int           `json:"auto_sync_hour"`
+	AutoSyncMinute              int           `json:"auto_sync_minute"`
+	AutoSyncDays                int           `json:"auto_sync_days"` // bitmask Mon=0…Sun=6
+	TrackedPlaylists            []interface{} `json:"tracked_playlists,omitempty"`
 }
 
 type HistoryItem struct {
@@ -142,6 +149,8 @@ func (a *App) GetConfig() Config {
 		cfg.WhitespaceHandling = "preserve"
 		cfg.FilenameConflictBehavior = "skip"
 		cfg.FetchLyrics = true
+		cfg.DownloadSource = "auto"
+		cfg.DownloadSources = []string{"auto"}
 		return cfg
 	}
 
@@ -208,6 +217,12 @@ func (a *App) GetConfig() Config {
 	if cfg.FilenameConflictBehavior == "" {
 		cfg.FilenameConflictBehavior = "skip"
 	}
+	if cfg.DownloadSource == "" {
+		cfg.DownloadSource = "auto"
+	}
+	if len(cfg.DownloadSources) == 0 {
+		cfg.DownloadSources = []string{cfg.DownloadSource}
+	}
 	return cfg
 }
 
@@ -258,6 +273,12 @@ func (a *App) SaveConfig(cfg Config) error {
 	}
 	if cfg.FilenameConflictBehavior == "" {
 		cfg.FilenameConflictBehavior = "skip"
+	}
+	if cfg.DownloadSource == "" {
+		cfg.DownloadSource = "auto"
+	}
+	if len(cfg.DownloadSources) == 0 {
+		cfg.DownloadSources = []string{cfg.DownloadSource}
 	}
 	dir := getAppDataDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -821,6 +842,10 @@ func (a *App) StartAmazonBrowserLogin() error {
 	return a.startBrowserLoginFlow("--amazon-browser-login", "amazon-login-event", "amazon_login_done")
 }
 
+func (a *App) CaptureSpDC() error {
+	return a.startBrowserLoginFlow("--capture-sp-dc", "sp-dc-event", "sp_dc_done")
+}
+
 // ConfirmAmazonLogin is called by the frontend when the user has signed into
 // Amazon Music in their real browser and is ready for Antra to capture the session.
 // It writes a sentinel file that the Python --amazon-browser-login process polls for.
@@ -887,6 +912,157 @@ func unwrapDiscographyJSON(out []byte) string {
 	}
 	result, _ := json.Marshal(wrapper["data"])
 	return string(result)
+}
+
+// GetSpotifyLibrary returns the user's Spotify library (Liked Songs + playlists).
+// Requires spotify_sp_dc to be configured.
+// Returns a JSON string: the library object or {"error":"..."}.
+func (a *App) GetSpotifyLibrary() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	backend, err := ensureBundledBackend()
+	if err != nil {
+		return a.getSpotifyLibraryViaPython(ctx)
+	}
+
+	cmd := exec.CommandContext(ctx, backend, "--spotify-library", "--config", getConfigPath())
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching Spotify library (30s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return parseLibraryOutput(out, "spotify_library")
+}
+
+func (a *App) getSpotifyLibraryViaPython(ctx context.Context) string {
+	pythonExe, _, workDir, env, err := a.resolveBackendCommand([]string{})
+	if err != nil {
+		return `{"error":"could not resolve backend"}`
+	}
+	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--spotify-library", "--config", getConfigPath())
+	cmd.Dir = workDir
+	cmd.Env = env
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching Spotify library (30s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return parseLibraryOutput(out, "spotify_library")
+}
+
+// GetAppleMusicLibrary returns the user's Apple Music library (saved songs + playlists).
+// Requires the Apple Music web session fields to be configured.
+// Returns a JSON string: the library object or {"error":"..."}.
+func (a *App) GetAppleMusicLibrary() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+
+	backend, err := ensureBundledBackend()
+	if err != nil {
+		return a.getAppleMusicLibraryViaPython(ctx)
+	}
+
+	cmd := exec.CommandContext(ctx, backend, "--apple-library", "--config", getConfigPath())
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching Apple Music library (35s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return parseLibraryOutput(out, "apple_library")
+}
+
+func (a *App) getAppleMusicLibraryViaPython(ctx context.Context) string {
+	pythonExe, _, workDir, env, err := a.resolveBackendCommand([]string{})
+	if err != nil {
+		return `{"error":"could not resolve backend"}`
+	}
+	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--apple-library", "--config", getConfigPath())
+	cmd.Dir = workDir
+	cmd.Env = env
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"timed out fetching Apple Music library (35s)"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return parseLibraryOutput(out, "apple_library")
+}
+
+// parseLibraryOutput scans newline-delimited JSON output and extracts a single
+// library event. Other lines (log events, etc.) are ignored so stray config
+// messages do not break JSON parsing.
+func parseLibraryOutput(out []byte, eventType string) string {
+	for _, line := range bytes.Split(bytes.TrimSpace(out), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var wrapper map[string]interface{}
+		if err := json.Unmarshal(line, &wrapper); err != nil {
+			continue
+		}
+		switch wrapper["type"] {
+		case eventType:
+			result, _ := json.Marshal(wrapper["data"])
+			return string(result)
+		case "error":
+			msg, _ := wrapper["message"].(string)
+			return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+		}
+	}
+	return `{"error":"no ` + eventType + ` event in backend output"}`
+}
+
+// RunAutoSync triggers an immediate auto-sync of all tracked playlists.
+// Streams newline-delimited JSON events on stdout (same format as StartDownload).
+// Returns empty string on success or an error string.
+func (a *App) RunAutoSync() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	backend, err := ensureBundledBackend()
+	var cmd *exec.Cmd
+	if err != nil {
+		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
+		if resolveErr != nil {
+			return `error:could not resolve backend`
+		}
+		cmd = exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--auto-sync", "--config", getConfigPath())
+		cmd.Dir = workDir
+		cmd.Env = env
+	} else {
+		cmd = exec.CommandContext(ctx, backend, "--auto-sync", "--config", getConfigPath())
+	}
+	hideProcess(cmd)
+
+	stdout, pipeErr := cmd.StdoutPipe()
+	if pipeErr != nil {
+		return `error:` + pipeErr.Error()
+	}
+	if startErr := cmd.Start(); startErr != nil {
+		return `error:` + startErr.Error()
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 16*1024*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		wailsRuntime.EventsEmit(a.ctx, "auto_sync_event", line)
+	}
+	_ = cmd.Wait()
+	return ""
 }
 
 // SearchArtists searches for artists by name using the given source ("spotify" or "apple").
@@ -1238,11 +1414,6 @@ const defaultEndpointManifestURL = "https://gist.githubusercontent.com/anandprtp
 
 var gistIDPattern = regexp.MustCompile(`(?i)([0-9a-f]{32})`)
 
-type endpointManifestDab struct {
-	Search []string `json:"search"`
-	Stream []string `json:"stream"`
-}
-
 type endpointManifestMirrors struct {
 	Tidal  string `json:"tidal"`
 	Qobuz  string `json:"qobuz"`
@@ -1255,7 +1426,6 @@ type endpointManifest struct {
 	Hifi    []string                `json:"hifi"`
 	Amazon  []string                `json:"amazon"`
 	Apple   []string                `json:"apple"`
-	Dab     endpointManifestDab     `json:"dab"`
 	Mirrors endpointManifestMirrors `json:"mirrors"`
 	ApiKey  string                  `json:"api_key"`
 }
@@ -1440,8 +1610,6 @@ func (m *endpointManifest) normalize() {
 	m.Hifi = normalizeURLList(m.Hifi)
 	m.Amazon = normalizeURLList(m.Amazon)
 	m.Apple = normalizeURLList(m.Apple)
-	m.Dab.Search = normalizeURLList(m.Dab.Search)
-	m.Dab.Stream = normalizeURLList(m.Dab.Stream)
 }
 
 func normalizeURLList(urls []string) []string {
@@ -1486,8 +1654,6 @@ func endpointsForHealthSource(manifest endpointManifest, source string) []string
 			return []string{manifest.Mirrors.Qobuz}
 		}
 		return nil
-	case "dab":
-		return append([]string{}, manifest.Dab.Search...)
 	case "deezer":
 		if manifest.Mirrors.Deezer != "" {
 			return []string{manifest.Mirrors.Deezer}
@@ -1499,7 +1665,7 @@ func endpointsForHealthSource(manifest endpointManifest, source string) []string
 }
 
 // CheckSourceHealth probes all known endpoints for a given source ("hifi", "amazon",
-// "apple", "qobuz", "deezer", "dab") in parallel and returns a JSON-encoded
+// "apple", "qobuz", "deezer") in parallel and returns a JSON-encoded
 // SourceHealthResult.
 //
 // Health check URLs mirror the adapters' own liveness checks:
@@ -1553,7 +1719,6 @@ func probeHifiEndpoint(client *http.Client, base string) (bool, error) {
 // - HiFi:   search + track manifest probe must both succeed
 // - Amazon: GET {mirror}/           → 200 or 404 (server reachable)
 // - Apple:  GET {mirror}/           → 200 or 404 (server reachable)
-// - DAB:    GET {ep}/search?q=test  → 200
 func (a *App) CheckSourceHealth(source string) string {
 	manifest := loadEndpointManifest()
 	endpoints := endpointsForHealthSource(manifest, source)
@@ -1587,8 +1752,6 @@ func (a *App) CheckSourceHealth(source string) string {
 				switch source {
 				case "amazon", "apple", "qobuz", "deezer":
 					checkURL = base + "/"
-				case "dab":
-					checkURL = base + "/search?q=test"
 				default:
 					checkURL = base
 				}

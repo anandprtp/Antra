@@ -70,6 +70,7 @@ class TrackCollector:
                 duration_ms=int(duration_ms) if duration_ms else None,
                 isrc=None,  # Populated later by ISRCEnricher
                 spotify_id=spotify_id,
+                spotify_url=f"https://open.spotify.com/track/{spotify_id}",
                 artwork_url=artwork_url,
                 playlist_name=playlist_name,
                 playlist_position=index,

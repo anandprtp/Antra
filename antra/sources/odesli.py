@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import html
 from typing import Optional
 
 import requests
@@ -35,8 +36,14 @@ logger = logging.getLogger(__name__)
 _ODESLI_API = "https://api.song.link/v1-alpha.1/links"
 _SONGWHIP_API = "https://api.songwhip.com/v3/resolve"
 _AMAZON_SEARCH = "https://www.amazon.com/s"
+_AMAZON_SEARCH_ENDPOINTS = (
+    "https://www.amazon.com/s",
+    "https://www.amazon.in/s",
+    "https://www.amazon.co.uk/s",
+    "https://www.amazon.com.br/s",
+)
 _CACHE_FILE = os.path.join(os.path.expanduser("~"), ".antra_link_cache.json")
-_ODESLI_RETRY_DELAYS = []
+_ODESLI_RETRY_DELAYS = [2, 5]
 
 _HEADERS = {
     "User-Agent": (
@@ -47,6 +54,11 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "application/json, text/html, */*",
 }
+
+_SONGSTATS_SCRIPT_RE = re.compile(
+    r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _load_cache() -> dict:
@@ -75,6 +87,26 @@ def _to_slug(s: str) -> str:
     s = re.sub(r"\s+", "-", s.strip())
     s = re.sub(r"-{2,}", "-", s)
     return s
+
+
+def _extract_amazon_asin(value: str) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+
+    for pattern in (
+        r"trackAsin=([A-Z0-9]{10})",
+        r"/albums/[A-Z0-9]{10}/([A-Z0-9]{10})",
+        r"/tracks/([A-Z0-9]{10})",
+        r"\b(B[0-9A-Z]{9})\b",
+    ):
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1)
+
+    if re.fullmatch(r"[A-Z0-9]{10}", raw):
+        return raw
+    return None
 
 
 class OdesliEnricher:
@@ -130,6 +162,20 @@ class OdesliEnricher:
         for k, v in sw.items():
             result.setdefault(k, v)
 
+        # 2.5 Deezer ISRC -> song.link. SpotiFLAC succeeds on a subset of Amazon
+        # matches by first resolving the ISRC to a Deezer track, then asking
+        # song.link for cross-platform URLs from that Deezer URL. This path is
+        # especially helpful when direct Spotify->song.link resolution is sparse.
+        if getattr(track, "isrc", None) and "amazonMusic" not in result:
+            ss = self._try_songstats(track)
+            for k, v in ss.items():
+                result.setdefault(k, v)
+
+        if getattr(track, "isrc", None) and "amazonMusic" not in result:
+            dz = self._try_deezer_songlink(track)
+            for k, v in dz.items():
+                result.setdefault(k, v)
+
         # 3. iTunes Search → Odesli(Apple Music URL) — catches tracks that Odesli
         #    rate-limited on the Spotify path and that Songwhip doesn't have indexed.
         #    iTunes Search API has no rate limit; the Apple Music URL goes through a
@@ -178,45 +224,51 @@ class OdesliEnricher:
         ).strip()
         query = f"{title_clean} {artist}".strip()
         try:
-            resp = self._session.get(
-                _AMAZON_SEARCH,
-                params={"k": query, "i": "digital-music-track"},
-                timeout=10,
-            )
-            if not resp.ok:
-                logger.debug(f"[Amazon Search] HTTP {resp.status_code}")
-                return None
+            pairs = []
+            for endpoint in _AMAZON_SEARCH_ENDPOINTS:
+                try:
+                    resp = self._session.get(
+                        endpoint,
+                        params={"k": query, "i": "digital-music-track"},
+                        timeout=10,
+                    )
+                    if not resp.ok:
+                        logger.debug(f"[Amazon Search] {endpoint} HTTP {resp.status_code}")
+                        continue
+                except Exception as e:
+                    logger.debug(f"[Amazon Search] {endpoint} request failed: {e}")
+                    continue
+
+                # Extract (ASIN, product title) pairs from the result page.
+                # Amazon embeds data-asin on product cards alongside h2 > span title text.
+                pairs = re.findall(
+                    r'data-asin="([A-Z0-9]{10})"[^>]*>.*?<h2[^>]*>.*?<span[^>]*>([^<]+)</span>',
+                    resp.text[:400000],
+                    re.DOTALL,
+                )
+                if not pairs:
+                    continue
+
+                title_lower = title.lower()
+                title_clean_lower = title_clean.lower()
+
+                for asin, product_title in pairs:
+                    pt_lower = product_title.strip().lower()
+                    # Accept if product title contains our track title (case-insensitive).
+                    # Also match against the collaboration-stripped title so "YouUgly" matches
+                    # a product titled "YouUgly (with Westside Gunn)" and vice-versa.
+                    if (title_lower in pt_lower or pt_lower in title_lower
+                            or title_clean_lower in pt_lower or pt_lower in title_clean_lower):
+                        logger.debug(f"[Amazon Search] Matched '{product_title.strip()}' → {asin}")
+                        return asin
+
+                # Looser fallback: first result (Amazon ranks by relevance)
+                asin, product_title = pairs[0]
+                logger.debug(f"[Amazon Search] Using first result '{product_title.strip()}' → {asin}")
+                return asin
         except Exception as e:
             logger.debug(f"[Amazon Search] Request failed: {e}")
             return None
-
-        # Extract (ASIN, product title) pairs from the result page.
-        # Amazon embeds data-asin on product cards alongside h2 > span title text.
-        pairs = re.findall(
-            r'data-asin="([A-Z0-9]{10})"[^>]*>.*?<h2[^>]*>.*?<span[^>]*>([^<]+)</span>',
-            resp.text[:400000],
-            re.DOTALL,
-        )
-
-        title_lower = title.lower()
-        title_clean_lower = title_clean.lower()
-        artist_lower = artist.lower()
-
-        for asin, product_title in pairs:
-            pt_lower = product_title.strip().lower()
-            # Accept if product title contains our track title (case-insensitive).
-            # Also match against the collaboration-stripped title so "YouUgly" matches
-            # a product titled "YouUgly (with Westside Gunn)" and vice-versa.
-            if (title_lower in pt_lower or pt_lower in title_lower
-                    or title_clean_lower in pt_lower or pt_lower in title_clean_lower):
-                logger.debug(f"[Amazon Search] Matched '{product_title.strip()}' → {asin}")
-                return asin
-
-        # Looser fallback: first result (Amazon ranks by relevance)
-        if pairs:
-            asin, product_title = pairs[0]
-            logger.debug(f"[Amazon Search] Using first result '{product_title.strip()}' → {asin}")
-            return asin
 
         return None
 
@@ -338,6 +390,117 @@ class OdesliEnricher:
 
         return {}
 
+    def _lookup_deezer_track_url_by_isrc(self, isrc: str) -> Optional[str]:
+        api_url = f"https://api.deezer.com/track/isrc:{str(isrc).strip().upper()}"
+        try:
+            resp = self._session.get(api_url, timeout=8)
+            if not resp.ok:
+                logger.debug("[Deezer ISRC] HTTP %s for %s", resp.status_code, isrc)
+                return None
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("[Deezer ISRC] Lookup failed for %s: %s", isrc, e)
+            return None
+
+        link = str(payload.get("link") or "").strip()
+        if link:
+            return link
+        track_id = payload.get("id")
+        if track_id:
+            return f"https://www.deezer.com/track/{track_id}"
+        return None
+
+    def _try_deezer_songlink(self, track) -> dict[str, str]:
+        isrc = getattr(track, "isrc", None)
+        if not isrc:
+            return {}
+
+        deezer_url = self._lookup_deezer_track_url_by_isrc(isrc)
+        if not deezer_url:
+            return {}
+
+        logger.debug(f"[Deezer->song.link] Found Deezer URL for '{track.title}': {deezer_url}")
+        try:
+            resp = self._session.get(
+                _ODESLI_API,
+                params={"url": deezer_url, "platform": "deezer", "type": "song"},
+                timeout=8,
+            )
+            if not resp.ok:
+                logger.debug("[Deezer->song.link] HTTP %s for '%s'", resp.status_code, track.title)
+                return {}
+            return self._extract_odesli(resp.json(), track.title)
+        except Exception as e:
+            logger.debug(f"[Deezer->song.link] Request failed for '{track.title}': {e}")
+            return {}
+
+    def _try_songstats(self, track) -> dict[str, str]:
+        isrc = str(getattr(track, "isrc", "") or "").strip().upper()
+        if not isrc:
+            return {}
+
+        page_url = f"https://songstats.com/{isrc}?ref=ISRCFinder"
+        try:
+            resp = self._session.get(page_url, timeout=10)
+            if not resp.ok:
+                logger.debug("[Songstats] HTTP %s for %s", resp.status_code, isrc)
+                return {}
+            body = resp.text
+        except Exception as e:
+            logger.debug("[Songstats] Request failed for %s: %s", isrc, e)
+            return {}
+
+        result: dict[str, str] = {}
+        for match in _SONGSTATS_SCRIPT_RE.finditer(body):
+            raw_script = html.unescape((match.group(1) or "").strip())
+            if not raw_script:
+                continue
+            try:
+                payload = json.loads(raw_script)
+            except Exception:
+                continue
+            self._collect_songstats_links(payload, result)
+
+        if result:
+            logger.debug("[Songstats] Resolved %s for '%s': %s", isrc, getattr(track, "title", ""), list(result.keys()))
+        return result
+
+    def _collect_songstats_links(self, value, result: dict[str, str]) -> None:
+        if isinstance(value, dict):
+            same_as = value.get("sameAs")
+            if same_as is not None:
+                self._apply_songstats_links(same_as, result)
+            for nested in value.values():
+                self._collect_songstats_links(nested, result)
+        elif isinstance(value, list):
+            for nested in value:
+                self._collect_songstats_links(nested, result)
+
+    def _apply_songstats_links(self, value, result: dict[str, str]) -> None:
+        if isinstance(value, str):
+            self._assign_songstats_link(value, result)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    self._assign_songstats_link(item, result)
+
+    def _assign_songstats_link(self, raw_link: str, result: dict[str, str]) -> None:
+        link = (raw_link or "").strip()
+        if not link:
+            return
+        if "music.amazon." in link and "amazonMusic" not in result:
+            asin = _extract_amazon_asin(link)
+            if asin:
+                result["amazonMusic"] = asin
+        elif "listen.tidal.com/track" in link and "tidal" not in result:
+            match = re.search(r"/track/(\d+)", link)
+            if match:
+                result["tidal"] = match.group(1)
+        elif "deezer.com" in link and "deezer" not in result:
+            match = re.search(r"/track/(\d+)", link)
+            if match:
+                result["deezer"] = match.group(1)
+
     def _extract_songwhip(self, data: dict) -> dict[str, str]:
         links = data.get("data", {}).get("links", {})
         result: dict[str, str] = {}
@@ -346,9 +509,8 @@ class OdesliEnricher:
         for entry in links.get("amazonMusic", []):
             url = entry.get("link", "")
             countries = entry.get("countries")
-            match = re.search(r"trackAsin=([A-Z0-9]{10})", url)
-            if match:
-                asin = match.group(1)
+            asin = _extract_amazon_asin(url)
+            if asin:
                 if countries is None or "US" in countries:
                     result["amazonMusic"] = asin
                     break
@@ -450,6 +612,16 @@ class OdesliEnricher:
         for platform, link_info in links.items():
             entity_uid = link_info.get("entityUniqueId", "")
             entity = entities.get(entity_uid, {})
+            if platform == "amazonMusic":
+                asin = (
+                    _extract_amazon_asin(link_info.get("url", ""))
+                    or _extract_amazon_asin(entity.get("id", ""))
+                    or _extract_amazon_asin(entity_uid.split("::")[-1] if "::" in entity_uid else entity_uid)
+                )
+                if asin:
+                    result[platform] = asin
+                    logger.debug(f"[Odesli] '{title}' -> {platform}: {asin}")
+                    continue
             raw_id = entity.get("id") or (entity_uid.split("::")[-1] if "::" in entity_uid else "")
             if raw_id:
                 result[platform] = str(raw_id)

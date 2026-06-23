@@ -47,6 +47,10 @@ class AudioTranscoder:
         # Normalise bit-depth variants to their base format for conversion logic.
         # lossless-16 / lossless-24 → lossless, alac-16 / alac-24 → alac
         base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
+        # 16-bit output requested: a >16-bit lossless source must be downsampled.
+        # Native 16-bit from Tidal is unavailable (LOSSLESS returns AAC on our pool),
+        # so the only reliable way to deliver 16-bit is to downsample the 24-bit FLAC.
+        wants_16 = target_format.endswith("-16")
 
         if base_format == "source":
             return False
@@ -54,18 +58,24 @@ class AudioTranscoder:
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".m4a":
                 return True
+            if wants_16 and not self._is_lossy(file_path) and (self._source_bit_depth(file_path) or 24) > 16:
+                return True
             return False
         if base_format == "flac":
             if self._is_lossy(file_path):
                 return False
             ext = os.path.splitext(file_path)[1].lower()
-            return ext not in {".flac"}
+            if ext != ".flac":
+                return True
+            return wants_16 and (self._source_bit_depth(file_path) or 24) > 16
 
         if base_format == "alac":
             if self._is_lossy(file_path):
                 return False
             ext = os.path.splitext(file_path)[1].lower()
-            return ext == ".flac"
+            if ext == ".flac":
+                return True
+            return wants_16 and (self._source_bit_depth(file_path) or 24) > 16
 
         if base_format == "aac":
             return True
@@ -131,12 +141,15 @@ class AudioTranscoder:
     def _plan(target_format: str, file_path: str = "") -> ConversionPlan:
         # Normalise bit-depth variants to base format
         base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
+        # For a "-16" request, force 16-bit output (ffmpeg dithers on bit-depth
+        # reduction by default). "-24"/no-suffix keep the source depth.
+        depth_args = ["-sample_fmt", "s16"] if target_format.endswith("-16") else []
 
         if base_format in ("lossless", "flac"):
             return ConversionPlan(
                 target_format="flac",
                 extension=".flac",
-                codec_args=["-c:a", "flac"],
+                codec_args=["-c:a", "flac", *depth_args],
             )
         if base_format == "mp3":
             return ConversionPlan(
@@ -148,7 +161,7 @@ class AudioTranscoder:
             return ConversionPlan(
                 target_format=base_format,
                 extension=".m4a",
-                codec_args=["-c:a", "alac"],
+                codec_args=["-c:a", "alac", *depth_args],
             )
         if base_format == "aac":
             if AudioTranscoder._can_normalize_aac_container(file_path):
@@ -197,3 +210,18 @@ class AudioTranscoder:
         info = getattr(audio, "info", None)
         codec = getattr(info, "codec", "") if info else ""
         return str(codec or "").lower()
+
+    @staticmethod
+    def _source_bit_depth(file_path: str) -> int | None:
+        """Bits-per-sample of a lossless source (FLAC/ALAC), or None if unknown.
+        Used to decide whether a 16-bit request needs a downsample pass."""
+        try:
+            audio = MutagenFile(file_path)
+        except Exception:
+            return None
+        info = getattr(audio, "info", None)
+        depth = getattr(info, "bits_per_sample", None) if info else None
+        try:
+            return int(depth) if depth else None
+        except (TypeError, ValueError):
+            return None

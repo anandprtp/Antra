@@ -342,6 +342,128 @@ func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 	return result
 }
 
+// ─── Lyrics ───────────────────────────────────────────────────────────────────
+
+// LyricsLine holds a single line of lyrics with its playback offset.
+// TimeMs == -1 means the line has no timestamp (plain-text lyrics).
+type LyricsLine struct {
+	TimeMs int64  `json:"time_ms"`
+	Text   string `json:"text"`
+}
+
+// TrackLyrics is the payload returned by GetTrackLyrics.
+type TrackLyrics struct {
+	Lines  []LyricsLine `json:"lines"`
+	Synced bool         `json:"synced"`
+}
+
+// reLRCTimestamp matches a standard LRC timestamp: [MM:SS.cc] or [MM:SS.xxx]
+// The minute field may be more than two digits.
+var reLRCTimestamp = regexp.MustCompile(`^\[(\d+):(\d{2})\.(\d{2,3})\](.*)$`)
+
+// parseLRC converts raw LRC text into a sorted slice of LyricsLine.
+// Lines that have no timestamp (metadata tags like [ti:…], [ar:…]) are skipped.
+func parseLRC(raw string) []LyricsLine {
+	var lines []LyricsLine
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimRight(line, "\r")
+		m := reLRCTimestamp.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		mins, _ := strconv.ParseInt(m[1], 10, 64)
+		secs, _ := strconv.ParseInt(m[2], 10, 64)
+		frac := m[3]
+		var ms int64
+		if len(frac) == 2 {
+			// centiseconds → milliseconds
+			cs, _ := strconv.ParseInt(frac, 10, 64)
+			ms = cs * 10
+		} else {
+			ms, _ = strconv.ParseInt(frac, 10, 64)
+		}
+		timeMs := (mins*60+secs)*1000 + ms
+		text := strings.TrimSpace(m[4])
+		if text != "" {
+			lines = append(lines, LyricsLine{TimeMs: timeMs, Text: text})
+		}
+	}
+	// LRC files are usually already sorted but guarantee it anyway.
+	sort.Slice(lines, func(i, j int) bool { return lines[i].TimeMs < lines[j].TimeMs })
+	return lines
+}
+
+// lyricsTagKeys lists the tag names Antra checks, in preference order.
+// Different taggers and formats use different casing / names.
+var lyricsTagKeys = []string{
+	"LYRICS", "lyrics", "Lyrics",
+	"SYNCEDLYRICS", "syncedlyrics",
+	"UNSYNCEDLYRICS", "unsyncedlyrics",
+	"LYRICS:LYRICS",
+}
+
+// GetTrackLyrics reads embedded lyrics from filePath via ffprobe and returns
+// a JSON-encoded TrackLyrics.  Returns {"lines":[],"synced":false} on any error
+// or when no lyrics tag is found so the frontend always gets valid JSON.
+func (a *App) GetTrackLyrics(filePath string) string {
+	a.mu.Lock()
+	ffprobeExe := a.ffprobeExe
+	a.mu.Unlock()
+
+	cmd := exec.Command(
+		resolveExe(ffprobeExe, "ffprobe"),
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_format",
+		filePath,
+	)
+	hideProcess(cmd)
+	out, err := cmd.Output()
+	if err != nil {
+		return `{"lines":[],"synced":false}`
+	}
+
+	var probe struct {
+		Format struct {
+			Tags map[string]string `json:"tags"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(out, &probe); err != nil {
+		return `{"lines":[],"synced":false}`
+	}
+
+	raw := ""
+	for _, k := range lyricsTagKeys {
+		if v, ok := probe.Format.Tags[k]; ok && strings.TrimSpace(v) != "" {
+			raw = v
+			break
+		}
+	}
+	if raw == "" {
+		return `{"lines":[],"synced":false}`
+	}
+
+	lrcLines := parseLRC(raw)
+	var result TrackLyrics
+	if len(lrcLines) > 0 {
+		result.Synced = true
+		result.Lines = lrcLines
+	} else {
+		// Plain-text lyrics — one entry per non-empty line, TimeMs = -1.
+		result.Synced = false
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimRight(line, "\r")
+			result.Lines = append(result.Lines, LyricsLine{TimeMs: -1, Text: line})
+		}
+	}
+
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		return `{"lines":[],"synced":false}`
+	}
+	return string(encoded)
+}
+
 // PickAnalyzerFiles opens a multi-file picker filtered to audio files.
 func (a *App) PickAnalyzerFiles() []string {
 	// Wails OpenMultipleFilesDialog expects a slice of FileFilter

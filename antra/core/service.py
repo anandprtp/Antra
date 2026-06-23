@@ -23,6 +23,7 @@ from antra.core.models import (
     TrackMetadata,
 )
 from antra.core.resolver import SourceResolver
+from antra.core.provider_stats import get_provider_stats
 from antra.core.spotify import SpotifyClient
 from antra.utils.matching import duration_close, score_similarity
 from antra.utils.lyrics import LyricsFetcher
@@ -30,10 +31,10 @@ from antra.utils.organizer import LibraryOrganizer
 
 logger = logging.getLogger(__name__)
 
-SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "dab", "qobuz", "deezer", "soulseek", "youtube", "jiosaavn")
+SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "qobuz", "deezer", "soulseek", "youtube", "jiosaavn")
 OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3", "lossless-16", "lossless-24", "alac-16", "alac-24")
 SPECIAL_SOURCE_PREFERENCE_CHOICES = ("priority-2", "priority-3", "priority-4")
-SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless",)
+SPECIAL_OUTPUT_FORMAT_CHOICES = ("lossless", "atmos-tidal", "atmos-apple", "atmos-amazon")
 LEGACY_SOURCE_PREFERENCE_ALIASES = {
     "tidal": "hifi",
     "anandtidal": "hifi",
@@ -112,6 +113,30 @@ def normalize_source_preference(value: Optional[str]) -> str:
     return "auto"
 
 
+def normalize_source_preferences(value) -> list[str]:
+    if not value:
+        return ["auto"]
+    if isinstance(value, str):
+        raw_items = value.replace(";", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        return ["auto"]
+
+    normalized: list[str] = []
+    for item in raw_items:
+        source = normalize_source_preference(str(item).strip().lower())
+        if source == "auto":
+            return ["auto"]
+        if source not in normalized:
+            normalized.append(source)
+    return normalized or ["auto"]
+
+
+def serialize_source_preferences(value) -> str:
+    return ",".join(normalize_source_preferences(value))
+
+
 def normalize_output_format(value: Optional[str]) -> str:
     normalized = LEGACY_OUTPUT_FORMAT_ALIASES.get(value or "", value or "")
     if normalized in OUTPUT_FORMAT_CHOICES or normalized in SPECIAL_OUTPUT_FORMAT_CHOICES:
@@ -124,7 +149,7 @@ def describe_source_preference(value: Optional[str]) -> str:
     labels = {
         "auto": "auto",
         "apple": "apple",
-        "priority-2": "hifi / dab -> soulseek -> jiosaavn",
+        "priority-2": "hifi -> soulseek -> jiosaavn",
         "priority-3": "jiosaavn",
         "priority-4": "jiosaavn",
     }
@@ -183,7 +208,7 @@ class AntraService:
 
     def build_runtime_config(self, options: Optional[RuntimeOptions] = None) -> Config:
         cfg = replace(self._base_config)
-        cfg.source_preference = normalize_source_preference(cfg.source_preference)
+        cfg.source_preference = serialize_source_preferences(cfg.source_preference)
         cfg.output_format = normalize_output_format(cfg.output_format)
         if not options:
             return cfg
@@ -195,47 +220,47 @@ class AntraService:
         if options.enrich_album_data is not None:
             cfg.enrich_album_data = options.enrich_album_data
         if options.source_preference is not None:
-            cfg.source_preference = normalize_source_preference(options.source_preference)
+            cfg.source_preference = serialize_source_preferences(options.source_preference)
         if options.output_format is not None:
             cfg.output_format = normalize_output_format(options.output_format)
         return cfg
 
     @staticmethod
     def _filter_adapters_by_source_preference(adapters: list, source_preference: Optional[str]) -> list:
-        normalized = normalize_source_preference(source_preference)
-        if not normalized or normalized == "auto":
+        normalized_sources = normalize_source_preferences(source_preference)
+        if not normalized_sources or "auto" in normalized_sources:
             return adapters
-        if normalized == "soulseek":
+        if normalized_sources == ["soulseek"]:
             preferred_order = ["soulseek", "apple", "hifi", "youtube", "jiosaavn"]
             by_name = {adapter.name: adapter for adapter in adapters}
             return [by_name[name] for name in preferred_order if name in by_name]
-        if normalized == "priority-2":
-            allowed = {"hifi", "amazon", "apple", "dab", "soulseek", "youtube", "jiosaavn"}
+        if normalized_sources == ["priority-2"]:
+            allowed = {"hifi", "amazon", "apple", "soulseek", "youtube", "jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
-        if normalized == "priority-3":
+        if normalized_sources == ["priority-3"]:
             allowed = {"jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
-        if normalized == "priority-4":
+        if normalized_sources == ["priority-4"]:
             allowed = {"jiosaavn"}
             return [adapter for adapter in adapters if adapter.name in allowed]
         # Service group overrides: "tidal" (normalized to "hifi" via alias) includes all
         # Tidal-backed adapters; "qobuz" and "deezer" include their mirror adapters.
         # This makes the Download Source UI setting work correctly — selecting a service
         # routes through all adapters backed by that service, not just the exact-named one.
-        if normalized == "hifi":
-            allowed = {"hifi", "tidal", "tidal_mirror"}
-            return [adapter for adapter in adapters if adapter.name in allowed]
-        if normalized == "qobuz":
-            allowed = {"qobuz", "qobuz_mirror", "dab"}
-            return [adapter for adapter in adapters if adapter.name in allowed]
-        if normalized == "deezer":
-            allowed = {"deezer", "deezer_mirror"}
-            return [adapter for adapter in adapters if adapter.name in allowed]
-        if normalized == "apple":
-            return [adapter for adapter in adapters if adapter.name == "apple"]
-        if normalized == "amazon":
-            return [adapter for adapter in adapters if adapter.name == "amazon"]
-        return [adapter for adapter in adapters if adapter.name == normalized]
+        source_groups = {
+            "hifi": {"hifi", "tidal", "tidal_mirror"},
+            "qobuz": {"qobuz", "qobuz_mirror"},
+            "deezer": {"deezer", "deezer_mirror"},
+            "apple": {"apple"},
+            "amazon": {"amazon"},
+            "soulseek": {"soulseek"},
+            "youtube": {"youtube"},
+            "jiosaavn": {"jiosaavn"},
+        }
+        allowed: set[str] = set()
+        for normalized in normalized_sources:
+            allowed.update(source_groups.get(normalized, {normalized}))
+        return [adapter for adapter in adapters if adapter.name in allowed]
 
     @staticmethod
     def validate_config(cfg: Config):
@@ -349,7 +374,11 @@ class AntraService:
         if source_group_enabled("tidal_mirror") and tidal_mirror_url:
             try:
                 from antra.sources.tidal_mirror import TidalMirrorAdapter
-                adapter = TidalMirrorAdapter(mirror_url=tidal_mirror_url, api_key=mirror_api_key)
+                adapter = TidalMirrorAdapter(
+                    mirror_url=tidal_mirror_url,
+                    api_key=mirror_api_key,
+                    preferred_output_format=cfg.output_format,
+                )
                 if adapter.is_available():
                     adapters.append(adapter)
                     logger.info("[OK] Tidal mirror adapter enabled")
@@ -841,10 +870,17 @@ class AntraService:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
 
+        from antra.core.apple_library import is_apple_library_url
         from antra.core.external_music_fetcher import is_deezer_url, is_qobuz_url, is_tidal_url
+        from antra.core.youtube_music_fetcher import is_youtube_music_url
+
+        # Handle Apple Music library pseudo-URLs
+        if is_apple_library_url(playlist):
+            tracks = self._fetch_apple_library_tracks(playlist, cfg, page_callback=page_callback)
+            self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
 
         # Handle Apple Music URLs
-        if "music.apple.com" in playlist:
+        elif "music.apple.com" in playlist:
             tracks = self._fetch_apple_tracks(playlist, cfg, page_callback=page_callback)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
@@ -880,11 +916,31 @@ class AntraService:
                 self._apply_source_intent(tracks, service="tidal", rule="exclusive")
             elif is_qobuz_url(playlist):
                 # Qobuz URL → prefer the Qobuz family first (qobuz_mirror, direct
-                # qobuz, DAB), but allow other hi-res sources afterward if Qobuz
+                # qobuz), but allow other hi-res sources afterward if Qobuz
                 # cannot produce a valid stream for the requested quality.
                 self._apply_source_intent(tracks, service="qobuz", rule="prefer_hires")
             elif is_deezer_url(playlist):
                 self._apply_source_intent(tracks, service="deezer", rule="exclusive")
+
+        # Handle YouTube Music URLs — metadata via yt-dlp, audio from lossless adapters
+        elif is_youtube_music_url(playlist):
+            tracks = self._fetch_youtube_music_tracks(playlist, cfg, page_callback=page_callback)
+            # request_kind is already set per-track by the fetcher; _apply_request_kind
+            # only fills in tracks that don't already have it set.
+            self._apply_request_kind(tracks, playlist)
+            # No source_intent override — let the resolver pick the best available source
+            # (Tidal mirror, Qobuz mirror, Amazon, Deezer, etc.) based on quality mode.
+
+        # Handle Spotify Liked Songs (collection/tracks) — requires sp_dc
+        elif "open.spotify.com/collection/tracks" in playlist:
+            sp_dc = getattr(cfg, "spotify_sp_dc", "") or ""
+            if not sp_dc:
+                raise ValueError(
+                    "Liked Songs requires your Spotify sp_dc cookie. "
+                    "Add it in Settings → Spotify Library."
+                )
+            tracks = self._fetch_liked_songs_tracks(sp_dc, cfg, page_callback=page_callback)
+            self._apply_request_kind(tracks, playlist)
 
         else:
             # Try VPS metadata proxy first — bypasses ISP throttling of Spotify APIs.
@@ -1184,10 +1240,11 @@ class AntraService:
                 original_tracks = list(tracks)
                 tracks = spotify.batch_enrich_album_data(tracks)
                 tracks = self._preserve_track_identity(original_tracks, tracks)
-            elif "music.apple.com" in playlist:
+            elif "music.apple.com" in playlist or is_apple_library_url(playlist):
                 tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
             elif not (
                 "soundcloud.com" in playlist
+                or "music.youtube.com" in playlist
             ):
                 spotify = self._make_spotify_client(cfg)
                 logger.info("Enriching tracks with album metadata...")
@@ -1212,6 +1269,41 @@ class AntraService:
         developer_token = getattr(cfg, "apple_developer_token", "") or None
         fetcher = AppleFetcher(developer_token=developer_token)
         return fetcher.fetch(url, page_callback=page_callback)
+
+    def _fetch_apple_library_tracks(
+        self,
+        url: str,
+        cfg: Config,
+        page_callback=None,
+    ) -> list[TrackMetadata]:
+        from antra.core.apple_library import (
+            APPLE_LIBRARY_SONGS_URL,
+            AppleLibraryClient,
+            extract_apple_library_playlist_id,
+        )
+
+        authorization = (getattr(cfg, "apple_authorization_token", "") or "").strip()
+        music_user_token = (getattr(cfg, "apple_music_user_token", "") or "").strip()
+        storefront = (getattr(cfg, "apple_storefront", "") or "us").strip() or "us"
+
+        if not authorization or not music_user_token:
+            raise ValueError(
+                "Apple Music library access requires your Apple Music web session. "
+                "Connect Apple Music in Settings first."
+            )
+
+        client = AppleLibraryClient(
+            authorization_token=authorization,
+            music_user_token=music_user_token,
+            storefront=storefront,
+        )
+        if url == APPLE_LIBRARY_SONGS_URL:
+            return client.get_saved_songs_tracks(page_callback=page_callback)
+
+        playlist_id = extract_apple_library_playlist_id(url)
+        if not playlist_id:
+            raise ValueError(f"Unsupported Apple Music library URL: {url}")
+        return client.get_library_playlist_tracks(playlist_id, page_callback=page_callback)
 
     def _fetch_soundcloud_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:
@@ -1306,6 +1398,85 @@ class AntraService:
             "Configure Spotify credentials to get reliable metadata."
         )
 
+    def _fetch_youtube_music_tracks(
+        self,
+        url: str,
+        cfg: Config,
+        page_callback=None,
+    ) -> list[TrackMetadata]:
+        try:
+            from antra.core.youtube_music_fetcher import YouTubeMusicFetcher
+        except ImportError:
+            raise RuntimeError(
+                "YouTube Music fetching is not available in this distribution."
+            )
+        return YouTubeMusicFetcher().fetch(url, page_callback=page_callback)
+
+    def _fetch_liked_songs_tracks(
+        self,
+        sp_dc: str,
+        cfg: Config,
+        page_callback=None,
+    ) -> list[TrackMetadata]:
+        """Fetch Liked Songs via GraphQL Partner API and convert to TrackMetadata."""
+        from antra.core.spotify_library import SpotifyLibraryClient
+
+        client = SpotifyLibraryClient(sp_dc)
+
+        # Build a page callback that converts raw dicts to TrackMetadata on each page.
+        # We collect raw dicts first, then convert at the end so we avoid partial lists.
+        raw_tracks: list[dict] = []
+
+        def _raw_page(tracks_so_far: list[dict]) -> None:
+            nonlocal raw_tracks
+            raw_tracks = tracks_so_far
+            if page_callback:
+                try:
+                    page_callback(self._liked_songs_to_metadata(tracks_so_far, cfg))
+                except Exception:
+                    pass
+
+        raw_tracks = client.get_liked_songs_tracks(page_callback=_raw_page)
+        return self._liked_songs_to_metadata(raw_tracks, cfg)
+
+    @staticmethod
+    def _liked_songs_to_metadata(raw_tracks: list[dict], cfg: "Config") -> list[TrackMetadata]:
+        """Convert raw liked-songs dicts (from SpotifyLibraryClient) to TrackMetadata."""
+        from antra.core.models import TrackMetadata
+
+        results: list[TrackMetadata] = []
+        for i, t in enumerate(raw_tracks):
+            artists = t.get("artists") or []
+            artist_str = ", ".join(a for a in artists if a) if artists else "Unknown Artist"
+            release_year: Optional[int] = None
+            release_date_str: Optional[str] = t.get("release_date") or ""
+            if release_date_str:
+                try:
+                    release_year = int(str(release_date_str)[:4])
+                except (ValueError, TypeError):
+                    pass
+
+            tm = TrackMetadata(
+                title=t.get("name") or "Unknown Title",
+                artists=artists,
+                album=t.get("album") or "Liked Songs",
+                album_id=t.get("album_id"),
+                spotify_id=t.get("spotify_id") or t.get("id"),
+                isrc=t.get("isrc"),
+                release_year=release_year,
+                release_date=release_date_str or None,
+                duration_ms=t.get("duration_ms") or 0,
+                artwork_url=t.get("artwork_url"),
+                is_explicit=t.get("explicit", False),
+                track_number=i + 1,
+                playlist_position=i + 1,
+                disc_number=1,
+                playlist_name="Liked Songs",
+                request_kind="playlist",
+            )
+            results.append(tm)
+        return results
+
     def _fetch_amazon_music_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:
             from antra.core.amazon_music_fetcher import AmazonMusicFetcher
@@ -1391,11 +1562,15 @@ class AntraService:
                 import requests as _req
                 _curl_kwargs = {}
             logger.debug("[Proxy] Fetching Spotify metadata via VPS (key=%s)...", api_key[:12])
+            # First-paint speed matters more than stubbornly waiting on the VPS.
+            # When the proxy is overloaded, the UI currently sits idle before it
+            # can fall back to direct Spotify fetches. Keep the proxy path, but
+            # fail fast enough that pasted Spotify URLs still render quickly.
             resp = _req.get(
                 f"{proxy_base}/api/spotify-metadata",
                 params={"url": url},
                 headers={"X-API-Key": api_key},
-                timeout=60,
+                timeout=(4, 12),
                 **_curl_kwargs,
             )
             if not resp.ok:
@@ -1440,6 +1615,7 @@ class AntraService:
                         is_explicit=t.get("is_explicit"),
                         audio_traits=t.get("audio_traits") or [],
                         album_artists=t.get("album_artists") or [],
+                        playlist_position=t.get("playlist_position") or (idx + 1),
                     ))
                 except Exception as track_err:
                     logger.warning("[Proxy] Track %d construction failed: %s (data: %s)", idx, track_err, str(t)[:200])
@@ -1676,26 +1852,35 @@ class AntraService:
         if not adapters:
             raise RuntimeError("No source adapters available. Check your configuration.")
 
-        normalized_source_preference = normalize_source_preference(cfg.source_preference)
-        preserve_input_order = normalized_source_preference in {
-            "auto",
-            "soulseek",
-            "priority-2",
-            "priority-3",
-            "priority-4",
-        }
+        normalized_source_preferences = normalize_source_preferences(cfg.source_preference)
+        preserve_input_order = bool(
+            set(normalized_source_preferences)
+            & {"auto", "soulseek", "priority-2", "priority-3", "priority-4"}
+        )
+        # Atmos formats route to a specific platform via the resolver's
+        # _build_resolve_order() — skip source_preference filtering so the
+        # resolver gets the full adapter list to pick from.
+        _atmos_formats = {"atmos-tidal", "atmos-apple", "atmos-amazon"}
         resolver_adapters = adapters
-        if normalized_source_preference == "auto":
+        if cfg.output_format in _atmos_formats:
+            resolver_adapters = adapters
+        elif "auto" in normalized_source_preferences:
             resolver_adapters = sorted(adapters, key=lambda adapter: adapter.priority)
         else:
             filtered = AntraService._filter_adapters_by_source_preference(adapters, cfg.source_preference)
             resolver_adapters = sorted(filtered, key=lambda adapter: adapter.priority) if filtered else adapters
+        provider_stats = None
+        if getattr(cfg, "provider_stats_enabled", True):
+            provider_stats = get_provider_stats(
+                getattr(cfg, "provider_stats_db_path", "") or None
+            )
         resolver = SourceResolver(
             resolver_adapters,
             preferred_output_format=cfg.output_format,
             preserve_input_order=preserve_input_order,
             prefer_explicit=getattr(cfg, "prefer_explicit", True),
             strict_matching=getattr(cfg, "strict_matching", False),
+            provider_stats=provider_stats,
         )
         if organizer is None:
             full_albums = getattr(cfg, "library_mode", "smart_dedup") == "full_albums"
@@ -1728,6 +1913,7 @@ class AntraService:
             max_retries=cfg.max_retries,
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
+            save_cover_art_sidecar=getattr(cfg, "save_cover_art_sidecar", False),
             output_format=cfg.output_format,
             strict_matching=getattr(cfg, "strict_matching", False),
             # ANTRA_MAX_WORKERS is set to 3 by the Go desktop layer when a

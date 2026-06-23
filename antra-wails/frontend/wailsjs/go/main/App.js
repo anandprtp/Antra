@@ -14,6 +14,10 @@ export function CancelDownload() {
   return window['go']['main']['App']['CancelDownload']();
 }
 
+export function CaptureSpDC() {
+  return window['go']['main']['App']['CaptureSpDC']();
+}
+
 export function CheckSourceHealth(arg1) {
   return window['go']['main']['App']['CheckSourceHealth'](arg1);
 }
@@ -28,6 +32,10 @@ export function ConfirmAmazonLogin() {
 
 export function GetAlbumAvailability(arg1) {
   return window['go']['main']['App']['GetAlbumAvailability'](arg1);
+}
+
+export function GetAppleMusicLibrary() {
+  return window['go']['main']['App']['GetAppleMusicLibrary']();
 }
 
 export function GetArtistDiscography(arg1) {
@@ -66,6 +74,10 @@ export function GetSlskdWebUIInfo() {
   return window['go']['main']['App']['GetSlskdWebUIInfo']();
 }
 
+export function GetSpotifyLibrary() {
+  return window['go']['main']['App']['GetSpotifyLibrary']();
+}
+
 export function GetSpotifyPlaylists() {
   return window['go']['main']['App']['GetSpotifyPlaylists']();
 }
@@ -76,6 +88,10 @@ export function GetSpotifyStatus() {
 
 export function GetSupportStatus() {
   return window['go']['main']['App']['GetSupportStatus']();
+}
+
+export function GetTrackLyrics(arg1) {
+  return window['go']['main']['App']['GetTrackLyrics'](arg1);
 }
 
 export function LoginSpotify() {
@@ -96,6 +112,10 @@ export function PickDirectory() {
 
 export function RetryTrackDownload(arg1) {
   return window['go']['main']['App']['RetryTrackDownload'](arg1);
+}
+
+export function RunAutoSync() {
+  return window['go']['main']['App']['RunAutoSync']();
 }
 
 export function SaveConfig(arg1) {

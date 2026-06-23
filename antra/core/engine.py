@@ -62,12 +62,36 @@ def _is_server_error(exc: BaseException) -> bool:
     ))
 
 
+def _summarize_source_error(msg: str) -> str:
+    """Condense an adapter download-failure message into a short chain tag.
+
+    Used for the per-track source-chain summary so users can see, at a glance,
+    why each source could not deliver the track (rather than just the last error).
+    """
+    m = (msg or "").lower()
+    if any(c in m for c in ("500", "502", "503", "504", "507")) or any(
+        kw in m for kw in ("server error", "service unavailable", "bad gateway", "internal error")
+    ):
+        return "server error"
+    if any(kw in m for kw in ("only available as high", "quality unconfirmable",
+                              "quality mismatch", "lossless unavailable")):
+        return "no lossless (AAC only)"
+    if "truncated" in m or "preview" in m:
+        return "truncated/preview"
+    if "rate" in m and "limit" in m:
+        return "rate-limited"
+    if "no matching source" in m or "no source" in m or "no catalog match" in m:
+        return "no catalog match"
+    return (msg or "failed").strip()[:50]
+
+
 @dataclass
 class EngineConfig:
     max_retries: int = 3
     retry_delay: float = 5.0
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
+    save_cover_art_sidecar: bool = False
     output_format: str = "source"
     strict_matching: bool = False
     max_workers: int = 1
@@ -469,9 +493,13 @@ class DownloadEngine:
         if not expected_duration_ms or expected_duration_ms < 60000:
             return None
 
+        tiny_lossless_reason = cls._get_tiny_lossless_file_reason(file_path, expected_duration_ms)
+        if tiny_lossless_reason is not None:
+            return tiny_lossless_reason
+
         actual_seconds = cls._probe_duration_seconds(file_path)
         if actual_seconds is None:
-            return None
+            return cls._get_flac_truncation_reason(file_path)
         expected_seconds = expected_duration_ms / 1000.0
 
         def _severe_mismatch(expected_s: float, actual_s: float) -> bool:
@@ -513,6 +541,30 @@ class DownloadEngine:
 
         # Secondary file-size check for FLAC files.
         return cls._get_flac_truncation_reason(file_path)
+
+    @staticmethod
+    def _get_tiny_lossless_file_reason(file_path: str, expected_duration_ms: int | None) -> str | None:
+        if not expected_duration_ms or expected_duration_ms < 60000:
+            return None
+        if not file_path.lower().endswith((".flac", ".m4a")):
+            return None
+        try:
+            actual_size = os.path.getsize(file_path)
+        except OSError:
+            return "downloaded file is missing"
+
+        expected_seconds = expected_duration_ms / 1000.0
+        # A full-length lossless file in the low hundreds of KB is always a bad
+        # delivery: preview HTML, an aborted stream, or a header-only container.
+        absolute_floor = 512 * 1024
+        per_second_floor = expected_seconds * 2 * 1024
+        min_expected_size = int(max(absolute_floor, min(per_second_floor, 2 * 1024 * 1024)))
+        if actual_size < min_expected_size:
+            return (
+                f"implausibly small lossless file: got {actual_size / 1024:.0f}KB "
+                f"for expected {expected_seconds:.1f}s track"
+            )
+        return None
 
     @classmethod
     def _is_truncated_flac_by_size(cls, file_path: str) -> bool:
@@ -657,6 +709,8 @@ class DownloadEngine:
 
             if existing:
                 existing = self.organizer.ensure_playlist_copy(track, existing)
+                if self.cfg.save_cover_art_sidecar:
+                    self.tagger.save_cover_art_sidecar(existing, track)
                 logger.info(f"  [SKIP]  Skipping (already downloaded): {track.title}")
                 self._emit(
                     EngineEventType.TRACK_SKIPPED,
@@ -685,11 +739,19 @@ class DownloadEngine:
         last_source: Optional[str] = None
         attempted_sources: list[str] = []  # ordered list of sources that were tried
         used_lossy_fallback: bool = False  # flag for post-download warning
+        # Per-adapter outcome across the whole track (search + download), so the
+        # full source chain can be surfaced if the track ultimately fails.
+        source_chain: dict[str, str] = {}
 
         while True:
             # 3. Resolve — skip both permanently-excluded and currently rate-limited adapters.
             all_excluded = excluded_adapters | rate_limited_adapters
             resolution = self.resolver.resolve(track, excluded_adapters=all_excluded)
+            # Merge this cycle's search outcomes (no-match / search-error / found)
+            # into the running chain. Excluded adapters aren't re-searched, so a
+            # prior download-failure reason for them is preserved; the selected
+            # adapter's "found" entry is overridden below if its download fails.
+            source_chain.update(self.resolver.last_resolve_report())
             if not resolution:
                 # Before giving up: if any adapters were rate-limited and haven't
                 # had their one retry yet, unblock them and try again.
@@ -724,6 +786,13 @@ class DownloadEngine:
                         "Amazon could not provide a playable file for this track, "
                         "and no safe YouTube fallback match was found."
                     )
+                # Surface the full per-source outcome so it's clear every source was
+                # tried (and why each one couldn't deliver) — not just the last error.
+                if source_chain:
+                    chain_str = ", ".join(
+                        f"{name}: {reason}" for name, reason in source_chain.items()
+                    )
+                    logger.info(f"  [CHAIN]  {track.title} — sources tried → {chain_str}")
                 self.organizer.mark_failed(track, user_error)
                 self._emit(
                     EngineEventType.TRACK_FAILED,
@@ -883,6 +952,10 @@ class DownloadEngine:
                     last_source = adapter.name
                     if adapter.name not in attempted_sources:
                         attempted_sources.append(adapter.name)
+                    # A download failure is more informative than the search outcome —
+                    # override the chain entry for this adapter.
+                    source_chain[adapter.name] = _summarize_source_error(str(e))
+                    self.resolver.record_album_source_failure(track, adapter.name)
                     adapter.mark_failed_result(result, e)
 
                     # Rate-limited: skip to next source immediately — no sleep, no retry.
@@ -943,9 +1016,26 @@ class DownloadEngine:
                         f"  [WARN]  Metadata tagging did not complete for {file_path}. "
                         "This usually means the output container is unsupported for embedded tags."
                     )
+                if self.cfg.save_cover_art_sidecar:
+                    self.tagger.save_cover_art_sidecar(file_path, track)
 
                 # 5. Mark done
                 self.organizer.mark_downloaded(track, file_path)
+                # Persist a successful delivery so this adapter is preferred within
+                # its tier on future downloads / sessions (SF-1).
+                self.resolver.record_outcome(adapter.name, True)
+                actual_bit_depth = None
+                try:
+                    audio = MutagenFile(file_path)
+                    actual_bit_depth = getattr(getattr(audio, "info", None), "bits_per_sample", None)
+                except Exception:
+                    pass
+                self.resolver.record_album_source_success(
+                    track,
+                    adapter.name,
+                    result,
+                    actual_bit_depth=actual_bit_depth,
+                )
 
                 size_mb = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0
                 attempt_time = getattr(self, "_last_attempt_start", time.time())
@@ -986,6 +1076,8 @@ class DownloadEngine:
             # Rate-limited adapters already placed in rate_limited_adapters above — skip
             # the regular exclude logic so they don't also land in excluded_adapters.
             if isinstance(final_error, RateLimitedError):
+                # Reliability signal: the adapter had the track but is overloaded (SF-1).
+                self.resolver.record_outcome(adapter.name, False)
                 continue
 
             # Truncated downloads: the adapter found the track but the stream ended early
@@ -995,12 +1087,14 @@ class DownloadEngine:
             #    Without this, workers running in parallel each independently queue on the
             #    broken adapter, discovering the truncation one at a time.
             # 2. Defer the adapter to the end of this track's queue (rate_limited_adapters)
-            #    so Amazon/DAB get a fair shot first; the adapter gets one last retry if
+            #    so Amazon/HiFi get a fair shot first; the adapter gets one last retry if
             #    nothing else works (useful when the adapter is the only one that can find
-            #    the track, e.g. featured-artist titles that defeat DAB/Amazon search).
+            #    the track, e.g. featured-artist titles that defeat Amazon/HiFi search).
             if final_error is not None and "appears truncated" in str(final_error):
                 # Signal all parallel workers to stop queuing on this adapter.
                 self.resolver._mark_rate_limited(adapter.name, cooldown_seconds=120)
+                # Reliability signal: a truncated/preview stream is a delivery failure (SF-1).
+                self.resolver.record_outcome(adapter.name, False)
 
                 if adapter.name in rate_limited_retried:
                     # Already had its second chance and still truncated — give up.
@@ -1033,6 +1127,8 @@ class DownloadEngine:
                 # After 3 in a row, rate-limit the adapter globally for 5 minutes
                 # so it is skipped for all subsequent tracks in this session.
                 if final_error is not None and _is_server_error(final_error):
+                    # Reliability signal: server-side 5xx delivery failure (SF-1).
+                    self.resolver.record_outcome(adapter.name, False)
                     with self._adapter_server_errors_lock:
                         count = self._adapter_server_errors.get(adapter.name, 0) + 1
                         self._adapter_server_errors[adapter.name] = count

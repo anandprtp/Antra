@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, SaveCoverArt } from '../wailsjs/go/main/App.js';
-  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus, GetAlbumAvailability } from '../wailsjs/go/main/App.js';
+  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, CaptureSpDC } from '../wailsjs/go/main/App.js';
+  import { ScanFolder, AnalyzeAudio, PickAnalyzerFiles, WriteFile, GetArtistDiscography, SearchArtists, CheckSourceHealth, GetSlskdWebUIInfo, GetDownloadedMusicLibrary, GetDownloadedRelease, GetSupportStatus, GetAlbumAvailability, GetSpotifyLibrary, GetAppleMusicLibrary, RunAutoSync, GetTrackLyrics } from '../wailsjs/go/main/App.js';
   import { EventsOn, BrowserOpenURL, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
   import AntraLogo from './AntraLogo.svelte';
@@ -53,6 +53,8 @@
     theme: '',
     strict_matching: false,
     download_source: 'auto',
+    download_sources: ['auto'],
+    save_cover_art_sidecar: false,
     single_track_filename_template: '{artist} - {title}',
     album_track_filename_template: '{track} - {title}',
     folder_structure_template: '{album_artist}/{year} - {album}',
@@ -62,6 +64,11 @@
     whitespace_handling: 'keep',
     fetch_lyrics: true,
     filename_conflict_behavior: 'skip',
+    auto_sync_enabled: false,
+    auto_sync_hour: 6,
+    auto_sync_minute: 0,
+    auto_sync_days: 127,
+    tracked_playlists: [],
   };
   let tidalValidationStatus: { ok: boolean; message: string; display_name?: string; country_code?: string } | null = null;
   let tidalValidationLoading = false;
@@ -85,6 +92,7 @@
   }
   let appleLogin: BrowserLoginState = { phase: 'idle' };
   let amazonLogin: BrowserLoginState = { phase: 'idle' };
+  let spDcCapture: BrowserLoginState = { phase: 'idle' };
 
   interface FailedTrackPayload {
     title: string;
@@ -139,16 +147,6 @@
     config.theme = id;
     showThemes = false;
     SaveConfig(config);
-  }
-
-  async function saveCoverArtToLibrary() {
-    if (!playlistArtwork) return;
-    try {
-      await SaveCoverArt(playlistArtwork, config.download_path);
-      addLog('success', '✔ Cover art saved to library folder.');
-    } catch (e) {
-      addLog('error', `Failed to save cover art: ${(e as any)?.message || e}`);
-    }
   }
 
   // ── Filename template system ────────────────────────────────────────────────
@@ -232,6 +230,7 @@
     title: string;
     artist?: string;
     album?: string;
+    file_path?: string;
     file_name: string;
     file_path: string;
     disc_number?: number;
@@ -266,6 +265,179 @@
   let playerReleaseTitle = '';
   $: currentPlayerTrack = playerTrackIndex >= 0 ? playerQueue[playerTrackIndex] : null;
 
+  // ── Synced Lyrics (SF-2) ────────────────────────────────────────────────────
+  interface LyricsLine { time_ms: number; text: string; }
+  let lyricsLines: LyricsLine[] = [];
+  let lyricsSynced = false;
+  let lyricsLoading = false;
+  let showLyrics = false;
+  let lyricsContainerEl: HTMLDivElement;
+
+  // Index of the last lyrics line whose time_ms <= current playback position.
+  $: activeLyricIdx = (lyricsSynced && lyricsLines.length > 0)
+    ? lyricsLines.reduce((best, line, i) =>
+        line.time_ms <= playerCurrentTime * 1000 ? i : best, -1)
+    : -1;
+
+  // Auto-scroll the active line into view when it changes.
+  $: if (activeLyricIdx >= 0 && lyricsContainerEl) {
+    const el = lyricsContainerEl.children[activeLyricIdx] as HTMLElement;
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  // ── Spotify Library (My Mixes home screen section) ─────────────────────────
+  interface SpotifyPlaylistItem {
+    id: string;
+    name: string;
+    url: string;
+    image_url?: string;
+    track_count: number;
+    owner_id: string;
+    is_algorithmic: boolean;
+    description?: string;
+  }
+  interface SpotifyAlbumItem {
+    id: string;
+    name: string;
+    url: string;
+    image_url?: string;
+    artists?: string;
+    year?: number;
+  }
+  interface SpotifyArtistItem {
+    id: string;
+    name: string;
+    url: string;
+    image_url?: string;
+  }
+  interface SpotifyLibraryData {
+    liked_songs_count: number;
+    playlists: SpotifyPlaylistItem[];
+    saved_albums?: SpotifyAlbumItem[];
+    followed_artists?: SpotifyArtistItem[];
+  }
+  let spotifyLibrary: SpotifyLibraryData | null = null;
+  let spotifyLibraryLoading = false;
+  let spotifyLibraryError = '';
+
+  // Per-section collapse state for the My Library tab (false = expanded)
+  let libMixesCollapsed = false;
+  let libPlaylistsCollapsed = false;
+  let libAlbumsCollapsed = false;
+  let libArtistsCollapsed = false;
+
+  // Apple Music library state
+  interface AppleLibraryPlaylistItem {
+    id: string;
+    name: string;
+    url: string;
+    image_url: string | null;
+    track_count: number;
+    is_algorithmic: boolean;
+  }
+  interface AppleLibraryData {
+    saved_songs_count: number;
+    playlists: AppleLibraryPlaylistItem[];
+  }
+  let appleLibrary: AppleLibraryData | null = null;
+  let appleLibraryLoading = false;
+  let appleLibraryError = '';
+
+  // Service switcher for My Library tab
+  let libActiveService: 'spotify' | 'apple' = 'spotify';
+
+  async function loadAppleMusicLibrary() {
+    if (!config.apple_music_user_token || !config.apple_authorization_token) return;
+    appleLibraryLoading = true;
+    appleLibraryError = '';
+    try {
+      const raw = await GetAppleMusicLibrary();
+      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (data.error) {
+        appleLibraryError = data.error;
+      } else {
+        appleLibrary = data as AppleLibraryData;
+      }
+    } catch (e: any) {
+      appleLibraryError = e?.message || String(e);
+    } finally {
+      appleLibraryLoading = false;
+    }
+  }
+
+  async function loadSpotifyLibrary() {
+    if (!config.spotify_sp_dc) return;
+    spotifyLibraryLoading = true;
+    spotifyLibraryError = '';
+    try {
+      const raw = await GetSpotifyLibrary();
+      const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (data.error) {
+        spotifyLibraryError = data.error;
+      } else {
+        spotifyLibrary = data as SpotifyLibraryData;
+      }
+    } catch (e: any) {
+      spotifyLibraryError = e?.message || String(e);
+    } finally {
+      spotifyLibraryLoading = false;
+    }
+  }
+
+  // Trigger a download by pasting a URL and starting immediately
+  function downloadPlaylistUrl(url: string) {
+    inputUrl = url;
+    activeTab = 'url';
+    startDownload();
+  }
+
+  // ── Auto-sync ───────────────────────────────────────────────────────────────
+  let autoSyncRunning = false;
+  let autoSyncLastResult = '';
+
+  async function runAutoSyncNow() {
+    autoSyncRunning = true;
+    autoSyncLastResult = '';
+    try {
+      const result = await RunAutoSync();
+      autoSyncLastResult = result || 'Auto-sync complete.';
+    } catch (e: any) {
+      autoSyncLastResult = `Error: ${e?.message || e}`;
+    } finally {
+      autoSyncRunning = false;
+    }
+  }
+
+  function togglePlaylistSync(pl: { url: string; name: string; artwork_url?: string; is_algorithmic?: boolean }) {
+    const list = [...((config.tracked_playlists || []) as any[])];
+    const idx = list.findIndex((p: any) => p.url === pl.url);
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], sync_enabled: !list[idx].sync_enabled };
+    } else {
+      list.push({
+        url: pl.url,
+        name: pl.name,
+        artwork_url: pl.artwork_url || '',
+        is_algorithmic: pl.is_algorithmic || false,
+        sync_enabled: true,
+        last_track_ids: [],
+        last_sync_ts: 0,
+      });
+    }
+    config.tracked_playlists = list;
+    SaveConfig(config);
+  }
+
+  function isPlaylistSyncing(url: string): boolean {
+    const entry = ((config.tracked_playlists || []) as any[]).find((p: any) => p.url === url);
+    if (!entry) return false;
+    return entry.sync_enabled !== false;
+  }
+
+  function getTrackedEntry(url: string): any {
+    return ((config.tracked_playlists || []) as any[]).find((p: any) => p.url === url);
+  }
+
   // ── Source health check ─────────────────────────────────────────────────────
   interface EndpointStatus { url: string; alive: boolean; latency_ms: number; }
   interface SourceHealth { source: string; total: number; live: number; endpoints: EndpointStatus[]; }
@@ -289,7 +461,7 @@
         gistStatus = {
           hifi:   !!(data['hifi']   ?? data['tidal'] ?? true),
           amazon: !!(data['amazon'] ?? true),
-          qobuz:  !!(data['qobuz']  ?? data['dab']   ?? true),
+          qobuz:  !!(data['qobuz']  ?? true),
           apple:  !!(data['apple']  ?? true),
           deezer: !!(data['deezer'] ?? true),
         };
@@ -306,6 +478,49 @@
     { key: 'qobuz',  label: 'Qobuz',   abbr: 'Q', bg: '#0d0d1f', bgEnabled: 'rgba(123,94,167,0.18)',  border: '#7B5EA7', text: '#7B5EA7' },
     { key: 'deezer', label: 'Deezer',  abbr: 'D', bg: '#001219', bgEnabled: 'rgba(0,196,80,0.14)',    border: '#00C450', text: '#00C450' },
   ];
+  const downloadSourceOptions = [
+    { value: 'auto',    label: 'Auto',        icon: null },
+    { value: 'tidal',   label: 'Tidal',       icon: '/icons/tidal.webp' },
+    { value: 'qobuz',   label: 'Qobuz',       icon: '/icons/qobuz.png' },
+    { value: 'apple',   label: 'Apple Music', icon: '/icons/apple-music.png' },
+    { value: 'amazon',  label: 'Amazon',      icon: '/icons/amazon-music.jpg' },
+    { value: 'deezer',  label: 'Deezer',      icon: '/icons/deezer.webp' },
+  ];
+  const concreteDownloadSources = downloadSourceOptions.filter(src => src.value !== 'auto').map(src => src.value);
+  let selectedDownloadSources: string[] = ['auto'];
+
+  function normalizeDownloadSources(): string[] {
+    const raw = config.download_sources && config.download_sources.length
+      ? config.download_sources
+      : [config.download_source || 'auto'];
+    const cleaned = Array.from(new Set(raw.filter(Boolean)));
+    if (!cleaned.length || cleaned.includes('auto')) return ['auto'];
+    const known = cleaned.filter(src => concreteDownloadSources.includes(src));
+    return known.length ? known : ['auto'];
+  }
+
+  function setDownloadSources(sources: string[]) {
+    selectedDownloadSources = sources;
+    config = {
+      ...config,
+      download_sources: sources,
+      download_source: sources.length === 1 ? sources[0] : 'custom',
+    };
+  }
+
+  function toggleDownloadSource(value: string) {
+    if (value === 'auto') {
+      setDownloadSources(['auto']);
+      return;
+    }
+    let selected = selectedDownloadSources.filter(src => src !== 'auto');
+    if (selected.includes(value)) {
+      selected = selected.filter(src => src !== value);
+    } else {
+      selected = [...selected, value];
+    }
+    setDownloadSources(selected.length ? selected : ['auto']);
+  }
   const formatOptions = [
     { value: 'auto',     name: 'Auto', label: 'Best available — lossless preferred, MP3 fallback' },
     { value: 'lossless', name: 'FLAC', label: 'FLAC lossless — highest quality from any source' },
@@ -431,9 +646,6 @@
     enabled: boolean;
     title: string;
     message: string;
-    current: number;
-    goal: number;
-    currency: string;
     link: string;
   }
 
@@ -441,24 +653,14 @@
     enabled: true,
     title: 'Support Antra',
     message: 'Solo-maintained by one developer. Help fund bug fixes, updates, and endpoint costs.',
-    current: 0,
-    goal: 200,
-    currency: 'USD',
     link: 'https://ko-fi.com/antraverse'
   };
   let supportStatusLoading = false;
-  $: supportProgress = supportStatus.goal > 0 ? Math.min(100, Math.max(0, (supportStatus.current / supportStatus.goal) * 100)) : 0;
 
   function dismissSponsorToast() {
     sponsorToastLeaving = true;
     clearTimeout(sponsorToastTimer);
     setTimeout(() => { showSponsorToast = false; sponsorToastLeaving = false; }, 450);
-  }
-
-  function formatSupportAmount(value: number): string {
-    const currency = supportStatus.currency || 'USD';
-    if (currency === 'USD') return `$${Math.round(value)}`;
-    return `${Math.round(value)} ${currency}`;
   }
 
   async function loadSupportStatus() {
@@ -470,9 +672,6 @@
         enabled: parsed.enabled !== false,
         title: parsed.title || supportStatus.title,
         message: parsed.message || supportStatus.message,
-        current: typeof parsed.current === 'number' ? parsed.current : supportStatus.current,
-        goal: typeof parsed.goal === 'number' && parsed.goal > 0 ? parsed.goal : supportStatus.goal,
-        currency: parsed.currency || supportStatus.currency,
         link: parsed.link || supportStatus.link
       };
     } catch (e) {
@@ -513,6 +712,21 @@
   }> = {};
   let currentPlaylistTrackKeysByIndex: Record<number, string> = {};
   let currentPlaylistTrackCount = 0;
+
+  // ── Failed Tracks Panel (ST-4) ──────────────────────────────────────────────
+  let dismissedFailures = new Set<string>();
+  let retryQueue: string[] = [];
+  let retryQueueTotal = 0;
+  let failedPanelCollapsed = false;
+
+  $: failedEntries = trackOrder
+    .filter(k => !k.startsWith('__SEP__') && activeTracks[k]?.status === 'failed' && !dismissedFailures.has(k))
+    .map(k => ({
+      key: k,
+      label: trackLabels[k] || k,
+      error: activeTracks[k]?.error || activeTracks[k]?.text || 'Failed',
+      trackData: activeTracks[k]?.trackData,
+    }));
 
   function makeTrackDisplayName(artist?: string | null, title?: string | null) {
     const artistPart = String(artist || '').trim();
@@ -626,6 +840,11 @@
       if (!config.download_source) {
         config.download_source = 'auto';
       }
+      selectedDownloadSources = normalizeDownloadSources();
+      config = { ...config, download_sources: selectedDownloadSources };
+      if (typeof config.save_cover_art_sidecar !== 'boolean') {
+        config.save_cover_art_sidecar = false;
+      }
       // Template defaults
       if (!config.single_track_filename_template) config.single_track_filename_template = '{artist} - {title}';
       if (!config.album_track_filename_template)  config.album_track_filename_template  = '{track} - {title}';
@@ -636,6 +855,13 @@
       // Apply saved theme
       applyTheme(config.theme || 'antra');
 
+      // Auto-sync defaults
+      if (config.auto_sync_enabled === undefined) config.auto_sync_enabled = false;
+      if (!config.auto_sync_hour && config.auto_sync_hour !== 0) config.auto_sync_hour = 6;
+      if (config.auto_sync_minute === undefined) config.auto_sync_minute = 0;
+      if (!config.auto_sync_days) config.auto_sync_days = 127;
+      if (!config.tracked_playlists) config.tracked_playlists = [];
+
     } catch (e) {
       console.error('Failed to load config', e);
       setupMode = true;
@@ -643,6 +869,12 @@
 
     await loadSupportStatus();
     fetchGistStatus(); // non-blocking — chips update when Gist responds
+    if (config.spotify_sp_dc) {
+      loadSpotifyLibrary(); // non-blocking — Spotify mixes section updates when ready
+    }
+    if (config.apple_music_user_token && config.apple_authorization_token) {
+      loadAppleMusicLibrary(); // non-blocking — Apple Music library updates when ready
+    }
     isLoading = false;
 
     // Listen to backend events
@@ -705,11 +937,14 @@
           appleLogin = { phase: 'starting', message: payload.message || 'Opening Apple Music login...' };
           break;
         case 'apple_login_success':
-          appleLogin = { phase: 'success', message: payload.message || 'Apple Music connected.' };
+          appleLogin = { phase: 'success', message: payload.message || 'Apple Music connected!' };
           config.apple_enabled = true;
           if (payload.authorization_token) config.apple_authorization_token = payload.authorization_token;
           if (payload.music_user_token) config.apple_music_user_token = payload.music_user_token;
           if (payload.storefront) config.apple_storefront = payload.storefront;
+          SaveConfig(config);
+          if (!appleLibrary && !appleLibraryLoading) loadAppleMusicLibrary();
+          setTimeout(() => { appleLogin = { phase: 'idle' }; }, 4000);
           break;
         case 'apple_login_error':
           appleLogin = { phase: 'error', message: payload.message || 'Apple Music login failed.' };
@@ -749,6 +984,30 @@
         case 'amazon_login_done':
           if (amazonLogin.phase === 'starting' || amazonLogin.phase === 'waiting_for_user' || amazonLogin.phase === 'capturing') {
             amazonLogin = { phase: 'error', message: amazonLogin.message || 'Amazon Music login ended unexpectedly.' };
+          }
+          break;
+      }
+    });
+
+    EventsOn("sp-dc-event", (payload: any) => {
+      if (!payload || !payload.type) return;
+      switch (payload.type) {
+        case 'sp_dc_status':
+          spDcCapture = { phase: payload.status === 'waiting' ? 'waiting_for_user' : 'starting', message: payload.message || 'Opening browser...' };
+          break;
+        case 'sp_dc_captured':
+          config.spotify_sp_dc = payload.sp_dc;
+          spDcCapture = { phase: 'success', message: 'Spotify account connected!' };
+          SaveConfig(config);
+          if (!spotifyLibrary && !spotifyLibraryLoading) loadSpotifyLibrary();
+          setTimeout(() => { spDcCapture = { phase: 'idle' }; }, 4000);
+          break;
+        case 'sp_dc_error':
+          spDcCapture = { phase: 'error', message: payload.message || 'Failed to capture sp_dc.' };
+          break;
+        case 'sp_dc_done':
+          if (spDcCapture.phase === 'starting' || spDcCapture.phase === 'waiting_for_user') {
+            spDcCapture = { phase: 'error', message: 'Login ended without capturing a session. Try again.' };
           }
           break;
       }
@@ -919,11 +1178,16 @@
         activeTracks = {};
         currentPlaylistTrackKeysByIndex = {};
         currentPlaylistTrackCount = 0;
+        dismissedFailures = new Set();
+        retryQueue = [];
+        retryQueueTotal = 0;
         addLog('warning', '■ Library sync stopped');
       } else if (payload.status === 'failed') {
         addLog('error', '✖ Library sync stopped with errors');
+        if (retryQueue.length > 0) { processRetryQueue(); }
       } else {
         addLog('success', '✔ Library updated successfully');
+        if (retryQueue.length > 0) { processRetryQueue(); }
       }
       return;
     }
@@ -981,7 +1245,6 @@
         if (displaySource === 'hifi') displaySource = 'Tidal';
         else if (displaySource === 'apple') displaySource = 'Apple';
         else if (displaySource === 'amazon') displaySource = 'Amazon';
-        else if (displaySource === 'dab') displaySource = 'Qobuz';
         else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
 
         updateActiveTrack(trackKey, {
@@ -1015,7 +1278,6 @@
         if (displaySource === 'hifi') displaySource = 'Tidal';
         else if (displaySource === 'apple') displaySource = 'Apple';
         else if (displaySource === 'amazon') displaySource = 'Amazon';
-        else if (displaySource === 'dab') displaySource = 'Qobuz';
         else displaySource = displaySource.charAt(0).toUpperCase() + displaySource.slice(1);
 
         updateActiveTrack(trackKey, {
@@ -1102,7 +1364,7 @@
   }
 
   // Tab mode
-  let activeTab: 'url' | 'artist' | 'discover' = 'url';
+  let activeTab: 'library' | 'url' | 'artist' | 'discover' = 'library';
   let searchQuery = '';
 
   // Discovery variables
@@ -1677,6 +1939,25 @@
     playerCurrentTime = audioEl.currentTime || 0;
   }
 
+  async function loadLyrics(filePath: string | undefined) {
+    lyricsLines = [];
+    lyricsSynced = false;
+    if (!filePath) return;
+    lyricsLoading = true;
+    try {
+      const raw = await GetTrackLyrics(filePath);
+      const parsed = JSON.parse(raw) as { lines: LyricsLine[]; synced: boolean };
+      lyricsLines = parsed.lines || [];
+      lyricsSynced = parsed.synced || false;
+      // Auto-show the panel when the track has lyrics; auto-hide when it doesn't.
+      if (lyricsLines.length > 0) showLyrics = true;
+    } catch { lyricsLines = []; }
+    finally { lyricsLoading = false; }
+  }
+
+  // Load lyrics whenever the active track changes.
+  $: loadLyrics(currentPlayerTrack?.file_path);
+
   function handleAudioLoadedMetadata() {
     if (!audioEl) return;
     playerDuration = audioEl.duration || playerDuration;
@@ -1726,7 +2007,7 @@
     let urls = inputUrl
       .split(/[\n,]+/)
       .map(s => s.trim())
-      .filter(s => s.startsWith('http'));
+      .filter(s => s.startsWith('http') || s.startsWith('apple-music://'));
     if (urls.length === 0) return;
 
     const isArtistUrl = (u: string) => {
@@ -1756,6 +2037,9 @@
       currentPlaylistTrackKeysByIndex = {};
       currentPlaylistTrackCount = 0;
       separatorMeta = {};
+      dismissedFailures = new Set();
+      retryQueue = [];
+      retryQueueTotal = 0;
       shouldAutoScroll = true;
       addLog('info', `━━━ Building your music library ━━━`);
       addLog('info', `Searching best available source (lossless prioritized)...`);
@@ -1829,6 +2113,13 @@
     }
   }
 
+  // Open the discography modal directly from a Spotify artist URL
+  // (used by the Followed Artists cards in the My Library tab).
+  async function openArtistFromUrl(profileUrl: string) {
+    if (!profileUrl) return;
+    await openArtistFromSearch({ profile_url: profileUrl });
+  }
+
   async function openArtistFromSearch(artist: any) {
     showArtistSearch = false;
     activeTab = 'url';
@@ -1894,8 +2185,13 @@
     if (!config.max_retries || config.max_retries < 1) {
       config.max_retries = 3;
     }
+    const hadSpDc = !!config.spotify_sp_dc;
     await SaveConfig(config);
     showSettings = false;
+    // auto-load library when sp_dc is first saved
+    if (hadSpDc && !spotifyLibrary && !spotifyLibraryLoading) {
+      loadSpotifyLibrary();
+    }
   }
 
   async function openFolderSettings(event?: MouseEvent) {
@@ -2058,6 +2354,29 @@
     }
   }
 
+  function dismissFailure(key: string) {
+    dismissedFailures = new Set([...dismissedFailures, key]);
+  }
+
+  function dismissAllFailures() {
+    dismissedFailures = new Set([...dismissedFailures, ...failedEntries.map(e => e.key)]);
+  }
+
+  async function processRetryQueue() {
+    if (retryQueue.length === 0 || isDownloading) return;
+    const nextKey = retryQueue[0];
+    retryQueue = retryQueue.slice(1);
+    if (nextKey) await retryFailedTrack(nextKey);
+  }
+
+  async function retryAllFailed() {
+    const eligible = failedEntries.filter(e => e.trackData);
+    if (eligible.length === 0 || isDownloading) return;
+    retryQueue = eligible.map(e => e.key);
+    retryQueueTotal = retryQueue.length;
+    await processRetryQueue();
+  }
+
 </script>
 
 {#if isLoading}
@@ -2119,21 +2438,9 @@
                   <button class="support-close-btn" on:click={() => kofiTooltipVisible = false} title="Close">×</button>
                 </div>
                 <p class="kofi-tooltip-body">{supportStatus.message}</p>
-                <div class="support-progress-wrap">
-                  <div class="support-progress-head">
-                    <span>{formatSupportAmount(supportStatus.current)} raised</span>
-                    <span>Goal {formatSupportAmount(supportStatus.goal)}</span>
-                  </div>
-                  <div class="support-progress-bar">
-                    <div class="support-progress-fill" style={`width:${supportProgress}%`}></div>
-                  </div>
-                  <div class="support-progress-foot">
-                    <span>{Math.round(supportProgress)}%</span>
-                    {#if supportStatusLoading}
-                      <span>Refreshing…</span>
-                    {/if}
-                  </div>
-                </div>
+                {#if supportStatusLoading}
+                  <p class="kofi-tooltip-refreshing">Refreshing…</p>
+                {/if}
                 <button class="kofi-tooltip-btn" on:click={() => BrowserOpenURL(supportStatus.link)}>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M23.881 8.948c-.773-4.085-4.859-4.593-4.859-4.593H.723c-.604 0-.679.798-.679.798s-.082 7.324-.022 11.822c.164 2.424 2.586 2.672 2.586 2.672s8.267-.023 11.966-.049c2.438-.426 2.683-2.566 2.658-3.734 4.352.24 7.422-2.831 6.649-6.916zm-11.062 3.511c-1.246 1.453-4.011 3.976-4.011 3.976s-.121.119-.31.023c-.076-.057-.108-.09-.108-.09-.443-.441-3.368-3.049-4.034-3.954-.709-.965-1.041-2.7-.091-3.71.951-1.01 3.005-1.086 4.363.407 0 0 1.565-1.782 3.468-.963 1.904.82 1.832 3.011.723 4.311zm6.173.478c-.928.116-1.682.028-1.682.028V7.284h1.77s1.971.551 1.971 2.638c0 1.913-.985 2.910-2.059 3.015z" fill="#FF5E5B"/></svg>
                   Support on Ko-fi
@@ -2147,10 +2454,21 @@
               <path d="M17.93 6.56L5.54 11.17c-.83.33-.82.8-.15 1l3.17.99 7.34-4.63c.35-.21.66-.1.4.14L9.4 14.1l-.22 3.37c.32 0 .46-.15.63-.3l1.52-1.48 3.16 2.33c.58.32 1 .16 1.14-.54l2.07-9.73c.2-.8-.3-1.16-.77-.95z" fill="white"/>
             </svg>
           </button>
+          <button title="Join our Discord community" on:click={() => BrowserOpenURL('https://discord.gg/Gq7CBAme7')} style="background: transparent; border: none; padding: 4px 6px; cursor: pointer; display: flex; align-items: center; opacity: 0.7; transition: opacity 0.15s;" on:mouseenter={(e) => e.currentTarget.style.opacity='1'} on:mouseleave={(e) => e.currentTarget.style.opacity='0.7'}>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <circle cx="12" cy="12" r="12" fill="#5865F2"/>
+              <path d="M8.12 7.75c1.02-.45 2.08-.7 3.14-.76l.15.29c-1.19.17-1.74.5-1.74.5s.15-.08.4-.18c.73-.31 1.31-.39 1.55-.41.04 0 .07-.01.11-.01.41-.05.88-.06 1.37-.01.64.07 1.33.26 2.03.61 0 0-.52-.31-1.65-.49l.21-.32c1.06.06 2.12.31 3.14.76 0 0 1.68 2.42 1.68 5.39 0 0-.98 1.67-3.55 1.76 0 0-.42-.5-.77-.93 1.54-.46 2.12-1.42 2.12-1.42-.48.32-.94.55-1.35.71-.58.24-1.14.39-1.69.47-1.12.2-2.15.14-3.03-.01-.67-.13-1.25-.31-1.73-.52-.27-.11-.57-.25-.87-.43-.04-.02-.08-.04-.12-.07-.02-.01-.03-.02-.05-.03-.22-.12-.34-.21-.34-.21s.56.93 2.06 1.4c-.35.44-.78.97-.78.97-2.57-.09-3.54-1.76-3.54-1.76 0-2.97 1.67-5.39 1.67-5.39Zm2.25 4.56c.66 0 1.19-.58 1.19-1.29 0-.71-.52-1.29-1.19-1.29-.66 0-1.19.58-1.19 1.29 0 .71.53 1.29 1.19 1.29Zm4.26 0c.66 0 1.19-.58 1.19-1.29 0-.71-.52-1.29-1.19-1.29-.66 0-1.19.58-1.19 1.29 0 .71.53 1.29 1.19 1.29Z" fill="white"/>
+            </svg>
+          </button>
         </div>
       </div>
       <!-- Mode toggle -->
       <div style="margin-top: 16px; display: flex; gap: 6px; margin-bottom: 8px;">
+        <button
+          on:click={() => { activeTab = 'library'; inputUrl = ''; if (!spotifyLibrary && !spotifyLibraryLoading && config.spotify_sp_dc) loadSpotifyLibrary(); }}
+          style="font-size: 12px; padding: 4px 12px; opacity: {activeTab === 'library' ? 1 : 0.45}; border-color: {activeTab === 'library' ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
+          🎵 My Library
+        </button>
         <button
           on:click={() => { activeTab = 'url'; searchQuery = ''; }}
           style="font-size: 12px; padding: 4px 12px; opacity: {activeTab === 'url' ? 1 : 0.45}; border-color: {activeTab === 'url' ? 'var(--accent-color)' : 'rgba(255,255,255,0.1)'};">
@@ -2168,7 +2486,9 @@
         </button>
       </div>
 
-      {#if activeTab === 'artist'}
+      {#if activeTab === 'library'}
+        <!-- My Library tab content rendered below health chips -->
+      {:else if activeTab === 'artist'}
         <!-- Artist search input -->
         <div class="input-bar" style="display: flex; gap: 8px; align-items: center;">
           <input
@@ -2215,9 +2535,6 @@
             class="health-chip"
             class:health-chip-disabled={!isOn}
             class:health-chip-enabled={isOn}
-            style={isOn
-              ? `background:${src.bgEnabled};`
-              : `background:rgba(0,0,0,0);`}
             on:click={() => handleChipClick(src.key)}
             title={isOn
               ? src.key === 'apple'
@@ -2225,21 +2542,16 @@
                 : `${src.label} — online`
               : `${src.label} — currently unavailable`}
           >
-            {#if isOn}
-              <span class="health-chip-on-badge">on</span>
-            {:else}
-              <span class="health-chip-off-badge">off</span>
-            {/if}
             {#if src.key === 'hifi'}
-              <img src="/icons/tidal.webp" alt="Tidal" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
+              <img src="/icons/tidal-health.png" alt="Tidal" class="health-chip-icon" />
             {:else if src.key === 'apple'}
-              <img src="/icons/apple-music.png" alt="Apple Music" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
+              <img src="/icons/apple-health.png" alt="Apple Music" class="health-chip-icon" />
             {:else if src.key === 'amazon'}
-              <img src="/icons/amazon-music.jpg" alt="Amazon Music" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3}; border-radius: 4px;" />
+              <img src="/icons/amazon-health.png" alt="Amazon Music" class="health-chip-icon" />
             {:else if src.key === 'qobuz'}
-              <img src="/icons/qobuz.png" alt="Qobuz" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
+              <img src="/icons/qobuz-health.png" alt="Qobuz" class="health-chip-icon" />
             {:else if src.key === 'deezer'}
-              <img src="/icons/deezer.webp" alt="Deezer" class="health-chip-icon" style="opacity:{isOn ? 1 : 0.3};" />
+              <img src="/icons/deezer-health.png" alt="Deezer" class="health-chip-icon" />
             {/if}
           </button>
         {/each}
@@ -2308,12 +2620,363 @@
       </div>
     {/if}
 
+    <!-- My Library tab: full library grid (Spotify / Apple Music switcher) -->
+    {#if activeTab === 'library'}
+    <div class="lib-scroll-area">
+      <!-- Service switcher tabs -->
+      <div class="lib-service-tabs">
+        <button
+          class="lib-service-tab"
+          class:active={libActiveService === 'spotify'}
+          on:click={() => { libActiveService = 'spotify'; if (config.spotify_sp_dc && !spotifyLibrary && !spotifyLibraryLoading) loadSpotifyLibrary(); }}
+        >
+          <span class="lib-tab-icon lib-tab-icon-spotify">
+            <img src="/icons/spotify.png" alt="" />
+          </span>
+          Spotify
+        </button>
+        <button
+          class="lib-service-tab"
+          class:active={libActiveService === 'apple'}
+          on:click={() => { libActiveService = 'apple'; if (config.apple_music_user_token && config.apple_authorization_token && !appleLibrary && !appleLibraryLoading) loadAppleMusicLibrary(); }}
+        >
+          <span class="lib-tab-icon lib-tab-icon-apple">
+            <img src="/icons/apple-music.png" alt="" />
+          </span>
+          Apple Music
+        </button>
+      </div>
+
+      {#if libActiveService === 'spotify'}
+      {#if !config.spotify_sp_dc}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 36px; margin-bottom: 12px; opacity: 0.3;">
+            <img src="/icons/spotify.png" alt="Spotify" style="width:40px;height:40px;object-fit:contain;opacity:0.3;" />
+          </div>
+          <p style="opacity: 0.6;">Connect your Spotify account in Settings to see your library here.</p>
+          <button on:click={() => { showSettings = true; }} style="margin-top: 8px; font-size: 12px;">Open Settings</button>
+        </div>
+      {:else if spotifyLibraryLoading}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">⏳</div>
+          <p style="opacity: 0.5;">Loading your Spotify library…</p>
+        </div>
+      {:else if spotifyLibraryError}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">⚠️</div>
+          <p style="opacity: 0.7; color: var(--error-color);">{spotifyLibraryError}</p>
+          <button on:click={loadSpotifyLibrary} style="margin-top: 8px; font-size: 12px;">Retry</button>
+        </div>
+      {:else if spotifyLibrary}
+        <div class="discover-sections" style="margin-top: 8px;">
+          <!-- Liked Songs + Algorithmic mixes -->
+          <div class="discover-section">
+            <div class="discover-section-header">
+              <button class="lib-collapse-btn" on:click={() => libMixesCollapsed = !libMixesCollapsed} title={libMixesCollapsed ? 'Expand' : 'Collapse'}>{libMixesCollapsed ? '▸' : '▾'}</button>
+              <h3 class="discover-section-title">Your Mixes</h3>
+              <div class="discover-section-rule"></div>
+              <button class="lib-refresh-btn" on:click={loadSpotifyLibrary} disabled={spotifyLibraryLoading} title="Refresh library">↺</button>
+            </div>
+            {#if !libMixesCollapsed}
+            <div class="discover-grid">
+              <!-- Liked Songs card -->
+              <!-- svelte-ignore a11y-click-events-have-key-events -->
+              <!-- svelte-ignore a11y-no-static-element-interactions -->
+              <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl('https://open.spotify.com/collection/tracks')}>
+                <div class="discovery-artwork-wrapper lib-liked-bg">
+                  <div class="lib-liked-icon">♥</div>
+                  <div class="discovery-play-overlay">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                  </div>
+                </div>
+                <div class="discovery-info">
+                  <div class="discovery-title">Liked Songs</div>
+                  <div class="discovery-subtitle">{spotifyLibrary.liked_songs_count} tracks</div>
+                </div>
+                <button
+                  class="lib-sync-pill"
+                  class:active={isPlaylistSyncing('https://open.spotify.com/collection/tracks')}
+                  on:click|stopPropagation={() => togglePlaylistSync({ url: 'https://open.spotify.com/collection/tracks', name: 'Liked Songs', artwork_url: '', is_algorithmic: false })}
+                  title={isPlaylistSyncing('https://open.spotify.com/collection/tracks') ? 'Auto-sync on — click to disable' : 'Enable auto-sync'}
+                >↺</button>
+              </div>
+              <!-- Algorithmic playlists -->
+              {#each spotifyLibrary.playlists.filter(p => p.is_algorithmic) as pl}
+                <!-- svelte-ignore a11y-click-events-have-key-events -->
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
+                <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl(pl.url)}>
+                  <div class="discovery-artwork-wrapper">
+                    {#if pl.image_url}
+                      <img src={pl.image_url} alt={pl.name} class="discovery-artwork" loading="lazy" />
+                    {:else}
+                      <div class="lib-art-fallback">♫</div>
+                    {/if}
+                    <div class="discovery-play-overlay">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                    </div>
+                  </div>
+                  <div class="discovery-info">
+                    <div class="discovery-title" title={pl.name}>{pl.name}</div>
+                    <div class="discovery-subtitle">{pl.track_count > 0 ? `${pl.track_count} tracks` : 'Playlist'}</div>
+                  </div>
+                  <button
+                    class="lib-sync-pill"
+                    class:active={isPlaylistSyncing(pl.url)}
+                    on:click|stopPropagation={() => togglePlaylistSync(pl)}
+                    title={isPlaylistSyncing(pl.url) ? 'Auto-sync on — click to disable' : 'Enable auto-sync'}
+                  >↺</button>
+                </div>
+              {/each}
+            </div>
+            {/if}
+          </div>
+
+          <!-- Personal playlists -->
+          {#if spotifyLibrary.playlists.filter(p => !p.is_algorithmic).length > 0}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <button class="lib-collapse-btn" on:click={() => libPlaylistsCollapsed = !libPlaylistsCollapsed} title={libPlaylistsCollapsed ? 'Expand' : 'Collapse'}>{libPlaylistsCollapsed ? '▸' : '▾'}</button>
+                <h3 class="discover-section-title">Your Playlists</h3>
+                <span class="lib-section-count">{spotifyLibrary.playlists.filter(p => !p.is_algorithmic).length}</span>
+                <div class="discover-section-rule"></div>
+              </div>
+              {#if !libPlaylistsCollapsed}
+              <div class="discover-grid">
+                {#each spotifyLibrary.playlists.filter(p => !p.is_algorithmic) as pl}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl(pl.url)}>
+                    <div class="discovery-artwork-wrapper">
+                      {#if pl.image_url}
+                        <img src={pl.image_url} alt={pl.name} class="discovery-artwork" loading="lazy" />
+                      {:else}
+                        <div class="lib-art-fallback">♫</div>
+                      {/if}
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={pl.name}>{pl.name}</div>
+                      <div class="discovery-subtitle">{pl.track_count > 0 ? `${pl.track_count} tracks` : 'Playlist'}</div>
+                    </div>
+                    <button
+                      class="lib-sync-pill"
+                      class:active={isPlaylistSyncing(pl.url)}
+                      on:click|stopPropagation={() => togglePlaylistSync(pl)}
+                      title={isPlaylistSyncing(pl.url) ? 'Auto-sync on — click to disable' : 'Enable auto-sync'}
+                    >↺</button>
+                  </div>
+                {/each}
+              </div>
+              {/if}
+            </div>
+          {/if}
+
+          <!-- Saved Albums -->
+          {#if spotifyLibrary.saved_albums && spotifyLibrary.saved_albums.length > 0}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <button class="lib-collapse-btn" on:click={() => libAlbumsCollapsed = !libAlbumsCollapsed} title={libAlbumsCollapsed ? 'Expand' : 'Collapse'}>{libAlbumsCollapsed ? '▸' : '▾'}</button>
+                <h3 class="discover-section-title">Saved Albums</h3>
+                <span class="lib-section-count">{spotifyLibrary.saved_albums.length}</span>
+                <div class="discover-section-rule"></div>
+              </div>
+              {#if !libAlbumsCollapsed}
+              <div class="discover-grid">
+                {#each spotifyLibrary.saved_albums as al}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl(al.url)}>
+                    <div class="discovery-artwork-wrapper">
+                      {#if al.image_url}
+                        <img src={al.image_url} alt={al.name} class="discovery-artwork" loading="lazy" />
+                      {:else}
+                        <div class="lib-art-fallback">♫</div>
+                      {/if}
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={al.name}>{al.name}</div>
+                      <div class="discovery-subtitle" title={al.artists}>{al.artists || ''}{al.year ? ` · ${al.year}` : ''}</div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+              {/if}
+            </div>
+          {/if}
+
+          <!-- Followed Artists -->
+          {#if spotifyLibrary.followed_artists && spotifyLibrary.followed_artists.length > 0}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <button class="lib-collapse-btn" on:click={() => libArtistsCollapsed = !libArtistsCollapsed} title={libArtistsCollapsed ? 'Expand' : 'Collapse'}>{libArtistsCollapsed ? '▸' : '▾'}</button>
+                <h3 class="discover-section-title">Followed Artists</h3>
+                <span class="lib-section-count">{spotifyLibrary.followed_artists.length}</span>
+                <div class="discover-section-rule"></div>
+              </div>
+              {#if !libArtistsCollapsed}
+              <div class="discover-grid">
+                {#each spotifyLibrary.followed_artists as ar}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card lib-card" on:click={() => openArtistFromUrl(ar.url)}>
+                    <div class="discovery-artwork-wrapper lib-artist-art">
+                      {#if ar.image_url}
+                        <img src={ar.image_url} alt={ar.name} class="discovery-artwork" loading="lazy" />
+                      {:else}
+                        <div class="lib-art-fallback">🎤</div>
+                      {/if}
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={ar.name}>{ar.name}</div>
+                      <div class="discovery-subtitle">Artist</div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">🎵</div>
+          <p style="opacity: 0.5;">Click Refresh to load your library.</p>
+          <button on:click={loadSpotifyLibrary} style="margin-top: 8px; font-size: 12px;">Load Library</button>
+        </div>
+      {/if}
+      {/if}<!-- /spotify -->
+
+      <!-- Apple Music library -->
+      {#if libActiveService === 'apple'}
+      {#if !config.apple_music_user_token || !config.apple_authorization_token}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 36px; margin-bottom: 12px; opacity: 0.3;">
+            <img src="/icons/apple-music.png" alt="Apple Music" style="width:40px;height:40px;object-fit:contain;opacity:0.3;" />
+          </div>
+          <p style="opacity: 0.6;">Connect your Apple Music account in Settings to see your library here.</p>
+          <button on:click={() => { showSettings = true; }} style="margin-top: 8px; font-size: 12px;">Open Settings</button>
+        </div>
+      {:else if appleLibraryLoading}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">⏳</div>
+          <p style="opacity: 0.5;">Loading your Apple Music library…</p>
+        </div>
+      {:else if appleLibraryError}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">⚠️</div>
+          <p style="opacity: 0.7; color: var(--error-color);">{appleLibraryError}</p>
+          <button on:click={loadAppleMusicLibrary} style="margin-top: 8px; font-size: 12px;">Retry</button>
+        </div>
+      {:else if appleLibrary}
+        <div class="discover-sections" style="margin-top: 8px;">
+          <!-- Saved Songs -->
+          <div class="discover-section">
+            <div class="discover-section-header">
+              <h3 class="discover-section-title">Your Music</h3>
+              <div class="discover-section-rule"></div>
+              <button class="lib-refresh-btn" on:click={loadAppleMusicLibrary} disabled={appleLibraryLoading} title="Refresh library">↺</button>
+            </div>
+            <div class="discover-grid">
+              <!-- Saved Songs card -->
+              <!-- svelte-ignore a11y-click-events-have-key-events -->
+              <!-- svelte-ignore a11y-no-static-element-interactions -->
+              <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl('apple-music://library/songs')}>
+                <div class="discovery-artwork-wrapper lib-apple-saved-bg">
+                  <div class="lib-liked-icon">♥</div>
+                  <div class="discovery-play-overlay">
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                  </div>
+                </div>
+                <div class="discovery-info">
+                  <div class="discovery-title">Saved Songs</div>
+                  <div class="discovery-subtitle">{appleLibrary.saved_songs_count} tracks</div>
+                </div>
+              </div>
+              <!-- Algorithmic playlists -->
+              {#each appleLibrary.playlists.filter(p => p.is_algorithmic) as pl}
+                <!-- svelte-ignore a11y-click-events-have-key-events -->
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
+                <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl(pl.url)}>
+                  <div class="discovery-artwork-wrapper">
+                    {#if pl.image_url}
+                      <img src={pl.image_url} alt={pl.name} class="discovery-artwork" loading="lazy" />
+                    {:else}
+                      <div class="lib-art-fallback">♫</div>
+                    {/if}
+                    <div class="discovery-play-overlay">
+                      <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                    </div>
+                  </div>
+                  <div class="discovery-info">
+                    <div class="discovery-title" title={pl.name}>{pl.name}</div>
+                    <div class="discovery-subtitle">{pl.track_count > 0 ? `${pl.track_count} tracks` : 'Playlist'}</div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+
+          <!-- Personal playlists -->
+          {#if appleLibrary.playlists.filter(p => !p.is_algorithmic).length > 0}
+            <div class="discover-section">
+              <div class="discover-section-header">
+                <h3 class="discover-section-title">Your Playlists</h3>
+                <div class="discover-section-rule"></div>
+              </div>
+              <div class="discover-grid">
+                {#each appleLibrary.playlists.filter(p => !p.is_algorithmic) as pl}
+                  <!-- svelte-ignore a11y-click-events-have-key-events -->
+                  <!-- svelte-ignore a11y-no-static-element-interactions -->
+                  <div class="discovery-card lib-card" on:click={() => downloadPlaylistUrl(pl.url)}>
+                    <div class="discovery-artwork-wrapper">
+                      {#if pl.image_url}
+                        <img src={pl.image_url} alt={pl.name} class="discovery-artwork" loading="lazy" />
+                      {:else}
+                        <div class="lib-art-fallback">♫</div>
+                      {/if}
+                      <div class="discovery-play-overlay">
+                        <svg width="32" height="32" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+                      </div>
+                    </div>
+                    <div class="discovery-info">
+                      <div class="discovery-title" title={pl.name}>{pl.name}</div>
+                      <div class="discovery-subtitle">{pl.track_count > 0 ? `${pl.track_count} tracks` : 'Playlist'}</div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <div class="discover-empty" style="margin-top: 24px;">
+          <div style="font-size: 28px; margin-bottom: 12px; opacity: 0.4;">🎵</div>
+          <p style="opacity: 0.5;">Click Refresh to load your Apple Music library.</p>
+          <button on:click={loadAppleMusicLibrary} style="margin-top: 8px; font-size: 12px;">Load Library</button>
+        </div>
+      {/if}
+      {/if}<!-- /apple -->
+
+    </div><!-- /lib-scroll-area -->
+    {/if}
+
     <!-- Tracklist: shows all tracks that have started, persists until next download -->
+    {#if activeTab !== 'library'}
     <div class="tracklist-wrapper">
       <div class="tracklist" bind:this={tracklistEl} on:scroll={updateTracklistScroll}>
         {#if trackOrder.length === 0}
           <div class="tracklist-empty">
-            <p>Paste a URL above and press <strong>Add to Library</strong></p>
+            {#if !config.spotify_sp_dc && historyItems.length === 0}
+              <p>Paste a URL above and press <strong>Add to Library</strong></p>
+            {/if}
           </div>
         {:else}
           {#each trackOrder as trackKey (trackKey)}
@@ -2336,16 +2999,6 @@
                   <div class="track-row-main">
                     <div class="track-row-head">
                       <span class="track-row-name">{trackLabel}</span>
-                      {#if state.status === 'failed'}
-                        <button
-                          class="track-retry-btn"
-                          on:click={() => retryFailedTrack(trackKey)}
-                          disabled={isDownloading || !state.trackData || state.retrying}
-                          title={isDownloading ? 'Wait for the current download to finish before retrying a single track.' : 'Retry this failed track only'}
-                        >
-                          {state.retrying ? 'Retrying…' : 'Retry'}
-                        </button>
-                      {/if}
                     </div>
                     <div class="track-row-side">
                       <span class="track-row-status">{state.error || state.text}</span>
@@ -2369,11 +3022,62 @@
         <button class="tracklist-jump-btn" on:click={scrollTracklistToBottom} title="Jump to bottom">↓</button>
       {/if}
     </div>
+    {/if}<!-- /activeTab !== 'library' -->
 
-    <!-- Floating log toggle button -->
+    <!-- ── Failed Tracks Panel (ST-4) ──────────────────────────────────────── -->
+    {#if activeTab !== 'library' && failedEntries.length > 0}
+    <div class="failed-panel">
+      <div class="failed-panel-head">
+        <button class="failed-collapse-btn"
+          on:click={() => failedPanelCollapsed = !failedPanelCollapsed}
+          title={failedPanelCollapsed ? 'Expand failed tracks' : 'Minimize failed tracks'}>
+          {failedPanelCollapsed ? '▸' : '▾'}
+        </button>
+        <span class="failed-panel-title">✗ Failed ({failedEntries.length})</span>
+        <div class="failed-panel-actions">
+          {#if retryQueue.length > 0}
+            <span class="failed-retry-progress">Retrying {retryQueueTotal - retryQueue.length + 1} / {retryQueueTotal}…</span>
+          {:else}
+            <button class="failed-action-btn"
+              on:click={retryAllFailed}
+              disabled={isDownloading || failedEntries.every(e => !e.trackData)}
+              title="Retry all failed tracks one by one">↻ Retry All</button>
+          {/if}
+          <button class="failed-action-btn failed-dismiss-all"
+            on:click={dismissAllFailures}
+            title="Dismiss all failed tracks from this view">× Dismiss All</button>
+        </div>
+      </div>
+      {#if !failedPanelCollapsed}
+      <div class="failed-list">
+        {#each failedEntries as entry (entry.key)}
+          <div class="failed-entry">
+            <div class="failed-entry-info">
+              <span class="failed-entry-label">{entry.label}</span>
+              <span class="failed-entry-error">{entry.error}</span>
+            </div>
+            <div class="failed-entry-btns">
+              <button class="failed-retry-btn"
+                on:click={() => retryFailedTrack(entry.key)}
+                disabled={isDownloading || !entry.trackData}
+                title="Retry this track">↻</button>
+              <button class="failed-close-btn"
+                on:click={() => dismissFailure(entry.key)}
+                title="Dismiss">×</button>
+            </div>
+          </div>
+        {/each}
+      </div>
+      {/if}
+    </div>
+    {/if}<!-- /failed panel -->
+
+    <!-- Floating log toggle button (not shown on Library tab) -->
+    {#if activeTab !== 'library'}
     <button class="log-toggle" on:click={() => showLog = !showLog} title="Activity Log">
       📋 {showLog ? 'Hide Log' : 'Log'}
     </button>
+    {/if}
   </main>
 
   <!-- ── Discover full-screen overlay ──────────────────────────────────────── -->
@@ -2545,17 +3249,6 @@
     <div class="sponsor-toast-body">
       <p class="sponsor-toast-title">{supportStatus.title}</p>
       <p class="sponsor-toast-text">{supportStatus.message}</p>
-      {#if supportStatus.enabled}
-        <div class="support-progress-wrap support-progress-toast">
-          <div class="support-progress-head">
-            <span>{formatSupportAmount(supportStatus.current)} raised</span>
-            <span>{formatSupportAmount(supportStatus.goal)} goal</span>
-          </div>
-          <div class="support-progress-bar">
-            <div class="support-progress-fill" style={`width:${supportProgress}%`}></div>
-          </div>
-        </div>
-      {/if}
       <button class="sponsor-toast-btn" on:click={() => { BrowserOpenURL(supportStatus.link); dismissSponsorToast(); }}>
         Support on Ko-fi
       </button>
@@ -2879,6 +3572,24 @@
       </div>
     </div>
 
+    {#if showLyrics && currentPlayerTrack}
+      <div class="lyrics-panel">
+        {#if lyricsLoading}
+          <div class="lyrics-empty">Loading lyrics…</div>
+        {:else if lyricsLines.length === 0}
+          <div class="lyrics-empty">No lyrics embedded in this track.</div>
+        {:else}
+          <div class="lyrics-lines" bind:this={lyricsContainerEl}>
+            {#each lyricsLines as line, i}
+              <div class="lyrics-line" class:lyrics-active={i === activeLyricIdx}>
+                {line.text || ' '}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     <div class="downloaded-player">
       <div class="downloaded-player-copy">
         <div class="downloaded-player-title">{currentPlayerTrack?.title || 'Nothing playing'}</div>
@@ -2894,6 +3605,12 @@
         <button on:click={playPreviousTrack} disabled={!currentPlayerTrack}>⏮</button>
         <button on:click={togglePlayback} disabled={!currentPlayerTrack && !(downloadedSelectedRelease?.tracks?.length)}>{audioEl && !audioEl.paused ? 'Pause' : 'Play'}</button>
         <button on:click={playNextTrack} disabled={!currentPlayerTrack || playerTrackIndex >= playerQueue.length - 1}>⏭</button>
+        <button
+          on:click={() => showLyrics = !showLyrics}
+          class:lyrics-btn-active={showLyrics}
+          title="Toggle lyrics"
+          style="font-size:14px; padding: 3px 8px;"
+        >♪</button>
       </div>
       <div class="downloaded-player-timeline">
         <span>{formatPlaybackTime(playerCurrentTime)}</span>
@@ -3060,6 +3777,16 @@
         </div>
 
         <div style="margin-top: 14px;">
+          <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer;">
+            <input type="checkbox" bind:checked={config.save_cover_art_sidecar} style="margin-top: 2px;" />
+            <div>
+              <span style="font-weight: 500; font-size: 13px;">Save cover art file</span>
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Save a high-resolution cover image as cover.jpg or cover.png inside the same folder as downloaded album and single tracks.</p>
+            </div>
+          </label>
+        </div>
+
+        <div style="margin-top: 14px;">
           <label for="maxRetriesModal">Failed track retries</label>
           <p style="font-size: 11px; color: #555; margin: 4px 0 8px;">Automatic retries for transient failures like truncated downloads before a track is marked failed.</p>
           <input
@@ -3076,19 +3803,15 @@
       <!-- ── Download Source ──────────────────────────────────────────────── -->
       <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
         <p style="font-size: 13px; font-weight: 600; margin: 0 0 6px;">Download Source</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 10px;">Force all downloads through a single service. Auto uses the full resolver chain.</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 10px;">Choose one or more services to use. Auto uses the full resolver chain.</p>
         <div style="display: flex; flex-wrap: wrap; gap: 6px;">
-          {#each [
-            { value: 'auto',    label: 'Auto',        icon: null },
-            { value: 'tidal',   label: 'Tidal',       icon: '/icons/tidal.webp' },
-            { value: 'qobuz',   label: 'Qobuz',       icon: '/icons/qobuz.png' },
-            { value: 'apple',   label: 'Apple Music', icon: '/icons/apple-music.png' },
-            { value: 'amazon',  label: 'Amazon',      icon: '/icons/amazon-music.jpg' },
-            { value: 'deezer',  label: 'Deezer',      icon: '/icons/deezer.webp' },
-          ] as src}
+          {#each downloadSourceOptions as src}
             <button
-              on:click={() => { config.download_source = src.value; }}
-              style="display:inline-flex; align-items:center; gap:5px; padding:5px 10px; font-size:12px; border-radius:99px; border: 1px solid {config.download_source === src.value ? 'var(--accent-color)' : 'rgba(255,255,255,0.12)'}; background:{config.download_source === src.value ? 'rgba(0,255,204,0.1)' : 'transparent'}; color:{config.download_source === src.value ? 'var(--accent-color)' : 'inherit'}; cursor:pointer;"
+              type="button"
+              on:click={() => { toggleDownloadSource(src.value); }}
+              class:selected-download-source={selectedDownloadSources.includes(src.value)}
+              aria-pressed={selectedDownloadSources.includes(src.value)}
+              style="display:inline-flex; align-items:center; gap:5px; padding:5px 10px; font-size:12px; border-radius:99px; border: 1px solid {selectedDownloadSources.includes(src.value) ? 'var(--accent-color)' : 'rgba(255,255,255,0.12)'}; background:{selectedDownloadSources.includes(src.value) ? 'rgba(0,255,204,0.1)' : 'transparent'}; color:{selectedDownloadSources.includes(src.value) ? 'var(--accent-color)' : 'inherit'}; cursor:pointer;"
             >
               {#if src.icon}
                 <img src={src.icon} alt="" style="width:14px; height:14px; border-radius:50%; object-fit:contain;" />
@@ -3141,11 +3864,27 @@
 
       </div>
 
-      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
-        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Spotify Podcasts</p>
-        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Paste your Spotify account cookie to enable podcast episode and show downloads. Episodes are saved to <code>Podcasts/Show Name/</code> inside your music folder.</p>
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;" id="settings-spotify-account">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Spotify Account</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Connect your Spotify account to unlock your personal library, Liked Songs, podcast downloads, and scheduled auto-sync.</p>
 
-        <label for="spDcInput" style="font-size: 12px; opacity: 0.7;">sp_dc cookie</label>
+        <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
+          <button
+            style="font-size: 11px; padding: 5px 12px; background: #1DB954; color: #000; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; opacity: {spDcCapture.phase === 'starting' || spDcCapture.phase === 'waiting_for_user' ? 0.6 : 1}; pointer-events: {spDcCapture.phase === 'starting' || spDcCapture.phase === 'waiting_for_user' ? 'none' : 'auto'};"
+            on:click={async () => { spDcCapture = { phase: 'starting', message: 'Opening browser...' }; try { await CaptureSpDC(); } catch(e) { spDcCapture = { phase: 'error', message: String(e) }; } }}
+          >{spDcCapture.phase === 'starting' ? 'Opening browser…' : spDcCapture.phase === 'waiting_for_user' ? 'Waiting for login…' : 'Connect Spotify Account'}</button>
+          {#if spDcCapture.phase === 'idle' || !spDcCapture.phase}
+            <span style="font-size: 11px; color: #555;">Auto-captures your session after login.</span>
+          {:else if spDcCapture.phase === 'success'}
+            <span style="font-size: 11px; color: #00ffcc;">✓ {spDcCapture.message}</span>
+          {:else if spDcCapture.phase === 'error'}
+            <span style="font-size: 11px; color: #ff6b6b;">{spDcCapture.message}</span>
+          {:else}
+            <span style="font-size: 11px; color: #aaa;">{spDcCapture.message}</span>
+          {/if}
+        </div>
+
+        <label for="spDcInput" style="font-size: 12px; opacity: 0.7;">sp_dc cookie (manual)</label>
         <input
           id="spDcInput"
           type="password"
@@ -3154,27 +3893,153 @@
           style="width: 100%; box-sizing: border-box; margin-top: 6px; font-family: monospace; font-size: 12px;"
         />
         <p style="font-size: 11px; color: #555; margin: 6px 0 0;">
-          Get it from your browser: open <strong>open.spotify.com</strong> while logged in →
-          DevTools (F12) → Application → Cookies → <code>sp_dc</code>.
-          Valid for ~1 year. Rate-limited to 50 episodes/hour with a 3–7s delay between downloads.
+          Or paste manually: DevTools (F12) → Application → Cookies → find <code>sp_dc</code>. Valid for ~1 year.
         </p>
         {#if config.spotify_sp_dc}
-          <p style="font-size: 11px; color: #00ffcc; margin: 6px 0 0;">● Cookie configured — podcast downloads enabled</p>
+          <p style="font-size: 11px; color: #00ffcc; margin: 6px 0 0;">● Connected — library, podcasts, and auto-sync enabled</p>
         {:else}
-          <p style="font-size: 11px; color: #555; margin: 6px 0 0;">○ No cookie set — podcast downloads disabled</p>
+          <p style="font-size: 11px; color: #555; margin: 6px 0 0;">○ Not connected</p>
         {/if}
+      </div>
+
+      <!-- ── Apple Music Account ────────────────────────────────────────────── -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;" id="settings-apple-account">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Apple Music Account</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Connect your Apple Music account to unlock your personal library and playlist downloads.</p>
+
+        <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
+          <button
+            style="font-size: 11px; padding: 5px 12px; background: #fc3c44; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; opacity: {appleLogin.phase === 'starting' || appleLogin.phase === 'waiting_for_user' ? 0.6 : 1}; pointer-events: {appleLogin.phase === 'starting' || appleLogin.phase === 'waiting_for_user' ? 'none' : 'auto'};"
+            on:click={startAppleLogin}
+          >{appleLogin.phase === 'starting' ? 'Opening browser…' : appleLogin.phase === 'waiting_for_user' ? 'Waiting for login…' : 'Connect Apple Music Account'}</button>
+          {#if appleLogin.phase === 'idle' || !appleLogin.phase}
+            <span style="font-size: 11px; color: #555;">Auto-captures your session after login.</span>
+          {:else if appleLogin.phase === 'success'}
+            <span style="font-size: 11px; color: #00ffcc;">✓ {appleLogin.message}</span>
+          {:else if appleLogin.phase === 'error'}
+            <span style="font-size: 11px; color: #ff6b6b;">{appleLogin.message}</span>
+          {:else}
+            <span style="font-size: 11px; color: #aaa;">{appleLogin.message}</span>
+          {/if}
+        </div>
+
+        <label for="appleMusicUserTokenInput" style="font-size: 12px; opacity: 0.7;">Music-User-Token (manual)</label>
+        <input
+          id="appleMusicUserTokenInput"
+          type="password"
+          bind:value={config.apple_music_user_token}
+          placeholder="Paste your Music-User-Token here…"
+          style="font-size: 11px; width: 100%; margin-top: 4px; margin-bottom: 6px;"
+          on:change={() => { if (config.apple_music_user_token && config.apple_authorization_token) { SaveConfig(config); appleLibrary = null; loadAppleMusicLibrary(); } }}
+        />
+        <p style="font-size: 11px; color: #555; margin: 0 0 4px;">
+          DevTools (F12) → Network → filter <code>amp-api.music.apple.com</code> → copy the <code>Music-User-Token</code> request header. Valid for ~30 days.
+        </p>
+        {#if config.apple_music_user_token && config.apple_authorization_token}
+          <p style="font-size: 11px; color: #00ffcc; margin: 6px 0 0;">● Connected — Apple Music library enabled</p>
+        {:else}
+          <p style="font-size: 11px; color: #555; margin: 6px 0 0;">○ Not connected</p>
+        {/if}
+      </div>
+
+      <!-- ── Auto-Sync / Scheduled Downloads ───────────────────────────────── -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;" id="settings-auto-sync">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 4px;">Auto-Sync / Scheduled Downloads</p>
+        <p style="font-size: 11px; color: #555; margin: 0 0 12px;">Automatically check your Spotify library for new tracks and download them on a schedule. Enable sync per-playlist using the ↺ button on each card.</p>
+
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 12px;">
+          <input type="checkbox" bind:checked={config.auto_sync_enabled} on:change={() => SaveConfig(config)} />
+          <span style="font-size: 12px;">Enable scheduled auto-sync</span>
+        </label>
+
+        {#if config.auto_sync_enabled}
+          <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 12px;">
+            <label style="font-size: 12px;">Time</label>
+            <input type="number" min="0" max="23" bind:value={config.auto_sync_hour}
+              style="width: 52px; text-align: center;"
+              on:change={() => SaveConfig(config)} />
+            <span style="font-size: 12px; opacity: 0.6;">:</span>
+            <input type="number" min="0" max="59" bind:value={config.auto_sync_minute}
+              style="width: 52px; text-align: center;"
+              on:change={() => SaveConfig(config)} />
+          </div>
+
+          <p style="font-size: 12px; margin: 0 0 6px; opacity: 0.7;">Days</p>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+            {#each ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'] as day, i}
+              <label style="display: flex; align-items: center; gap: 4px; font-size: 11px; cursor: pointer;">
+                <input type="checkbox"
+                  checked={!!((config.auto_sync_days ?? 127) & (1 << i))}
+                  on:change={(e) => {
+                    const days = config.auto_sync_days ?? 127;
+                    const checked = e.target.checked;
+                    config.auto_sync_days = checked ? days | (1 << i) : days & ~(1 << i);
+                    SaveConfig(config);
+                  }} />
+                {day}
+              </label>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Playlists to sync — drawn from the live Spotify library -->
+        <p style="font-size: 12px; font-weight: 600; margin: 0 0 8px;">Playlists to Sync</p>
+        {#if !config.spotify_sp_dc}
+          <p style="font-size: 11px; color: #555; margin: 0 0 8px;">Configure your Spotify account in the section above to see your library here.</p>
+        {:else if spotifyLibraryLoading}
+          <p style="font-size: 11px; color: #555; margin: 0 0 8px;">Loading your library…</p>
+        {:else if spotifyLibrary}
+          <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; max-height: 260px; overflow-y: auto;">
+            <!-- Liked Songs -->
+            <label style="display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: rgba(255,255,255,0.04); border-radius: 6px; cursor: pointer;">
+              <input type="checkbox"
+                checked={isPlaylistSyncing('https://open.spotify.com/collection/tracks')}
+                on:change={() => togglePlaylistSync({ url: 'https://open.spotify.com/collection/tracks', name: 'Liked Songs', artwork_url: '', is_algorithmic: false })} />
+              <span style="font-size: 12px; flex: 1;">♥ Liked Songs</span>
+              <span style="font-size: 11px; opacity: 0.4;">{spotifyLibrary.liked_songs_count} tracks</span>
+              {#if getTrackedEntry('https://open.spotify.com/collection/tracks')?.last_sync_ts}
+                <span style="font-size: 10px; opacity: 0.35;">{new Date(getTrackedEntry('https://open.spotify.com/collection/tracks').last_sync_ts * 1000).toLocaleDateString()}</span>
+              {/if}
+            </label>
+            {#each spotifyLibrary.playlists as pl}
+              <label style="display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: rgba(255,255,255,0.04); border-radius: 6px; cursor: pointer;">
+                <input type="checkbox"
+                  checked={isPlaylistSyncing(pl.url)}
+                  on:change={() => togglePlaylistSync(pl)} />
+                <span style="font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                  {#if pl.is_algorithmic}<span style="opacity: 0.45; margin-right: 3px;">✦</span>{/if}{pl.name}
+                </span>
+                {#if pl.track_count}
+                  <span style="font-size: 11px; opacity: 0.4; flex-shrink: 0;">{pl.track_count}</span>
+                {/if}
+                {#if getTrackedEntry(pl.url)?.last_sync_ts}
+                  <span style="font-size: 10px; opacity: 0.35; flex-shrink: 0;">{new Date(getTrackedEntry(pl.url).last_sync_ts * 1000).toLocaleDateString()}</span>
+                {/if}
+              </label>
+            {/each}
+          </div>
+        {:else}
+          <p style="font-size: 11px; color: #555; margin: 0 0 8px;">Library not loaded — return to the home screen and click ↺ to refresh.</p>
+        {/if}
+
+        <div style="display: flex; gap: 8px; margin-bottom: 10px;">
+          <button
+            style="font-size: 11px; padding: 5px 10px;"
+            on:click={runAutoSyncNow}
+            disabled={autoSyncRunning}
+          >
+            {autoSyncRunning ? 'Syncing…' : '↺ Sync Now'}
+          </button>
+          {#if autoSyncLastResult}
+            <span style="font-size: 11px; opacity: 0.7; align-self: center;">{autoSyncLastResult}</span>
+          {/if}
+        </div>
       </div>
 
     </div>
 
     <div style="flex-shrink: 0; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.05); margin-top: 8px; display:flex; flex-direction:column; gap:8px; align-items:center;">
-      {#if playlistArtwork}
-        <button
-          on:click={saveCoverArtToLibrary}
-          style="width:100%; font-size:12px; padding:8px; border-color:rgba(0,255,204,0.3); color:var(--accent-color); background:rgba(0,255,204,0.05);"
-        >🖼 Save Cover Art</button>
-      {/if}
-      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.6</p>
+      <p style="text-align: center; font-size: 11px; color: rgba(255,255,255,0.2); margin: 0;">Antra v1.1.7</p>
     </div>
   </div>
 </div>
@@ -3494,6 +4359,9 @@
           currentPlaylistTrackKeysByIndex = {};
           currentPlaylistTrackCount = 0;
           separatorMeta = {};
+          dismissedFailures = new Set();
+          retryQueue = [];
+          retryQueueTotal = 0;
           shouldAutoScroll = true;
           addLog('info', `━━━ Building your music library ━━━`);
           addLog('info', `Downloading ${albumUrls.length} release${albumUrls.length !== 1 ? 's' : ''} (lossless prioritized)...`);
@@ -3948,22 +4816,161 @@
     text-align: left;
     width: 100%;
   }
-  .track-retry-btn {
-    padding: 4px 9px;
+  /* ── Failed Tracks Panel (ST-4) ──────────────────────────────────────────── */
+  .failed-panel {
+    /* bottom margin keeps the last entry's buttons clear of the floating Log button */
+    margin: 0 0 64px 0;
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-radius: 8px;
+    background: rgba(248, 113, 113, 0.04);
+    overflow: hidden;
+  }
+  .failed-panel-head {
+    display: flex;
+    align-items: center;
+    padding: 7px 10px;
+    background: rgba(248, 113, 113, 0.08);
+    border-bottom: 1px solid rgba(248, 113, 113, 0.15);
+    gap: 8px;
+  }
+  .failed-panel-actions { margin-left: auto; }
+  .failed-collapse-btn {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    line-height: 1;
+    background: transparent;
+    border: none;
+    color: #fda4af;
+    cursor: pointer;
+    padding: 0;
+  }
+  .failed-collapse-btn:hover { color: #fecdd3; }
+  .failed-panel-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #fda4af;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+  .failed-panel-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .failed-retry-progress {
+    font-size: 11px;
+    color: #fda4af;
+    opacity: 0.8;
+    white-space: nowrap;
+  }
+  .failed-action-btn {
+    padding: 3px 8px;
     font-size: 11px;
     line-height: 1;
     white-space: nowrap;
-    background: rgba(248, 113, 113, 0.08);
-    border-color: rgba(248, 113, 113, 0.28);
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    border-radius: 4px;
+    color: #fda4af;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+  .failed-action-btn:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.2);
+    border-color: rgba(248, 113, 113, 0.5);
+  }
+  .failed-action-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .failed-action-btn.failed-dismiss-all {
+    background: rgba(255,255,255,0.04);
+    border-color: rgba(255,255,255,0.12);
+    color: rgba(255,255,255,0.5);
+  }
+  .failed-action-btn.failed-dismiss-all:hover:not(:disabled) {
+    background: rgba(255,255,255,0.08);
+    border-color: rgba(255,255,255,0.22);
+    color: rgba(255,255,255,0.7);
+  }
+  .failed-list {
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .failed-entry {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    gap: 8px;
+    border-bottom: 1px solid rgba(248, 113, 113, 0.08);
+  }
+  .failed-entry:last-child { border-bottom: none; }
+  .failed-entry-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .failed-entry-label {
+    font-size: 12px;
+    color: rgba(255,255,255,0.85);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .failed-entry-error {
+    font-size: 10.5px;
+    color: rgba(248, 113, 113, 0.7);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .failed-entry-btns {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .failed-retry-btn, .failed-close-btn {
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    line-height: 1;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .failed-retry-btn {
+    background: rgba(248, 113, 113, 0.1);
+    border: 1px solid rgba(248, 113, 113, 0.25);
     color: #fda4af;
   }
-  .track-retry-btn:hover:not(:disabled) {
-    background: rgba(248, 113, 113, 0.16);
-    border-color: rgba(248, 113, 113, 0.45);
+  .failed-retry-btn:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.22);
   }
-  .track-retry-btn:disabled {
-    opacity: 0.45;
+  .failed-retry-btn:disabled {
+    opacity: 0.35;
     cursor: not-allowed;
+  }
+  .failed-close-btn {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.4);
+  }
+  .failed-close-btn:hover {
+    background: rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.7);
   }
 
   .progress-bar-bg {
@@ -4695,40 +5702,10 @@
   }
   .support-close-btn:hover { color: #cbd5e1; }
 
-  .support-progress-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-top: 4px;
-  }
-
-  .support-progress-head,
-  .support-progress-foot {
-    display: flex;
-    justify-content: space-between;
-    gap: 10px;
+  .kofi-tooltip-refreshing {
+    margin: -2px 0 6px;
     font-size: 11px;
     color: #94a3b8;
-  }
-
-  .support-progress-bar {
-    width: 100%;
-    height: 8px;
-    border-radius: 999px;
-    background: rgba(255,255,255,0.08);
-    overflow: hidden;
-    border: 1px solid rgba(255,255,255,0.06);
-  }
-
-  .support-progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, #FF5E5B, #ff8d62);
-    border-radius: inherit;
-    transition: width 0.25s ease;
-  }
-
-  .support-progress-toast {
-    margin: 6px 0 2px;
   }
 
   /* ── Source health bar + format selector ────────────────────────────────── */
@@ -4779,18 +5756,18 @@
 
   .health-chip {
     display: inline-flex;
-    flex-direction: column;
     align-items: center;
-    gap: 2px;
-    padding: 5px 10px 4px;
-    border-radius: 10px;
+    justify-content: center;
+    padding: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 9px;
     border: 1.5px solid rgba(255,255,255,0.1);
-    font-size: 11px;
+    background: transparent;
+    overflow: hidden;
     cursor: pointer;
     transition: box-shadow 0.2s, border-color 0.2s, opacity 0.15s;
-    letter-spacing: 0.02em;
     white-space: nowrap;
-    min-width: 48px;
   }
   .health-chip:hover { filter: brightness(1.15); }
 
@@ -4843,7 +5820,7 @@
 
   .health-chip-count { font-weight: 700; font-size: 10px; line-height: 1; }
   .health-chip-idle { opacity: 0.3; font-size: 10px; line-height: 1; }
-  .health-chip-icon { width: 20px; height: 20px; object-fit: contain; flex-shrink: 0; transition: opacity 0.2s; }
+  .health-chip-icon { width: 100%; height: 100%; object-fit: cover; display: block; transition: opacity 0.2s; }
 
   /* ── Health popover dot grid ─────────────────────────────────────────────── */
   .health-dot-grid {
@@ -5208,6 +6185,52 @@
     width: 100%;
   }
 
+  /* ── Lyrics panel (SF-2) ───────────────────────────────────────────────── */
+  .lyrics-panel {
+    border-top: 1px solid rgba(0,255,204,0.12);
+    padding: 0;
+    max-height: 200px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .lyrics-lines {
+    overflow-y: auto;
+    padding: 10px 0;
+    scroll-behavior: smooth;
+  }
+
+  .lyrics-line {
+    text-align: center;
+    padding: 5px 24px;
+    font-size: 13px;
+    color: rgba(210, 230, 230, 0.38);
+    line-height: 1.5;
+    transition: color 0.25s, font-size 0.25s, opacity 0.25s;
+    cursor: default;
+    white-space: pre-wrap;
+  }
+
+  .lyrics-line.lyrics-active {
+    color: var(--accent-color, #00ffcc);
+    font-size: 14px;
+    opacity: 1;
+  }
+
+  .lyrics-empty {
+    text-align: center;
+    padding: 16px;
+    font-size: 12px;
+    color: rgba(210, 230, 230, 0.35);
+  }
+
+  .lyrics-btn-active {
+    color: var(--accent-color, #00ffcc);
+    border-color: rgba(0,255,204,0.4);
+    background: rgba(0,255,204,0.08);
+  }
+
   @media (max-width: 900px) {
     .downloaded-modal {
       width: min(96vw, 96vw);
@@ -5458,6 +6481,206 @@
   @keyframes fadeIn {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Library tab ────────────────────────────────────────────────────────── */
+  .lib-service-tabs {
+    display: flex;
+    gap: 6px;
+    padding: 10px 0 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    margin-bottom: 4px;
+    flex-shrink: 0;
+  }
+
+  .lib-service-tab {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 5px 14px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.03);
+    color: rgba(255,255,255,0.45);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .lib-service-tab:hover {
+    border-color: rgba(255,255,255,0.22);
+    color: rgba(255,255,255,0.8);
+    background: rgba(255,255,255,0.06);
+  }
+
+  .lib-service-tab.active {
+    border-color: var(--accent-color);
+    color: #fff;
+    background: rgba(0,255,204,0.07);
+  }
+
+  .lib-tab-icon {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    overflow: hidden;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .lib-tab-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  .lib-tab-icon-spotify {
+    background: #1DB954;
+    border-radius: 50%;
+    padding: 2px;
+  }
+
+  .lib-tab-icon-apple {
+    background: transparent;
+  }
+
+  .lib-apple-saved-bg {
+    background: linear-gradient(135deg, #fc3c44, #ff6b8a);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .lib-scroll-area {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    padding-bottom: 16px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.15) transparent;
+  }
+
+  .lib-card {
+    position: relative;
+  }
+
+  .lib-liked-bg {
+    background: linear-gradient(135deg, #450af5, #c13584);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .lib-liked-icon {
+    font-size: 40px;
+    color: rgba(255, 255, 255, 0.9);
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .lib-art-fallback {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 32px;
+    color: rgba(255, 255, 255, 0.25);
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  .lib-sync-pill {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 50%;
+    color: rgba(255, 255, 255, 0.5);
+    width: 24px;
+    height: 24px;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    padding: 0;
+  }
+
+  .lib-card:hover .lib-sync-pill {
+    opacity: 1;
+  }
+
+  .lib-sync-pill.active {
+    opacity: 1;
+    color: #1ed760;
+    border-color: #1ed760;
+    background: rgba(30, 215, 96, 0.15);
+  }
+
+  .lib-refresh-btn {
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 14px;
+    padding: 2px 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    flex-shrink: 0;
+  }
+
+  .lib-refresh-btn:hover:not(:disabled) {
+    color: var(--accent-color);
+    border-color: var(--accent-color);
+  }
+
+  .lib-refresh-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+
+  .lib-collapse-btn {
+    background: none;
+    border: none;
+    color: var(--text-secondary, rgba(255,255,255,0.6));
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 2px 4px;
+    margin-right: 2px;
+    flex-shrink: 0;
+    transition: color 0.15s;
+  }
+
+  .lib-collapse-btn:hover {
+    color: var(--accent-color);
+  }
+
+  .lib-section-count {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary, rgba(255,255,255,0.5));
+    background: rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 1px 8px;
+    flex-shrink: 0;
+  }
+
+  /* Followed-artist tiles render the avatar as a circle */
+  .lib-artist-art {
+    border-radius: 50% !important;
+    overflow: hidden;
+  }
+  .lib-artist-art .discovery-artwork {
+    border-radius: 50%;
   }
 
   /* ── Template preview ───────────────────────────────────────────────────── */

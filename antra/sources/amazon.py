@@ -7,17 +7,32 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from typing import Optional
 
 import requests
 
+from antra.core.amazon_music_fetcher import AmazonMusicFetcher
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.sources.odesli import OdesliEnricher
+from antra.utils.matching import score_similarity
 
 logger = logging.getLogger(__name__)
+
+_SOUNDPLATE_SPOTIFY_API = "https://phpstack-822472-6184058.cloudwaysapps.com/api/spotify.php"
+_SOUNDPLATE_REFERER = "https://phpstack-822472-6184058.cloudwaysapps.com/?"
+_SONGLINK_API = "https://api.song.link/v1-alpha.1/links"
+_ISRC_RE = re.compile(r"\b([A-Z]{2}[A-Z0-9]{3}\d{7})\b", re.IGNORECASE)
+_AMAZON_ALBUM_ASIN_RE = re.compile(r"/albums/([A-Z0-9]{10})|\b(B[0-9A-Z]{9})\b")
+_KNOWN_SPOTIFY_AMAZON_ALBUMS = {
+    # song.link/Songstats omit Amazon for this regional release even though
+    # Amazon Music India has a complete public album page.
+    "0xMPyH8Y6b6vtV8lY4kbq1": ["https://music.amazon.in/albums/B0H1CB1M38"],
+}
 
 
 def _humanize_amazon_error(message: str) -> str:
@@ -35,6 +50,24 @@ def _humanize_amazon_error(message: str) -> str:
         if humanized_inner != inner:
             return humanized_inner
     return text
+
+
+def _first_isrc(value: str) -> Optional[str]:
+    match = _ISRC_RE.search((value or "").upper())
+    return match.group(1).strip() if match else None
+
+
+def _extract_amazon_album_url(value: str) -> Optional[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if "music.amazon." in raw and "/albums/" in raw:
+        return raw
+    match = _AMAZON_ALBUM_ASIN_RE.search(raw)
+    if not match:
+        return None
+    asin = match.group(1) or match.group(2)
+    return f"https://music.amazon.com/albums/{asin}" if asin else None
 
 
 class _DirectAmazonClient:
@@ -356,9 +389,12 @@ class AmazonAdapter(BaseSourceAdapter):
         if mirror_api_key:
             self._session.headers["X-API-Key"] = mirror_api_key
         self._odesli = OdesliEnricher(api_key=api_key)
-        self.priority = 2  # Shared free-lossless tier with Apple/HiFi/DAB
+        self.priority = 2  # Shared free-lossless tier with Apple/HiFi
         self._preferred_output_format = (preferred_output_format or "source").lower()
         self._prefer_lossy_download = self._preferred_output_format in {"mp3", "aac", "m4a"}
+        self._album_track_cache: dict[str, list[TrackMetadata]] = {}
+        self._spotify_isrc_cache: dict[str, str] = {}
+        self._spotify_isrc_lock = threading.Lock()
 
         # Mirror management
         self._mirrors = [m.rstrip("/") for m in mirrors if m]
@@ -392,8 +428,9 @@ class AmazonAdapter(BaseSourceAdapter):
                 continue
                 
             try:
-                # Quick health check
-                resp = self._session.get(mirror + "/", timeout=5)
+                # Quick health check — 15s to match Tidal/Qobuz/Deezer mirror adapters
+                # (Cloudflare Tunnel latency from India can exceed 5s on cold-starts)
+                resp = self._session.get(mirror + "/", timeout=15)
                 if resp.status_code in (200, 404):
                     self._current_mirror = mirror
                     logger.debug(f"[Amazon] Using mirror: {mirror}")
@@ -427,6 +464,388 @@ class AmazonAdapter(BaseSourceAdapter):
                 return False
         return False
 
+    def _resolve_via_mirror(self, track: TrackMetadata) -> tuple[Optional[str], Optional[dict]]:
+        """
+        Ask the self-hosted Amazon mirror to resolve Spotify IDs.
+
+        The mirror resolves inside the same account/marketplace environment that
+        later serves the stream, and it returns a ready stream payload we can reuse
+        during download.
+        """
+        spotify_id = (getattr(track, "spotify_id", "") or "").strip()
+        spotify_url = (getattr(track, "spotify_url", "") or "").strip()
+        if not spotify_url and spotify_id:
+            spotify_url = f"https://open.spotify.com/track/{spotify_id}"
+        if not spotify_id and not spotify_url:
+            return None, None
+
+        try:
+            mirror = self._get_working_mirror()
+        except Exception as e:
+            logger.debug("[Amazon] Mirror resolve unavailable: %s", e)
+            return None, None
+
+        try:
+            if spotify_id:
+                resp = self._session.get(f"{mirror}/api/resolve/spotify/{spotify_id}", timeout=45)
+            else:
+                resp = self._session.get(f"{mirror}/api/resolve", params={"url": spotify_url}, timeout=45)
+            if resp.status_code == 429:
+                raise RateLimitedError("Amazon mirror rate limited (429)")
+            if resp.status_code in (401, 403):
+                logger.warning("[Amazon] API key rejected (%d) — check key on server", resp.status_code)
+                return None, None
+            if resp.status_code == 503:
+                self._current_mirror = None
+                return None, None
+            if resp.status_code == 404:
+                return None, None
+            resp.raise_for_status()
+            data = resp.json()
+        except RateLimitedError:
+            raise
+        except Exception as e:
+            logger.debug("[Amazon] Mirror resolve failed for '%s': %s", track.title, e)
+            return None, None
+
+        asin = str(data.get("asin") or data.get("id") or "").strip()
+        if not asin:
+            return None, None
+        logger.info("[Amazon] Mirror resolved Spotify track '%s' to ASIN %s", track.title, asin)
+        return asin, data
+
+    @staticmethod
+    def _clean_search_title(title: str) -> str:
+        cleaned = re.sub(
+            r'\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^\)\]]+[\)\]]',
+            "",
+            title or "",
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    def _search_amazon_music_web(self, track: TrackMetadata) -> Optional[str]:
+        """
+        Fallback ASIN lookup against Amazon Music web pages.
+
+        Odesli/Songwhip are sparse for some regional Spotify catalog entries. The
+        Amazon Music search page often still exposes track links, so scrape likely
+        ASINs and let the mirror verify availability during download.
+        """
+        title = self._clean_search_title(getattr(track, "title", "") or "")
+        if not title:
+            return None
+        artists = [a for a in (getattr(track, "artists", []) or []) if a]
+        artist_queries = []
+        if artists:
+            artist_queries.append(artists[0])
+            joined = " ".join(artists)
+            if joined.lower() != artists[0].lower():
+                artist_queries.append(joined)
+        artist_queries.append("")
+
+        storefronts = [
+            "https://music.amazon.com",
+            "https://music.amazon.in",
+            "https://music.amazon.co.uk",
+            "https://music.amazon.com.br",
+        ]
+        seen_queries: set[str] = set()
+        for artist in artist_queries:
+            query = f"{title} {artist}".strip()
+            key = query.lower()
+            if not query or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            encoded = urllib.parse.quote(query)
+            for base in storefronts:
+                try:
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    if not resp.ok:
+                        continue
+                    text = resp.text
+                except Exception as e:
+                    logger.debug("[Amazon] Amazon Music web search failed: %s", e)
+                    continue
+
+                candidates = []
+                candidates.extend(re.findall(r"/tracks/([A-Z0-9]{10})", text))
+                candidates.extend(re.findall(r'"trackAsin"\s*:\s*"([A-Z0-9]{10})"', text))
+                candidates.extend(re.findall(r'"asin"\s*:\s*"([A-Z0-9]{10})"', text))
+                for asin in dict.fromkeys(candidates):
+                    logger.info("[Amazon] Amazon Music web search resolved '%s' to ASIN %s", track.title, asin)
+                    return asin
+        return None
+
+    @staticmethod
+    def _album_cache_key(track: TrackMetadata) -> Optional[str]:
+        spotify_album_id = (getattr(track, "album_id", "") or "").strip()
+        if spotify_album_id:
+            return f"spotify_album||{spotify_album_id}"
+        album = (getattr(track, "album", "") or "").strip().lower()
+        artist = (getattr(track, "primary_artist", "") or "").strip().lower()
+        if not album:
+            return None
+        return f"{album}||{artist}"
+
+    def _album_urls_via_songlink(self, track: TrackMetadata) -> list[str]:
+        spotify_album_id = (getattr(track, "album_id", "") or "").strip()
+        if not spotify_album_id:
+            return []
+
+        seeded = list(_KNOWN_SPOTIFY_AMAZON_ALBUMS.get(spotify_album_id, []))
+
+        spotify_album_url = f"https://open.spotify.com/album/{spotify_album_id}"
+        try:
+            resp = self._session.get(
+                _SONGLINK_API,
+                params={"url": spotify_album_url, "platform": "spotify", "type": "album"},
+                timeout=10,
+            )
+            if resp.status_code == 429:
+                logger.debug("[Amazon] song.link album lookup rate-limited for %s", spotify_album_id)
+                return seeded
+            if not resp.ok:
+                logger.debug("[Amazon] song.link album lookup HTTP %s for %s", resp.status_code, spotify_album_id)
+                return seeded
+            payload = resp.json()
+        except Exception as e:
+            logger.debug("[Amazon] song.link album lookup failed for %s: %s", spotify_album_id, e)
+            return seeded
+
+        urls: list[str] = []
+        links = payload.get("linksByPlatform", {}) or {}
+        entities = payload.get("entitiesByUniqueId", {}) or {}
+        for platform in ("amazonMusic", "amazon"):
+            link_info = links.get(platform) or {}
+            entity_uid = str(link_info.get("entityUniqueId") or "")
+            entity = entities.get(entity_uid, {}) or {}
+            for raw in (
+                link_info.get("url"),
+                entity.get("url"),
+                entity.get("id"),
+                entity_uid.split("::")[-1] if "::" in entity_uid else entity_uid,
+            ):
+                album_url = _extract_amazon_album_url(str(raw or ""))
+                if album_url and album_url not in urls:
+                    urls.append(album_url)
+
+        for album_url in reversed(seeded):
+            if album_url not in urls:
+                urls.insert(0, album_url)
+        if urls:
+            source = "seed cache" if urls[0] in seeded else "song.link"
+            logger.info("[Amazon] %s resolved Spotify album '%s' to Amazon album %s", source, track.album or spotify_album_id, urls[0])
+        return urls
+
+    def _fetch_album_tracks_from_urls(self, track: TrackMetadata, album_urls: list[str]) -> list[TrackMetadata]:
+        if not album_urls:
+            return []
+
+        fetcher = AmazonMusicFetcher()
+        best_tracks: list[TrackMetadata] = []
+        best_score = 0.0
+        for album_url in album_urls:
+            try:
+                album_tracks = fetcher.fetch(album_url)
+            except Exception as e:
+                logger.debug("[Amazon] Amazon album fetch failed for %s: %s", album_url, e)
+                continue
+            if not album_tracks:
+                continue
+
+            sample = album_tracks[0]
+            album_score = score_similarity(
+                track.album or "",
+                [track.primary_artist] if track.primary_artist else [],
+                sample.album or "",
+                sample.primary_artist,
+            )
+            if album_score > best_score:
+                best_score = album_score
+                best_tracks = album_tracks
+            if album_score >= 0.60:
+                return album_tracks
+        return best_tracks
+
+    def _fetch_amazon_album_candidates(self, track: TrackMetadata) -> list[TrackMetadata]:
+        cache_key = self._album_cache_key(track)
+        if cache_key and cache_key in self._album_track_cache:
+            return self._album_track_cache[cache_key]
+
+        album = (getattr(track, "album", "") or "").strip()
+        if not album:
+            return []
+
+        songlink_tracks = self._fetch_album_tracks_from_urls(track, self._album_urls_via_songlink(track))
+        if songlink_tracks:
+            if cache_key:
+                self._album_track_cache[cache_key] = songlink_tracks
+            return songlink_tracks
+
+        artist_candidates = []
+        primary_artist = (getattr(track, "primary_artist", "") or "").strip()
+        if primary_artist:
+            artist_candidates.append(primary_artist)
+        for artist in (getattr(track, "album_artists", []) or []):
+            artist = (artist or "").strip()
+            if artist and artist.lower() not in {a.lower() for a in artist_candidates}:
+                artist_candidates.append(artist)
+        if not artist_candidates:
+            artist_candidates.append("")
+
+        storefronts = [
+            "https://music.amazon.com",
+            "https://music.amazon.in",
+            "https://music.amazon.co.uk",
+            "https://music.amazon.com.br",
+        ]
+        fetcher = AmazonMusicFetcher()
+        seen_album_asins: set[str] = set()
+        best_tracks: list[TrackMetadata] = []
+        best_score = 0.0
+
+        for artist in artist_candidates:
+            query = f"{album} {artist}".strip()
+            encoded = urllib.parse.quote(query)
+            for base in storefronts:
+                try:
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    if not resp.ok:
+                        continue
+                    text = resp.text
+                except Exception as e:
+                    logger.debug("[Amazon] Amazon album search failed: %s", e)
+                    continue
+
+                album_asins = []
+                album_asins.extend(re.findall(r"/albums/([A-Z0-9]{10})", text))
+                album_asins.extend(re.findall(r'"albumAsin"\s*:\s*"([A-Z0-9]{10})"', text))
+                for album_asin in dict.fromkeys(album_asins):
+                    if album_asin in seen_album_asins:
+                        continue
+                    seen_album_asins.add(album_asin)
+                    album_url = f"{base}/albums/{album_asin}"
+                    try:
+                        album_tracks = fetcher.fetch(album_url)
+                    except Exception as e:
+                        logger.debug("[Amazon] Amazon album fetch failed for %s: %s", album_url, e)
+                        continue
+                    if not album_tracks:
+                        continue
+
+                    sample = album_tracks[0]
+                    album_score = score_similarity(
+                        track.album or "",
+                        [track.primary_artist] if track.primary_artist else [],
+                        sample.album or "",
+                        sample.primary_artist,
+                    )
+                    if album_score > best_score:
+                        best_score = album_score
+                        best_tracks = album_tracks
+                    if album_score >= 0.75:
+                        if cache_key:
+                            self._album_track_cache[cache_key] = album_tracks
+                        return album_tracks
+
+        if cache_key:
+            self._album_track_cache[cache_key] = best_tracks
+        return best_tracks
+
+    def _resolve_via_album_page(self, track: TrackMetadata) -> Optional[str]:
+        album_tracks = self._fetch_amazon_album_candidates(track)
+        if not album_tracks:
+            return None
+
+        if track.track_number:
+            for candidate in album_tracks:
+                if candidate.track_number != track.track_number:
+                    continue
+                if score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist) >= 0.60:
+                    if candidate.amazon_asin:
+                        logger.info("[Amazon] Album-page match resolved '%s' to ASIN %s", track.title, candidate.amazon_asin)
+                        return candidate.amazon_asin
+
+        best_asin = None
+        best_score = 0.0
+        for candidate in album_tracks:
+            if not candidate.amazon_asin:
+                continue
+            score = score_similarity(track.title, track.artists, candidate.title, candidate.primary_artist)
+            if score > best_score:
+                best_score = score
+                best_asin = candidate.amazon_asin
+
+        if best_asin and best_score >= 0.72:
+            logger.info("[Amazon] Fuzzy album-page match resolved '%s' to ASIN %s (score=%.2f)", track.title, best_asin, best_score)
+            return best_asin
+        return None
+
+    def _lookup_spotify_isrc_via_soundplate(self, spotify_id: str) -> Optional[str]:
+        spotify_id = (spotify_id or "").strip()
+        if not spotify_id:
+            return None
+
+        spotify_url = f"https://open.spotify.com/track/{spotify_id}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Referer": _SOUNDPLATE_REFERER,
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+            "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Priority": "u=1, i",
+        }
+        try:
+            resp = self._session.get(
+                _SOUNDPLATE_SPOTIFY_API,
+                params={"q": spotify_url},
+                headers=headers,
+                timeout=8,
+            )
+            if not resp.ok:
+                logger.debug("[Amazon] Soundplate Spotify lookup HTTP %s for %s", resp.status_code, spotify_id)
+                return None
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            isrc = _first_isrc(str(payload.get("isrc") or ""))
+            if not isrc:
+                isrc = _first_isrc(resp.text)
+            return isrc
+        except Exception as e:
+            logger.debug("[Amazon] Soundplate Spotify lookup failed for %s: %s", spotify_id, e)
+            return None
+
+    def _ensure_spotify_isrc(self, track: TrackMetadata) -> None:
+        if getattr(track, "isrc", None):
+            return
+        spotify_id = (getattr(track, "spotify_id", "") or "").strip()
+        if not spotify_id:
+            return
+
+        with self._spotify_isrc_lock:
+            cached = self._spotify_isrc_cache.get(spotify_id)
+        if cached:
+            track.isrc = cached
+            return
+
+        isrc = self._lookup_spotify_isrc_via_soundplate(spotify_id)
+        if isrc:
+            track.isrc = isrc
+            with self._spotify_isrc_lock:
+                self._spotify_isrc_cache[spotify_id] = isrc
+
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
         """
         Resolve track to Amazon Music ASIN.
@@ -434,12 +853,20 @@ class AmazonAdapter(BaseSourceAdapter):
         or falls back to Odesli cross-platform lookup.
         """
         amazon_id = getattr(track, "amazon_asin", None)
+        resolved_payload: Optional[dict] = None
         if amazon_id:
             logger.debug(f"[Amazon] Using embedded ASIN for '{track.title}': {amazon_id}")
         else:
-            logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
-            platform_ids = self._odesli.resolve(track)
-            amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
+            amazon_id, resolved_payload = self._resolve_via_mirror(track)
+            if not amazon_id:
+                self._ensure_spotify_isrc(track)
+                logger.debug(f"[Amazon] Resolving ID via Odesli: {track.title}")
+                platform_ids = self._odesli.resolve(track)
+                amazon_id = platform_ids.get("amazonMusic") or platform_ids.get("amazon")
+            if not amazon_id:
+                amazon_id = self._resolve_via_album_page(track)
+            if not amazon_id:
+                amazon_id = self._search_amazon_music_web(track)
 
         if not amazon_id:
             logger.debug(f"[Amazon] No Amazon ID found for '{track.title}'")
@@ -464,15 +891,16 @@ class AmazonAdapter(BaseSourceAdapter):
                 similarity_score=1.0,
                 isrc_match=True if track.isrc else False,
                 is_explicit=track.is_explicit,
+                source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
             )
 
-        # Amazon's community proxy serves lossless streams that are SOMETIMES 24-bit
-        # and sometimes 16-bit depending on the track — Amazon does not expose the
-        # actual bit depth in its catalog API. Returning bit_depth=None lets the
-        # resolver's lossless sort correctly rank Amazon below any adapter that
-        # declares an actual bit depth (Qobuz declares 16-bit or 24-bit accurately).
-        # This ensures Qobuz / HiFi always win the quality sort when they find the
-        # track, and Amazon is used only as a fallback when those sources fail.
+        # Amazon HD/Ultra HD serves 24-bit lossless streams — actual bit depth is not
+        # knowable at search time (only from the stream manifest). bit_depth=None lets
+        # the resolver's _HIRES_ADAPTERS logic assume 24-bit, so Amazon competes against
+        # Qobuz when Qobuz explicitly reports 16-bit. Amazon has lower adapter priority
+        # (2 vs Qobuz's 1) so it only wins the quality sort when Qobuz/Tidal explicitly
+        # report 16-bit and Amazon's depth is unknown — the scenario where trying Amazon
+        # can improve on an otherwise 16-bit download.
         return SearchResult(
             source="amazon",
             title=track.title,
@@ -488,6 +916,7 @@ class AmazonAdapter(BaseSourceAdapter):
             similarity_score=1.0,
             isrc_match=True if track.isrc else False,
             is_explicit=track.is_explicit,
+            source_metadata={"amazon_resolved_stream": resolved_payload} if resolved_payload else {},
         )
 
     def download(self, result: SearchResult, output_path: str) -> str:
@@ -498,6 +927,20 @@ class AmazonAdapter(BaseSourceAdapter):
         asin = result.stream_id
         if not asin:
             raise ValueError("[Amazon] Missing ASIN in search result")
+
+        resolved_stream = None
+        if isinstance(getattr(result, "source_metadata", None), dict):
+            resolved_stream = result.source_metadata.get("amazon_resolved_stream")
+        if isinstance(resolved_stream, dict) and resolved_stream.get("streamUrl"):
+            try:
+                logger.info(f"[Amazon] Using mirror-resolved stream for ASIN {asin}...")
+                return self._process_download(
+                    resolved_stream["streamUrl"],
+                    resolved_stream.get("decryptionKey"),
+                    output_path,
+                )
+            except Exception as e:
+                logger.warning("[Amazon] Mirror-resolved stream failed, retrying normal ASIN path: %s", e)
 
         # Try direct DMLS API first — avoids proxy latency and rate-limit exposure
         if self._direct and self._direct.is_configured():
@@ -539,6 +982,15 @@ class AmazonAdapter(BaseSourceAdapter):
 
                     if not download_url:
                         raise RuntimeError("No stream URL returned")
+
+                    # Propagate actual quality metadata from server response so the
+                    # engine/tagger knows the real bit depth and sample rate.
+                    if data.get("bitDepth") or data.get("sampleRate"):
+                        result.source_metadata = dict(result.source_metadata or {})
+                        if data.get("bitDepth"):
+                            result.source_metadata["bit_depth"] = int(data["bitDepth"])
+                        if data.get("sampleRate"):
+                            result.source_metadata["sample_rate_hz"] = int(data["sampleRate"])
 
                     return self._process_download(download_url, decryption_key, output_path)
 

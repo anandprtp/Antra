@@ -24,13 +24,15 @@ Source chain (per track):
   Soulseek P2P          →  anything the community has, including rare and out-of-print releases
 ```
 
+Antra also remembers which sources have been reliable across app restarts (a persistent provider-reliability store) and reorders same-priority sources accordingly — without ever letting a lower-quality source jump ahead of a higher-quality one.
+
 Free tier works out of the box with rate-limited downloads. Support on Ko-fi to receive a 30-day supporter key with unlimited downloads and 2-3 concurrent downloads.
 
 ---
 
 ## Download Source Selector
 
-Force all downloads through a single service instead of letting the resolver decide. Six options: **Auto** (default), **Tidal**, **Qobuz**, **Apple Music**, **Amazon Music**, **Deezer**. When a specific source is selected, only adapters in that service family are used and no fallback to other services occurs.
+Constrain downloads to the services you choose instead of letting the resolver use everything. **Auto** (default) runs the full resolver chain; or select any combination of **Tidal**, **Qobuz**, **Apple Music**, **Amazon Music**, and **Deezer** to limit resolution to only those services — unselected services are excluded entirely. Pick a single service to force it, or several (e.g. Tidal + Qobuz) to allow fallback only between your chosen sources.
 
 Accessible from the pill-style selector on the main screen — no need to open Settings.
 
@@ -157,6 +159,32 @@ Accessible from the 🌍 button in the header.
 
 ---
 
+## My Library
+
+Connect your Spotify and Apple Music accounts to browse and download your own library directly inside Antra — no copy-pasting URLs.
+
+**One-click connect.** The "Connect Spotify Account" button opens your system browser, you log in, and Antra captures the session automatically (no manual cookie extraction). A manual paste field is still available as a fallback.
+
+**Spotify library** shows your **Liked Songs**, algorithmic mixes (Discover Weekly, Daily Mixes, Release Radar, On Repeat…), all personal **playlists**, **saved albums**, and **followed artists**. Each section is collapsible. Click any card to download it; click a followed artist to open their discography.
+
+**Apple Music library** shows your Saved Songs and all library playlists via a Spotify | Apple Music switcher at the top of the tab.
+
+My Library is the default tab on launch.
+
+---
+
+## Auto-Sync / Scheduled Downloads
+
+Keep playlists mirrored to your library automatically. Toggle auto-sync on any playlist card (the ↺ button), then set a schedule in Settings (time + days of week). Antra checks your tracked playlists on schedule, diffs against what it downloaded last time, and pulls **only the new tracks**. A "Sync Now" button runs it on demand.
+
+---
+
+## YouTube Music URLs
+
+Paste a `music.youtube.com` link — single track, playlist, or album — and Antra resolves it through the same lossless source chain as a Spotify or Apple Music link. yt-dlp extracts the metadata (and ISRC where available); the actual audio comes from Tidal / Qobuz / Amazon / Deezer, so every quality tier (FLAC, ALAC, AAC, MP3) is supported.
+
+---
+
 ## Artist Discography Download
 
 Search for any artist by Spotify or Apple Music URL. Antra fetches their full discography and presents it grouped by release type.
@@ -189,6 +217,18 @@ Each row shows the track title, artist, duration, and a real-time progress bar a
 When multiple URLs are queued in one session, a divider with the album cover and title separates each batch so you always know which tracks belong where.
 
 A dedicated log panel (accessible via the 📋 button) shows verbose download output without disrupting the tracklist view.
+
+---
+
+## Failed Downloads Viewer
+
+When a playlist or album finishes, any tracks that failed are collected into a dedicated **Failed (N)** panel below the tracklist — no scrolling to hunt for red rows. Retry a single track, **Retry All** (runs them one by one with live progress), or dismiss entries you don't care about. The panel collapses and auto-hides once everything is retried or dismissed.
+
+---
+
+## Synced Lyrics in the Player
+
+The built-in player for downloaded tracks reads embedded LRC lyrics and shows a scrolling panel that auto-highlights the current line in sync with playback. Toggle it with the ♪ button; it appears automatically when a track has synced lyrics. Plain (unsynced) lyrics are shown too.
 
 ---
 
@@ -260,9 +300,11 @@ A **free Spotify account is sufficient**. Podcast audio is not gated behind Spot
 2. Open **DevTools** (F12 on Chrome/Edge, Cmd+Option+I on macOS)
 3. Go to **Application** tab → **Cookies** → `https://open.spotify.com`
 4. Find the cookie named **`sp_dc`** and copy its value (starts with `AQ...`)
-5. In Antra, open **Settings → Spotify Podcasts** and paste it into the **sp_dc cookie** field
+5. In Antra, open **Settings → Spotify Account** and paste it into the **sp_dc cookie** field
 
-The cookie is valid for approximately one year.
+> **Easiest path:** use the **Connect Spotify Account** button in Settings instead — it opens your browser, you log in, and Antra captures the cookie automatically. The manual steps above are only needed if you prefer pasting it yourself.
+
+The cookie is valid for approximately one year. The same connection also powers the **My Library** tab.
 
 ### Output and tagging
 

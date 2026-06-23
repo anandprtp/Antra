@@ -57,6 +57,13 @@ export namespace main {
 	    antra_api_key?: string;
 	    theme?: string;
 	    download_source?: string;
+	    download_sources?: string[];
+	    save_cover_art_sidecar: boolean;
+	    auto_sync_enabled: boolean;
+	    auto_sync_hour: number;
+	    auto_sync_minute: number;
+	    auto_sync_days: number;
+	    tracked_playlists?: any[];
 	
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
@@ -120,6 +127,13 @@ export namespace main {
 	        this.antra_api_key = source["antra_api_key"];
 	        this.theme = source["theme"];
 	        this.download_source = source["download_source"];
+	        this.download_sources = source["download_sources"];
+	        this.save_cover_art_sidecar = source["save_cover_art_sidecar"];
+	        this.auto_sync_enabled = source["auto_sync_enabled"];
+	        this.auto_sync_hour = source["auto_sync_hour"];
+	        this.auto_sync_minute = source["auto_sync_minute"];
+	        this.auto_sync_days = source["auto_sync_days"];
+	        this.tracked_playlists = source["tracked_playlists"];
 	    }
 	}
 	export class HistoryItem {

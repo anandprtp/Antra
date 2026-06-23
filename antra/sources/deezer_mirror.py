@@ -85,7 +85,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
         if self._available is not None:
             return self._available
         try:
-            r = self._session.get(f"{self._base}/", timeout=5)
+            r = self._session.get(f"{self._base}/", timeout=15)
             self._available = r.status_code == 200
         except Exception:
             self._available = False

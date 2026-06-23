@@ -11,7 +11,7 @@ HTTP API, via the official `slskd-api` Python client. It:
   5. Polls the transfers API until the download completes, then moves the
      finished file into Antra's output directory
 
-Priority: 1 — runs after HiFi (0) and before Debrid (2), DAB (3), etc.
+Priority: 3 — runs after Amazon/HiFi (2).
 """
 from __future__ import annotations
 

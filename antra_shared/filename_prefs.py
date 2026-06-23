@@ -122,6 +122,21 @@ def build_folder_path(track: Any, prefs: dict[str, Any]) -> str:
     return normalized
 
 
+def _collapse_artist_list(artists: list[str], max_len: int = 60) -> str:
+    """Join artists into a string, collapsing to 'A, B & N others' if too long."""
+    joined = ", ".join(str(a) for a in artists if a)
+    if len(joined) <= max_len or len(artists) <= 2:
+        return joined
+    # Try dropping artists from the end until we fit
+    for keep in range(len(artists) - 1, 1, -1):
+        others = len(artists) - keep
+        candidate = ", ".join(str(a) for a in artists[:keep]) + f" & {others} others"
+        if len(candidate) <= max_len:
+            return candidate
+    # Fallback: first artist only + others count
+    return str(artists[0]) + f" & {len(artists) - 1} others"
+
+
 def build_context(
     track: Any,
     prefs: dict[str, Any],
@@ -132,8 +147,12 @@ def build_context(
     album_artist = ""
     album_artists = getattr(track, "album_artists", None) or []
     if album_artists:
-        album_artist = ", ".join([str(value) for value in album_artists if value])
-    artist = getattr(track, "primary_artist", "") or ""
+        album_artist = _collapse_artist_list(album_artists)
+    raw_artists = getattr(track, "artists", None) or []
+    if raw_artists and len(raw_artists) > 1:
+        artist = _collapse_artist_list(raw_artists)
+    else:
+        artist = getattr(track, "primary_artist", "") or ""
     genres = getattr(track, "genres", None) or []
     genre = ", ".join([str(value) for value in genres if value])
     quality = _track_quality(track)
@@ -173,22 +192,35 @@ def render_template(
     is_path: bool = False,
 ) -> str:
     prefs = migrate_legacy_templates(prefs or {})
-    raw = _TOKEN_RE.sub(lambda m: _stringify(values.get(m.group(1).lower(), "")), template or "")
+    if is_path:
+        # Pre-sanitize token values so that slashes *within* values (e.g. an album
+        # title like "The United States Of Mind / Phase 2") don't get interpreted as
+        # path separators when the rendered string is later split on "/".
+        replacement = str(prefs.get("illegal_character_replacement", ""))
+        safe_values = {
+            k: _stringify(v).replace("/", replacement).replace("\\", replacement)
+            for k, v in values.items()
+        }
+        raw = _TOKEN_RE.sub(lambda m: safe_values.get(m.group(1).lower(), ""), template or "")
+    else:
+        raw = _TOKEN_RE.sub(lambda m: _stringify(values.get(m.group(1).lower(), "")), template or "")
     collapsed = _collapse_orphaned_separators(raw)
     sanitized = _apply_whitespace_policy(collapsed, prefs.get("whitespace_handling", "preserve"))
     if is_path:
-        segments = [sanitize_filename_segment(part, prefs) for part in sanitized.replace("\\", "/").split("/") if part.strip()]
+        segments = [sanitize_filename_segment(part, prefs, max_len=120) for part in sanitized.replace("\\", "/").split("/") if part.strip()]
         return "/".join([segment for segment in segments if segment])
-    return sanitize_filename_segment(sanitized, prefs)
+    return sanitize_filename_segment(sanitized, prefs, max_len=180)
 
 
-def sanitize_filename_segment(value: str, prefs: Optional[dict[str, Any]] = None) -> str:
+def sanitize_filename_segment(value: str, prefs: Optional[dict[str, Any]] = None, max_len: Optional[int] = None) -> str:
     prefs = migrate_legacy_templates(prefs or {})
     replacement = str(prefs.get("illegal_character_replacement", ""))
     value = value or ""
     value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', replacement, value)
     value = re.sub(r"\s{2,}", " ", value).strip()
     value = value.strip(". ")
+    if max_len and len(value) > max_len:
+        value = value[:max_len].rstrip(". ")
     return value or "Unknown"
 
 
