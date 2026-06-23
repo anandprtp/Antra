@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>A fast, modern desktop app for building, tagging, and organising your personal music library.</strong>
+  <strong>A desktop music library builder that turns Spotify, Youtube Music Apple Music, Amazon Music, Tidal, Qobuz, and Deezer links into fully tagged local library in FLAC, ALAC, AAC, or MP3.</strong>
 </p>
 
 <p align="center">
