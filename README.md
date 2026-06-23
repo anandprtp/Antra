@@ -30,10 +30,10 @@
 <br/>
 
 <p align="center">
-  <img src="assets/screenshots/ss_1.png" width="780"/>
+  <img src="assets/screenshots/ss_1.png?v=117" width="780"/>
 </p>
 <p align="center">
-  <img src="assets/screenshots/ss_2.png" width="780"/>
+  <img src="assets/screenshots/ss_2.png?v=117" width="780"/>
 </p>
 
 ---
