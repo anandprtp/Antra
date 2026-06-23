@@ -128,6 +128,18 @@ This repository and its contents are provided strictly for educational and resea
 
 ---
 
+## Shoutout to the Day Ones
+
+Huge thanks to these folks for bringing new ideas, feedback, and testing the beta builds before everyone else:
+
+<p align="center">
+  <a href="https://github.com/rafaelmolivebh">@rafaelmolivebh</a> &nbsp;·&nbsp;
+  <a href="https://github.com/robarnoldio">@robarnoldio</a> &nbsp;·&nbsp;
+  <a href="https://github.com/mishrabiswajit">@mishrabiswajit</a>
+</p>
+
+---
+
 <p align="center">
   <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Telegram</a> · <a href="https://discord.gg/Gq7CBAme7">Discord</a></sub>
 </p>
