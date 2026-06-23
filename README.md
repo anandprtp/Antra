@@ -14,6 +14,7 @@
   <a href="https://github.com/anandprtp/Antra/releases"><img src="https://img.shields.io/github/v/release/anandprtp/Antra?color=0ea5e9&label=latest&style=flat-square&labelColor=0d1117"/></a>
   <img src="https://img.shields.io/badge/Windows%20·%20macOS%20·%20Linux-supported-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <a href="https://t.me/antraaverse"><img src="https://img.shields.io/badge/Community-Telegram-26A5E4?style=flat-square&labelColor=0d1117&logo=telegram&logoColor=white"/></a>
+  <a href="https://discord.gg/Gq7CBAme7"><img src="https://img.shields.io/badge/Community-Discord-5865F2?style=flat-square&labelColor=0d1117&logo=discord&logoColor=white"/></a>
 </p>
 
 <p align="center">
@@ -128,5 +129,5 @@ This repository and its contents are provided strictly for educational and resea
 ---
 
 <p align="center">
-  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Join the Community</a></sub>
+  <sub>Built with ❤️ by <a href="https://github.com/anandprtp">Hoshiyaar Singh</a> · <a href="https://github.com/anandprtp/Antra/issues">Report an Issue</a> · <a href="https://t.me/antraaverse">Telegram</a> · <a href="https://discord.gg/Gq7CBAme7">Discord</a></sub>
 </p>
