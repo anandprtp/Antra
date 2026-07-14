@@ -1,0 +1,5 @@
+-r requirements-runtime.txt
+
+# Private Telegram interface and signed VLC media endpoints.
+python-telegram-bot>=22.5,<23
+aiohttp>=3.12,<4

@@ -1519,6 +1519,27 @@ class AntraService:
             logger.debug(f"[Service] Apple fallback artist search failed: {e}")
         return []
 
+    def search_track(
+        self,
+        query: str,
+        options: Optional[RuntimeOptions] = None,
+    ) -> Optional[TrackMetadata]:
+        """Resolve a free-text song query into normalized track metadata.
+
+        This is the public application-service seam for non-desktop clients such
+        as the private Telegram integration. SpotifyClient already owns the
+        authenticated, anonymous, and iTunes fallback search behaviour.
+        """
+        cleaned_query = " ".join((query or "").split())
+        if not cleaned_query:
+            return None
+
+        cfg = self.build_runtime_config(options)
+        track = self._make_spotify_client(cfg).search_track(cleaned_query)
+        if track is not None:
+            track.request_kind = "track"
+        return track
+
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
         client = self._spotify_client_factory(
             cfg.spotify_client_id,

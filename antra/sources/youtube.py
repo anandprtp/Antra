@@ -10,6 +10,7 @@ import logging
 import os
 import re
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter
@@ -51,6 +52,28 @@ class YouTubeAdapter(BaseSourceAdapter):
             import yt_dlp
         except ImportError:
             return None
+
+        direct_url = (getattr(track, "source_url", None) or "").strip()
+        if (
+            (getattr(track, "source_service", None) or "").lower() == "youtube"
+            and self._is_direct_video_url(direct_url)
+        ):
+            logger.info("[YouTube] Using exact source video for: %s", track.title)
+            return SearchResult(
+                source=self.name,
+                title=track.title,
+                artists=list(track.artists),
+                album=track.album or None,
+                duration_ms=track.duration_ms,
+                audio_format=AudioFormat.OPUS,
+                quality_kbps=None,
+                is_lossless=False,
+                download_url=direct_url,
+                stream_id=direct_url,
+                similarity_score=1.0,
+                isrc_match=False,
+                artwork_url=track.artwork_url,
+            )
 
         best: Optional[SearchResult] = None
         best_score = 0.0
@@ -248,6 +271,23 @@ class YouTubeAdapter(BaseSourceAdapter):
         add(re.sub(r"\s*[\(\[].*?[\)\]]\s*", " ", title))
         add(re.sub(r"\s*(feat\.?|ft\.?|with)\s+.*$", "", title, flags=re.IGNORECASE))
         return variants
+
+    @staticmethod
+    def _is_direct_video_url(value: str) -> bool:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+            return False
+        host = (parsed.hostname or "").lower()
+        if host == "youtu.be":
+            return re.fullmatch(r"[A-Za-z0-9_-]{6,64}", parsed.path.strip("/")) is not None
+        if host not in {"youtube.com", "www.youtube.com", "music.youtube.com"}:
+            return False
+        video_ids = parse_qs(parsed.query).get("v") or []
+        return (
+            parsed.path.rstrip("/") == "/watch"
+            and len(video_ids) == 1
+            and re.fullmatch(r"[A-Za-z0-9_-]{6,64}", video_ids[0]) is not None
+        )
 
     @staticmethod
     def _safe_stem(value: str) -> str:

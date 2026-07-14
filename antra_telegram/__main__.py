@@ -1,0 +1,94 @@
+import logging
+
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+
+from .access import AccessStore
+from .bot import TelegramMusicBot
+from .config import ConfigError, TelegramConfig
+from .jobs import JobCoordinator, MusicResolver
+from .library import LibraryIndex
+from .media import MediaRegistry, MediaServer
+from .security import LinkSigner
+
+
+def build_application(config: TelegramConfig) -> Application:
+    library = LibraryIndex(config.library_dir)
+    library.refresh()
+
+    signer = LinkSigner(config.link_secret)
+    registry = MediaRegistry(config.library_dir, config.link_secret)
+    registry.refresh()
+    media_server = MediaServer(
+        registry=registry,
+        signer=signer,
+        public_base_url=config.public_base_url,
+        bind_host=config.bind_host,
+        bind_port=config.bind_port,
+        link_ttl_seconds=config.link_ttl_seconds,
+    )
+    resolver = MusicResolver(config, library)
+    coordinator = JobCoordinator(
+        resolver,
+        max_concurrent=config.max_concurrent_jobs,
+        max_pending=config.max_pending_jobs,
+    )
+    access_store = AccessStore(
+        config.access_db_path,
+        static_allowed_user_ids=config.allowed_user_ids,
+        allow_first_claim=config.claim_first_user,
+    )
+    bot = TelegramMusicBot(
+        config,
+        access_store,
+        library,
+        coordinator,
+        registry,
+        media_server,
+    )
+
+    async def post_init(application: Application) -> None:
+        await media_server.start()
+
+    async def post_shutdown(application: Application) -> None:
+        await media_server.stop()
+
+    application = (
+        Application.builder()
+        .token(config.bot_token)
+        .concurrent_updates(False)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CommandHandler("help", bot.help))
+    application.add_handler(CommandHandler("status", bot.status))
+    application.add_handler(CommandHandler("files", bot.files))
+    application.add_handler(CommandHandler("invite", bot.invite))
+    application.add_handler(CommandHandler("members", bot.members))
+    application.add_handler(CommandHandler("rescan", bot.rescan))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
+    application.add_handler(MessageHandler(filters.COMMAND, bot.unknown_command))
+    return application
+
+
+def main() -> None:
+    load_dotenv(".env.telegram", override=False)
+    load_dotenv(override=False)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    try:
+        config = TelegramConfig.from_env()
+    except ConfigError as exc:
+        raise SystemExit(f"Telegram bot configuration error: {exc}") from exc
+    build_application(config).run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
