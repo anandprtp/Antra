@@ -667,6 +667,9 @@ class AntraService:
            filename numbering — sequential renumbering fixes this.
         """
         from collections import defaultdict, Counter
+        preserve_playlist_order = any(
+            (track.request_kind or "").lower() == "playlist" for track in tracks
+        )
         album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
         for track in tracks:
             key = AntraService._album_group_key(track)
@@ -770,6 +773,8 @@ class AntraService:
             else:
                 reordered_tracks.extend(group)
 
+        if preserve_playlist_order:
+            return tracks
         return reordered_tracks if len(reordered_tracks) == len(tracks) else tracks
 
     @staticmethod

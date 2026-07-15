@@ -1,22 +1,33 @@
 import asyncio
 import concurrent.futures
 import os
+import sqlite3
 import time
 from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
+from telegram.ext import CallbackQueryHandler
 
 from antra.core.config import Config
 from antra.core.models import DownloadResult, DownloadStatus, TrackMetadata
 from antra.core.service import AntraService
+from antra.core.youtube_music_fetcher import YouTubeMusicFetcher
 from antra.sources.youtube import YouTubeAdapter
 from antra_telegram.access import AccessStore, AccessStoreError
+from antra_telegram.__main__ import build_application
 from antra_telegram.config import ConfigError, TelegramConfig
 from antra_telegram.delivery import DeliveryKind, choose_delivery
-from antra_telegram.jobs import JobCoordinator, MusicRequestError, MusicResolver
+from antra_telegram.jobs import (
+    JobCoordinator,
+    MusicRequestError,
+    MusicResolver,
+    youtube_music_input_kind,
+)
 from antra_telegram.library import LibraryIndex
 from antra_telegram.media import MediaRegistry, MediaServer
-from antra_telegram.models import TrackAsset
+from antra_telegram.models import PlaylistPreview, PlaylistSession, TrackAsset
+from antra_telegram.playlist_sessions import PlaylistSessionStore, PlaylistTooLarge
+from antra_telegram.playlist_ui import parse_playlist_callback, render_playlist_page
 from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
 
@@ -247,7 +258,7 @@ def test_youtube_music_track_url_uses_url_pipeline(tmp_path: Path):
     assert asset.duration_seconds == 179
 
 
-def test_youtube_music_playlist_url_is_rejected_without_download(tmp_path: Path):
+def test_youtube_music_playlist_url_is_redirected_to_preview_without_download(tmp_path: Path):
     class FakeService:
         def download_playlist(self, url, options=None):
             raise AssertionError("collection URLs must not reach the downloader")
@@ -265,11 +276,285 @@ def test_youtube_music_playlist_url_is_rejected_without_download(tmp_path: Path)
     )
 
     try:
-        resolver.resolve("https://music.youtube.com/watch?v=track&list=playlist")
+        resolver.resolve(
+            "https://music.youtube.com/watch?v=video12345&list=PL12345678"
+        )
     except MusicRequestError as exc:
-        assert "один трек" in str(exc)
+        assert "список с кнопками" in str(exc)
     else:
-        raise AssertionError("a YouTube Music playlist must be rejected")
+        raise AssertionError("a YouTube Music playlist must use the preview flow")
+
+
+def test_playlist_preview_fetches_metadata_without_downloading(tmp_path: Path):
+    tracks = [
+        TrackMetadata(
+            title="First",
+            artists=["Artist"],
+            album="Album",
+            playlist_name="Small playlist",
+            playlist_position=1,
+            request_kind="playlist",
+            source_service="youtube",
+            source_url="https://music.youtube.com/watch?v=video12345",
+        ),
+        TrackMetadata(
+            title="Second",
+            artists=["Artist"],
+            album="Album",
+            playlist_name="Small playlist",
+            playlist_position=2,
+            request_kind="playlist",
+            source_service="youtube",
+            source_url="https://music.youtube.com/watch?v=video67890",
+        ),
+    ]
+
+    class FakeService:
+        def __init__(self):
+            self.fetches = []
+
+        def fetch_playlist_tracks(self, url, options=None):
+            self.fetches.append(url)
+            return tracks
+
+        def download_playlist(self, *args, **kwargs):
+            raise AssertionError("preview must not download a playlist")
+
+        def download_tracks(self, *args, **kwargs):
+            raise AssertionError("preview must not download tracks")
+
+    service = FakeService()
+    config = TelegramConfig(
+        bot_token="token",
+        allowed_user_ids=frozenset({1}),
+        library_dir=tmp_path,
+        resolve_mode="download",
+    )
+    resolver = MusicResolver(
+        config,
+        LibraryIndex(tmp_path),
+        service_factory=lambda: service,
+    )
+    url = "https://music.youtube.com/playlist?list=PL12345678"
+
+    preview = resolver.preview_playlist(url)
+
+    assert service.fetches == [url]
+    assert preview.name == "Small playlist"
+    assert [track.title for track in preview.tracks] == ["First", "Second"]
+
+
+def test_playlist_selected_track_downloads_only_that_track(tmp_path: Path):
+    output = tmp_path / "Artist" / "Album" / "02 - Second.mp3"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"not-real-audio")
+    selected = TrackMetadata(
+        title="Second",
+        artists=["Artist"],
+        album="Album",
+        playlist_name="Small playlist",
+        playlist_position=2,
+        request_kind="playlist",
+        source_service="youtube",
+        source_url="https://music.youtube.com/watch?v=video67890",
+    )
+
+    class FakeService:
+        def __init__(self):
+            self.downloaded = []
+
+        def download_tracks(self, tracks, options=None):
+            self.downloaded.extend(tracks)
+            return [
+                DownloadResult(
+                    track=tracks[0],
+                    status=DownloadStatus.COMPLETED,
+                    file_path=str(output),
+                    source_used="youtube",
+                )
+            ]
+
+    service = FakeService()
+    config = TelegramConfig(
+        bot_token="token",
+        allowed_user_ids=frozenset({1}),
+        library_dir=tmp_path,
+        resolve_mode="download",
+    )
+    resolver = MusicResolver(config, LibraryIndex(tmp_path), service_factory=lambda: service)
+
+    asset = resolver.resolve_track(selected)
+
+    assert asset is not None and asset.title == "Second"
+    assert len(service.downloaded) == 1
+    downloaded = service.downloaded[0]
+    assert downloaded.source_url == selected.source_url
+    assert downloaded.request_kind == "track"
+    assert downloaded.playlist_name is None
+    assert downloaded.playlist_position is None
+
+
+def test_playlist_sessions_survive_restart_and_are_owner_bound(tmp_path: Path):
+    path = tmp_path / "playlist.sqlite3"
+    preview = PlaylistPreview(
+        source_url="https://music.youtube.com/playlist?list=PL12345678",
+        name="Persistent playlist",
+        tracks=(
+            TrackMetadata(
+                title="First",
+                artists=["Artist"],
+                album="Album",
+                source_service="youtube",
+                source_url="https://music.youtube.com/watch?v=video12345",
+            ),
+        ),
+    )
+    store = PlaylistSessionStore(path, ttl_seconds=3600, max_tracks=100)
+    session = store.create(111, 111, preview, now=1_000)
+    assert store.bind_message(session.token, 111, 111, 77)
+
+    restarted = PlaylistSessionStore(path, ttl_seconds=3600, max_tracks=100)
+    loaded = restarted.get(session.token, 111, 111, 77, now=1_001)
+
+    assert loaded is not None
+    assert loaded.name == "Persistent playlist"
+    assert loaded.tracks[0].source_url == preview.tracks[0].source_url
+    assert restarted.get(session.token, 222, 111, 77, now=1_001) is None
+    assert restarted.get(session.token, 111, 222, 77, now=1_001) is None
+    assert restarted.get(session.token, 111, 111, 78, now=1_001) is None
+    assert path.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(path) as db:
+        stored_hash = db.execute("SELECT token_hash FROM playlist_sessions").fetchone()[0]
+    assert stored_hash != session.token
+    assert session.token.encode() not in path.read_bytes()
+    assert restarted.get(session.token, 111, 111, 77, now=4_601) is None
+
+
+def test_playlist_session_rejects_oversized_playlist(tmp_path: Path):
+    preview = PlaylistPreview(
+        source_url="https://music.youtube.com/playlist?list=PL12345678",
+        name="Too large",
+        tracks=tuple(
+            TrackMetadata(title=f"Track {index}", artists=["Artist"], album="Album")
+            for index in range(3)
+        ),
+    )
+    store = PlaylistSessionStore(tmp_path / "playlist.sqlite3", ttl_seconds=60, max_tracks=2)
+    try:
+        store.create(1, 1, preview)
+    except PlaylistTooLarge:
+        pass
+    else:
+        raise AssertionError("oversized playlists must be rejected")
+
+
+def test_playlist_ui_paginates_and_callbacks_fit_telegram_limits():
+    session = PlaylistSession(
+        token="abcdefghijklmnopqrstuv",
+        owner_user_id=1,
+        chat_id=1,
+        message_id=10,
+        source_url="https://music.youtube.com/playlist?list=PL12345678",
+        name="Twenty five tracks",
+        tracks=tuple(
+            TrackMetadata(
+                title=f"Track {index} with a deliberately long mobile button label",
+                artists=["Artist"],
+                album="Album",
+            )
+            for index in range(25)
+        ),
+        expires_at=10_000,
+    )
+
+    text, markup = render_playlist_page(session, page=1, page_size=10)
+
+    assert "страница 2/3" in text
+    assert "11. Artist — Track 10" in text
+    assert "20. Artist — Track 19" in text
+    assert len(text) <= 4096
+    callbacks = [
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    ]
+    assert all(len(callback.encode("utf-8")) <= 64 for callback in callbacks)
+    assert parse_playlist_callback(callbacks[0]).value == 10
+    assert any(callback.endswith(":a") for callback in callbacks)
+    largest_text, _ = render_playlist_page(session, page=0, page_size=20)
+    assert len(largest_text) <= 4096
+
+
+def test_playlist_callback_parser_rejects_malformed_data():
+    assert parse_playlist_callback("pl:short:t:0") is None
+    assert parse_playlist_callback("pl:abcdefghijklmnopqrstuv:x:0") is None
+    assert parse_playlist_callback("pl:abcdefghijklmnopqrstuv:t:-1") is None
+    assert parse_playlist_callback("pl:abcdefghijklmnopqrstuv:a:1") is None
+
+
+def test_youtube_music_playlist_classifier_is_strict():
+    assert youtube_music_input_kind(
+        "https://music.youtube.com/playlist?list=PL12345678"
+    ) == "collection"
+    assert youtube_music_input_kind(
+        "https://music.youtube.com/watch?v=video12345&list=PL12345678"
+    ) == "collection"
+    assert youtube_music_input_kind(
+        "https://music.youtube.com/watch?v=video12345"
+    ) == "track"
+    assert youtube_music_input_kind(
+        "https://music.youtube.com.example.invalid/playlist?list=PL12345678"
+    ) is None
+    assert youtube_music_input_kind(
+        "https://user@music.youtube.com/playlist?list=PL12345678"
+    ) == "invalid"
+
+
+def test_youtube_music_playlist_entries_receive_stable_positions():
+    track = YouTubeMusicFetcher()._info_to_track(
+        {
+            "id": "video12345",
+            "title": "Artist - Song",
+            "duration": 180,
+        },
+        playlist_name="Ordered playlist",
+        playlist_artwork=None,
+        index=7,
+    )
+
+    assert track is not None
+    assert track.playlist_position == 7
+    assert track.source_url == "https://music.youtube.com/watch?v=video12345"
+
+
+def test_playlist_order_is_preserved_across_album_groups():
+    tracks = [
+        TrackMetadata("A1", ["Artist A"], "Album A", request_kind="playlist"),
+        TrackMetadata("B1", ["Artist B"], "Album B", request_kind="playlist"),
+        TrackMetadata("A2", ["Artist A"], "Album A", request_kind="playlist"),
+    ]
+
+    result = AntraService._stamp_disc_totals(tracks)
+
+    assert [track.title for track in result] == ["A1", "B1", "A2"]
+
+
+def test_application_registers_playlist_callback_handler(tmp_path: Path):
+    config = TelegramConfig(
+        bot_token="token",
+        allowed_user_ids=frozenset({1}),
+        library_dir=tmp_path / "Music",
+        access_db_path=tmp_path / "access.sqlite3",
+        playlist_db_path=tmp_path / "playlist.sqlite3",
+        resolve_mode="download",
+        link_secret=SECRET,
+    )
+
+    application = build_application(config)
+    handlers = [handler for group in application.handlers.values() for handler in group]
+
+    assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 1
 
 
 def test_youtube_adapter_uses_exact_source_video_without_text_search():

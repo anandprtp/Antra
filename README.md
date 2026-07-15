@@ -111,6 +111,13 @@ formats are sent as documents. Large files receive an expiring M3U8 link that
 VLC can open and seek through. The public base URL must terminate HTTPS and
 forward to the configured bind host/port.
 
+Public YouTube Music playlist links open as a paginated track list. Every row
+has its own download button and the footer has **Download all**. Playlist button
+sessions are owner/chat/message-bound, stored in a local SQLite database, expire
+after the configured TTL, and survive bot restarts. Defaults are 10 tracks per
+page, 100 tracks per playlist, and 24-hour button lifetime; see the
+`ANTRA_TELEGRAM_PLAYLIST_*` settings in `.env.telegram.example`.
+
 `ANTRA_TELEGRAM_RESOLVE_MODE=download` enables Antra's existing provider chain
 only for private, authorised personal use. Public multi-user hosting requires
 separate permission from the licensor and appropriate content rights.

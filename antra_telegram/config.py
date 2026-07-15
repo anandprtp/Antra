@@ -46,6 +46,11 @@ class TelegramConfig:
     download_format: str = "mp3"
     max_upload_bytes: int = 49_000_000
     max_query_chars: int = 200
+    max_playlist_url_chars: int = 2048
+    playlist_db_path: Path = Path(".antra_telegram_playlists.sqlite3")
+    playlist_session_ttl_seconds: int = 86_400
+    max_playlist_tracks: int = 100
+    playlist_page_size: int = 10
     max_concurrent_jobs: int = 1
     max_pending_jobs: int = 20
     public_base_url: str = ""
@@ -103,24 +108,44 @@ class TelegramConfig:
                 os.getenv("OUTPUT_DIR", "./Music"),
             )
         ).expanduser().resolve()
+        access_db_path = Path(
+            os.getenv(
+                "ANTRA_TELEGRAM_ACCESS_DB",
+                ".antra_telegram_access.sqlite3",
+            )
+        ).expanduser().resolve()
+        playlist_page_size = _positive_int("ANTRA_TELEGRAM_PLAYLIST_PAGE_SIZE", 10)
+        if playlist_page_size > 20:
+            raise ConfigError("ANTRA_TELEGRAM_PLAYLIST_PAGE_SIZE must not exceed 20")
+        max_playlist_tracks = _positive_int("ANTRA_TELEGRAM_MAX_PLAYLIST_TRACKS", 100)
+        if max_playlist_tracks > 500:
+            raise ConfigError("ANTRA_TELEGRAM_MAX_PLAYLIST_TRACKS must not exceed 500")
 
         return cls(
             bot_token=token,
             allowed_user_ids=allowed,
             library_dir=library_dir,
             claim_first_user=claim_first_user,
-            access_db_path=Path(
-                os.getenv(
-                    "ANTRA_TELEGRAM_ACCESS_DB",
-                    ".antra_telegram_access.sqlite3",
-                )
-            ).expanduser().resolve(),
+            access_db_path=access_db_path,
             invite_ttl_seconds=_positive_int("ANTRA_TELEGRAM_INVITE_TTL_SECONDS", 86_400),
             resolve_mode=resolve_mode,
             delivery_mode=delivery_mode,
             download_format=os.getenv("ANTRA_TELEGRAM_DOWNLOAD_FORMAT", "mp3").strip().lower(),
             max_upload_bytes=_positive_int("ANTRA_TELEGRAM_MAX_UPLOAD_BYTES", 49_000_000),
             max_query_chars=_positive_int("ANTRA_TELEGRAM_MAX_QUERY_CHARS", 200),
+            max_playlist_url_chars=_positive_int("ANTRA_TELEGRAM_MAX_PLAYLIST_URL_CHARS", 2048),
+            playlist_db_path=Path(
+                os.getenv(
+                    "ANTRA_TELEGRAM_PLAYLIST_DB",
+                    str(access_db_path.with_name("playlist_sessions.sqlite3")),
+                )
+            ).expanduser().resolve(),
+            playlist_session_ttl_seconds=_positive_int(
+                "ANTRA_TELEGRAM_PLAYLIST_SESSION_TTL_SECONDS",
+                86_400,
+            ),
+            max_playlist_tracks=max_playlist_tracks,
+            playlist_page_size=playlist_page_size,
             max_concurrent_jobs=_positive_int("ANTRA_TELEGRAM_MAX_CONCURRENT_JOBS", 1),
             max_pending_jobs=_positive_int("ANTRA_TELEGRAM_MAX_PENDING_JOBS", 20),
             public_base_url=public_base_url,

@@ -264,6 +264,7 @@ class YouTubeMusicFetcher:
             source_service="youtube",
             source_url=f"https://music.youtube.com/watch?v={video_id}",
             playlist_name=playlist_name,
+            playlist_position=index if playlist_name else None,
             playlist_artwork_url=playlist_artwork,
             release_year=release_year,
             release_date=release_date,

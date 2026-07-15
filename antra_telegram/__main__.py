@@ -2,7 +2,13 @@ import logging
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from .access import AccessStore
 from .bot import TelegramMusicBot
@@ -10,6 +16,7 @@ from .config import ConfigError, TelegramConfig
 from .jobs import JobCoordinator, MusicResolver
 from .library import LibraryIndex
 from .media import MediaRegistry, MediaServer
+from .playlist_sessions import PlaylistSessionStore
 from .security import LinkSigner
 
 
@@ -39,6 +46,11 @@ def build_application(config: TelegramConfig) -> Application:
         static_allowed_user_ids=config.allowed_user_ids,
         allow_first_claim=config.claim_first_user,
     )
+    playlist_store = PlaylistSessionStore(
+        config.playlist_db_path,
+        ttl_seconds=config.playlist_session_ttl_seconds,
+        max_tracks=config.max_playlist_tracks,
+    )
     bot = TelegramMusicBot(
         config,
         access_store,
@@ -46,6 +58,7 @@ def build_application(config: TelegramConfig) -> Application:
         coordinator,
         registry,
         media_server,
+        playlist_store,
     )
 
     async def post_init(application: Application) -> None:
@@ -69,6 +82,9 @@ def build_application(config: TelegramConfig) -> Application:
     application.add_handler(CommandHandler("invite", bot.invite))
     application.add_handler(CommandHandler("members", bot.members))
     application.add_handler(CommandHandler("rescan", bot.rescan))
+    application.add_handler(
+        CallbackQueryHandler(bot.handle_playlist_callback, pattern=r"^pl:")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
     application.add_handler(MessageHandler(filters.COMMAND, bot.unknown_command))
     return application

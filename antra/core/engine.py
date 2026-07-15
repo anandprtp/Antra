@@ -1166,7 +1166,7 @@ class DownloadEngine:
                 return index, DownloadResult(
                     track=track,
                     status=DownloadStatus.FAILED,
-                    error=self._output_lost_message,
+                    error_message=self._output_lost_message,
                 )
             if self.controller:
                 self.controller.wait_if_paused()
@@ -1174,7 +1174,7 @@ class DownloadEngine:
                     return index, DownloadResult(
                         track=track,
                         status=DownloadStatus.CANCELLED,
-                        error="Cancelled",
+                        error_message="Cancelled",
                     )
             logger.info(f"[{index + 1}/{total}] {track.artist_string} — {track.title}")
             self._emit(
@@ -1202,7 +1202,7 @@ class DownloadEngine:
                     results[idx] = DownloadResult(
                         track=tracks[idx],
                         status=DownloadStatus.FAILED,
-                        error=self._output_lost_message if self._output_lost.is_set() else str(e),
+                        error_message=self._output_lost_message if self._output_lost.is_set() else str(e),
                     )
                 except Exception as e:
                     idx = futures[future]
@@ -1210,7 +1210,7 @@ class DownloadEngine:
                     results[idx] = DownloadResult(
                         track=tracks[idx],
                         status=DownloadStatus.FAILED,
-                        error=str(e),
+                        error_message=str(e),
                     )
 
         # Fill any slots that were cancelled or never completed
@@ -1220,7 +1220,7 @@ class DownloadEngine:
                 r = DownloadResult(
                     track=tracks[i],
                     status=DownloadStatus.CANCELLED,
-                    error="Cancelled",
+                    error_message="Cancelled",
                 )
             final.append(r)
 
