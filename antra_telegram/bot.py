@@ -2,8 +2,9 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
+from urllib.parse import urlencode
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
@@ -27,6 +28,8 @@ from .playlist_sessions import (
 )
 from .playlist_ui import parse_playlist_callback, render_playlist_page
 from .splitter import AudioSplitError, split_audio_copy
+from .telegram_storage import TelegramStorage
+from .web_sessions import WebSessionStore
 
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,8 @@ class TelegramMusicBot:
         registry: MediaRegistry,
         media_server: MediaServer,
         playlist_store: PlaylistSessionStore,
+        web_session_store: WebSessionStore | None = None,
+        telegram_storage: TelegramStorage | None = None,
     ):
         self.config = config
         self.access_store = access_store
@@ -50,8 +55,11 @@ class TelegramMusicBot:
         self.registry = registry
         self.media_server = media_server
         self.playlist_store = playlist_store
+        self.web_session_store = web_session_store
+        self.telegram_storage = telegram_storage
         self._playlist_action_lock = asyncio.Lock()
         self._playlist_actions: dict[str, set[int]] = {}
+        self._storage_tasks: set[asyncio.Task] = set()
 
     async def _authorize(self, update: Update, *, require_admin: bool = False) -> bool:
         user = update.effective_user
@@ -113,10 +121,21 @@ class TelegramMusicBot:
 
         if not await self._authorize(update):
             return
+        reply_markup = None
+        if self._player_is_ready():
+            player_url = await asyncio.to_thread(
+                self._player_url,
+                update.effective_user.id,
+                None,
+            )
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("▶ Открыть Antra Player", url=player_url)]]
+            )
         await update.effective_message.reply_text(
             "Напишите название песни и исполнителя или отправьте публичную ссылку на "
             "плейлист YouTube Music. Для плейлиста появятся кнопки загрузки каждого "
-            "трека и всех треков сразу."
+            "трека и всех треков сразу.",
+            reply_markup=reply_markup,
         )
 
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -129,8 +148,30 @@ class TelegramMusicBot:
             "/status — проверить состояние бота\n"
             "/files — показать треки в локальной библиотеке\n"
             "/rescan — перечитать локальную музыкальную библиотеку\n"
+            "/player — открыть браузерный музыкальный плеер\n"
             "/invite — создать одноразовую ссылку для нового участника\n"
             "/members — показать администратора и участников"
+        )
+
+    async def player(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorize(update):
+            return
+        if not self._player_is_ready():
+            await update.effective_message.reply_text(
+                "Web-плеер ещё не опубликован."
+            )
+            return
+        user = update.effective_user
+        url = await asyncio.to_thread(
+            self._player_url,
+            user.id,
+            None,
+        )
+        await update.effective_message.reply_text(
+            "Ваша медиатека готова.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("▶ Открыть Antra Player", url=url)]]
+            ),
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -473,6 +514,9 @@ class TelegramMusicBot:
             await self._release_playlist_action(session.token, -1)
 
     async def _deliver(self, message, asset: TrackAsset) -> None:
+        if self.config.delivery_mode == "player" and self._player_is_ready():
+            await self._send_player(message, asset)
+            return
         decision = choose_delivery(
             asset.path,
             self.config.max_upload_bytes,
@@ -554,6 +598,77 @@ class TelegramMusicBot:
             logger.exception("Large audio split/upload failed")
             await notice.edit_text(
                 "Не удалось разделить или отправить большой файл. Подробности записаны в лог."
+            )
+
+    def _player_is_ready(self) -> bool:
+        return bool(
+            self.config.player_url
+            and self.config.public_base_url
+            and self.web_session_store is not None
+        )
+
+    def _player_url(self, user_id: int, media_id: str | None) -> str:
+        if not self._player_is_ready() or self.web_session_store is None:
+            raise RuntimeError("web player is not configured")
+        token = self.web_session_store.issue(user_id)
+        fragment_values = {
+            "token": token,
+            "api": self.config.public_base_url,
+        }
+        if media_id:
+            fragment_values["track"] = media_id
+        return f"{self.config.player_url}/#{urlencode(fragment_values)}"
+
+    async def _send_player(self, message, asset: TrackAsset) -> None:
+        user = message.from_user
+        if user is None:
+            await message.reply_text("Не удалось определить пользователя плеера.")
+            return
+        media_id = self.registry.register(asset)
+        url = await asyncio.to_thread(self._player_url, user.id, media_id)
+        await message.reply_text(
+            f"Сохранено в медиатеку:\n{asset.display_name}",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("▶ Слушать в Antra", url=url)]]
+            ),
+        )
+        if self.telegram_storage is not None:
+            storage_chat_id = (
+                self.config.storage_chat_id
+                or await asyncio.to_thread(self.access_store.admin_id)
+                or message.chat_id
+            )
+            task = asyncio.create_task(
+                self._archive_in_telegram(
+                    message.get_bot(),
+                    asset,
+                    media_id,
+                    storage_chat_id,
+                ),
+                name=f"telegram-storage-{media_id}",
+            )
+            self._storage_tasks.add(task)
+            task.add_done_callback(self._storage_tasks.discard)
+
+    async def _archive_in_telegram(
+        self,
+        bot,
+        asset: TrackAsset,
+        media_id: str,
+        chat_id: int,
+    ) -> None:
+        assert self.telegram_storage is not None
+        try:
+            await self.telegram_storage.archive(
+                bot,
+                asset,
+                track_id=media_id,
+                chat_id=chat_id,
+            )
+        except Exception:
+            logger.exception(
+                "Telegram storage archive failed for media %s",
+                media_id,
             )
 
     async def _send_vlc(self, message, asset: TrackAsset) -> None:

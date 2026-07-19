@@ -18,6 +18,9 @@ from .library import LibraryIndex
 from .media import MediaRegistry, MediaServer
 from .playlist_sessions import PlaylistSessionStore
 from .security import LinkSigner
+from .storage_db import StorageCatalog
+from .telegram_storage import TelegramStorage
+from .web_sessions import WebSessionStore
 
 
 def build_application(config: TelegramConfig) -> Application:
@@ -27,6 +30,10 @@ def build_application(config: TelegramConfig) -> Application:
     signer = LinkSigner(config.link_secret)
     registry = MediaRegistry(config.library_dir, config.link_secret)
     registry.refresh()
+    web_session_store = WebSessionStore(
+        config.web_sessions_db_path,
+        default_ttl_seconds=config.web_session_ttl_seconds,
+    )
     media_server = MediaServer(
         registry=registry,
         signer=signer,
@@ -34,6 +41,9 @@ def build_application(config: TelegramConfig) -> Application:
         bind_host=config.bind_host,
         bind_port=config.bind_port,
         link_ttl_seconds=config.link_ttl_seconds,
+        web_session_store=web_session_store,
+        cors_allowed_origins=(config.player_url,) if config.player_url else (),
+        web_link_ttl_seconds=min(config.web_session_ttl_seconds, 86_400),
     )
     resolver = MusicResolver(config, library)
     coordinator = JobCoordinator(
@@ -51,6 +61,12 @@ def build_application(config: TelegramConfig) -> Application:
         ttl_seconds=config.playlist_session_ttl_seconds,
         max_tracks=config.max_playlist_tracks,
     )
+    telegram_storage = None
+    if config.storage_enabled:
+        telegram_storage = TelegramStorage(
+            StorageCatalog(config.storage_db_path),
+            part_bytes=config.storage_part_bytes,
+        )
     bot = TelegramMusicBot(
         config,
         access_store,
@@ -59,6 +75,8 @@ def build_application(config: TelegramConfig) -> Application:
         registry,
         media_server,
         playlist_store,
+        web_session_store=web_session_store,
+        telegram_storage=telegram_storage,
     )
 
     async def post_init(application: Application) -> None:
@@ -82,6 +100,7 @@ def build_application(config: TelegramConfig) -> Application:
     application.add_handler(CommandHandler("invite", bot.invite))
     application.add_handler(CommandHandler("members", bot.members))
     application.add_handler(CommandHandler("rescan", bot.rescan))
+    application.add_handler(CommandHandler("player", bot.player))
     application.add_handler(
         CallbackQueryHandler(bot.handle_playlist_callback, pattern=r"^pl:")
     )

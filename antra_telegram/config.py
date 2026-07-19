@@ -42,6 +42,16 @@ def _allowed_user_ids(raw: str) -> frozenset[int]:
     return frozenset(values)
 
 
+def _optional_int(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+
+
 @dataclass(frozen=True)
 class TelegramConfig:
     bot_token: str
@@ -65,6 +75,13 @@ class TelegramConfig:
     max_concurrent_jobs: int = 1
     max_pending_jobs: int = 20
     public_base_url: str = ""
+    player_url: str = ""
+    web_sessions_db_path: Path = Path(".antra_telegram_web.sqlite3")
+    web_session_ttl_seconds: int = 2_592_000
+    storage_enabled: bool = False
+    storage_chat_id: int | None = None
+    storage_db_path: Path = Path(".antra_telegram_storage.sqlite3")
+    storage_part_bytes: int = 18_000_000
     link_secret: bytes = b""
     link_ttl_seconds: int = 86_400
     bind_host: str = "127.0.0.1"
@@ -90,8 +107,10 @@ class TelegramConfig:
             raise ConfigError("ANTRA_TELEGRAM_RESOLVE_MODE must be 'library' or 'download'")
 
         delivery_mode = os.getenv("ANTRA_TELEGRAM_DELIVERY_MODE", "auto").strip().lower()
-        if delivery_mode not in {"auto", "audio", "vlc"}:
-            raise ConfigError("ANTRA_TELEGRAM_DELIVERY_MODE must be auto, audio, or vlc")
+        if delivery_mode not in {"auto", "audio", "vlc", "player"}:
+            raise ConfigError(
+                "ANTRA_TELEGRAM_DELIVERY_MODE must be auto, audio, vlc, or player"
+            )
 
         public_base_url = os.getenv("ANTRA_TELEGRAM_PUBLIC_BASE_URL", "").strip().rstrip("/")
         secret_text = os.getenv("ANTRA_TELEGRAM_LINK_SECRET", "").strip()
@@ -112,6 +131,24 @@ class TelegramConfig:
                 raise ConfigError(
                     "ANTRA_TELEGRAM_LINK_SECRET must be a unique secret of at least 32 characters when VLC links are enabled"
                 )
+        player_url = os.getenv("ANTRA_TELEGRAM_PLAYER_URL", "").strip().rstrip("/")
+        if player_url:
+            parsed_player_url = urlparse(player_url)
+            if (
+                parsed_player_url.scheme != "https"
+                or not parsed_player_url.netloc
+                or parsed_player_url.username
+                or parsed_player_url.password
+                or parsed_player_url.query
+                or parsed_player_url.fragment
+            ):
+                raise ConfigError(
+                    "ANTRA_TELEGRAM_PLAYER_URL must be an HTTPS origin without credentials, query, or fragment"
+                )
+            if not public_base_url:
+                raise ConfigError(
+                    "ANTRA_TELEGRAM_PUBLIC_BASE_URL is required when the web player is enabled"
+                )
 
         library_dir = Path(
             os.getenv(
@@ -131,6 +168,15 @@ class TelegramConfig:
         max_playlist_tracks = _positive_int("ANTRA_TELEGRAM_MAX_PLAYLIST_TRACKS", 100)
         if max_playlist_tracks > 500:
             raise ConfigError("ANTRA_TELEGRAM_MAX_PLAYLIST_TRACKS must not exceed 500")
+        storage_enabled = _boolean("ANTRA_TELEGRAM_STORAGE_ENABLED", False)
+        storage_part_bytes = _positive_int(
+            "ANTRA_TELEGRAM_STORAGE_PART_BYTES",
+            18_000_000,
+        )
+        if storage_enabled and storage_part_bytes > 19_000_000:
+            raise ConfigError(
+                "ANTRA_TELEGRAM_STORAGE_PART_BYTES must not exceed 19000000 in cloud mode"
+            )
 
         return cls(
             bot_token=token,
@@ -162,6 +208,26 @@ class TelegramConfig:
             max_concurrent_jobs=_positive_int("ANTRA_TELEGRAM_MAX_CONCURRENT_JOBS", 1),
             max_pending_jobs=_positive_int("ANTRA_TELEGRAM_MAX_PENDING_JOBS", 20),
             public_base_url=public_base_url,
+            player_url=player_url,
+            web_sessions_db_path=Path(
+                os.getenv(
+                    "ANTRA_TELEGRAM_WEB_SESSIONS_DB",
+                    str(access_db_path.with_name("web_sessions.sqlite3")),
+                )
+            ).expanduser().resolve(),
+            web_session_ttl_seconds=_positive_int(
+                "ANTRA_TELEGRAM_WEB_SESSION_TTL_SECONDS",
+                2_592_000,
+            ),
+            storage_enabled=storage_enabled,
+            storage_chat_id=_optional_int("ANTRA_TELEGRAM_STORAGE_CHAT_ID"),
+            storage_db_path=Path(
+                os.getenv(
+                    "ANTRA_TELEGRAM_STORAGE_DB",
+                    str(access_db_path.with_name("telegram_storage.sqlite3")),
+                )
+            ).expanduser().resolve(),
+            storage_part_bytes=storage_part_bytes,
             link_secret=(secret_text or secrets.token_urlsafe(32)).encode("utf-8"),
             link_ttl_seconds=_positive_int("ANTRA_TELEGRAM_LINK_TTL_SECONDS", 86_400),
             bind_host=os.getenv("ANTRA_TELEGRAM_BIND_HOST", "127.0.0.1").strip(),

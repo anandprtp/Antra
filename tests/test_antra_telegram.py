@@ -1,9 +1,11 @@
 import asyncio
 import concurrent.futures
+import hashlib
 import os
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer
 from telegram.ext import CallbackQueryHandler
@@ -33,6 +35,12 @@ from antra_telegram.playlist_ui import parse_playlist_callback, render_playlist_
 from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
 from antra_telegram.splitter import estimate_segment_seconds
+from antra_telegram.storage_db import StorageCatalog
+from antra_telegram.telegram_storage import TelegramStorage, copy_part
+from antra_telegram.tunnel_supervisor import (
+    QUICK_TUNNEL_URL,
+    update_dotenv_value,
+)
 
 
 SECRET = b"test-secret-that-is-long-enough-123456"
@@ -668,6 +676,7 @@ def test_application_registers_playlist_callback_handler(tmp_path: Path):
         library_dir=tmp_path / "Music",
         access_db_path=tmp_path / "access.sqlite3",
         playlist_db_path=tmp_path / "playlist.sqlite3",
+        web_sessions_db_path=tmp_path / "web-sessions.sqlite3",
         resolve_mode="download",
         link_secret=SECRET,
     )
@@ -760,6 +769,136 @@ def test_large_audio_segment_estimate_keeps_upload_margin():
     estimated_part_bytes = 123_000_000 * segment_seconds / 7_223
     assert 60 <= segment_seconds < 7_223
     assert estimated_part_bytes <= 49_000_000 * 0.83
+
+
+def test_telegram_storage_archives_restorable_cloud_parts(tmp_path: Path):
+    async def scenario():
+        source = tmp_path / "Music" / "Artist" / "Album" / "01 - Track.webm"
+        source.parent.mkdir(parents=True)
+        payload = (b"telegram-storage-payload-" * 11) + b"done"
+        source.write_bytes(payload)
+        asset = TrackAsset(
+            source,
+            "Track",
+            "Artist",
+            "Album",
+            duration_seconds=120,
+        )
+        sent_payloads = []
+
+        class FakeBot:
+            async def send_document(self, chat_id, document, **kwargs):
+                content = document.read()
+                sent_payloads.append(content)
+                index = len(sent_payloads)
+                return SimpleNamespace(
+                    chat_id=chat_id,
+                    message_id=100 + index,
+                    document=SimpleNamespace(
+                        file_id=f"file-{index}",
+                        file_unique_id=f"unique-{index}",
+                    ),
+                )
+
+        catalog = StorageCatalog(tmp_path / "storage.sqlite3")
+        storage = TelegramStorage(catalog, part_bytes=41)
+        uploaded = await storage.archive(
+            FakeBot(),
+            asset,
+            track_id="opaque-track-id",
+            chat_id=123,
+        )
+
+        assert uploaded is True
+        assert b"".join(sent_payloads) == payload
+        assert all(len(part) <= 41 for part in sent_payloads)
+        assert catalog.is_ready(
+            "opaque-track-id",
+            hashlib.sha256(payload).hexdigest(),
+        )
+        parts = catalog.parts_for("opaque-track-id")
+        assert [part.byte_offset for part in parts] == [
+            index * 41 for index in range(len(parts))
+        ]
+        assert [part.file_id for part in parts] == [
+            f"file-{index}" for index in range(1, len(parts) + 1)
+        ]
+
+        uploaded_again = await storage.archive(
+            FakeBot(),
+            asset,
+            track_id="opaque-track-id",
+            chat_id=123,
+        )
+        assert uploaded_again is False
+
+    asyncio.run(scenario())
+
+
+def test_copy_part_preserves_exact_byte_range(tmp_path: Path):
+    source = tmp_path / "source.bin"
+    destination = tmp_path / "part.bin"
+    source.write_bytes(bytes(range(100)))
+
+    written, digest = copy_part(
+        source,
+        destination,
+        offset=23,
+        length=41,
+    )
+
+    assert written == 41
+    assert destination.read_bytes() == bytes(range(23, 64))
+    assert digest == hashlib.sha256(destination.read_bytes()).hexdigest()
+
+
+def test_tunnel_supervisor_updates_only_public_origin(tmp_path: Path):
+    env_file = tmp_path / ".env.telegram"
+    env_file.write_text(
+        "ANTRA_TELEGRAM_BOT_TOKEN=private-token\n"
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL=https://old.example\n",
+        encoding="utf-8",
+    )
+
+    assert update_dotenv_value(
+        env_file,
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL",
+        "https://music-test.trycloudflare.com",
+    )
+    assert not update_dotenv_value(
+        env_file,
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL",
+        "https://music-test.trycloudflare.com",
+    )
+    assert env_file.read_text(encoding="utf-8") == (
+        "ANTRA_TELEGRAM_BOT_TOKEN=private-token\n"
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL=https://music-test.trycloudflare.com\n"
+    )
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert QUICK_TUNNEL_URL.search(
+        "INF https://music-test.trycloudflare.com is ready"
+    )
+
+
+def test_config_rejects_cloud_storage_parts_over_getfile_limit(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("ANTRA_TELEGRAM_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setenv("ANTRA_TELEGRAM_STORAGE_ENABLED", "true")
+    monkeypatch.setenv("ANTRA_TELEGRAM_STORAGE_PART_BYTES", "19000001")
+    monkeypatch.delenv("ANTRA_TELEGRAM_PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTRA_TELEGRAM_PLAYER_URL", raising=False)
+    monkeypatch.delenv("ANTRA_TELEGRAM_LINK_SECRET", raising=False)
+
+    try:
+        TelegramConfig.from_env()
+    except ConfigError as exc:
+        assert "19000000" in str(exc)
+    else:
+        raise AssertionError("oversized Telegram storage parts must be rejected")
 
 
 def test_service_search_track_is_public_and_marks_single_request():

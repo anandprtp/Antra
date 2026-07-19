@@ -1,17 +1,27 @@
 import base64
 import hashlib
 import hmac
+import json
 import mimetypes
+import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit
 
 from aiohttp import web
 
-from .library import SUPPORTED_AUDIO_EXTENSIONS, inspect_track
+from .library import SUPPORTED_AUDIO_EXTENSIONS, inspect_track, normalize_query
 from .models import TrackAsset
 from .playlists import render_m3u8
 from .security import LinkSigner
+from .web_sessions import (
+    PlayerStateConflict,
+    WebIdentity,
+    WebSessionStore,
+    WebSessionStoreError,
+    validate_player_state,
+)
 
 
 class MediaRegistry:
@@ -21,6 +31,7 @@ class MediaRegistry:
         self.root = root.expanduser().resolve()
         self._secret = secret
         self._assets: dict[str, TrackAsset] = {}
+        self._lock = threading.RLock()
 
     def _id_for(self, path: Path) -> str:
         relative = path.resolve().relative_to(self.root).as_posix().encode("utf-8")
@@ -37,7 +48,7 @@ class MediaRegistry:
         if not resolved.is_file():
             raise FileNotFoundError(resolved)
         media_id = self._id_for(resolved)
-        self._assets[media_id] = TrackAsset(
+        registered = TrackAsset(
             path=resolved,
             title=asset.title,
             artist=asset.artist,
@@ -45,18 +56,38 @@ class MediaRegistry:
             duration_seconds=asset.duration_seconds,
             source=asset.source,
         )
+        with self._lock:
+            self._assets[media_id] = registered
         return media_id
 
     def refresh(self) -> int:
         self.root.mkdir(parents=True, exist_ok=True)
-        self._assets.clear()
+        refreshed: dict[str, TrackAsset] = {}
         for path in sorted(self.root.rglob("*")):
             if path.is_file() and path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS:
-                self.register(path)
-        return len(self._assets)
+                asset = inspect_track(self.root, path)
+                resolved = asset.path.expanduser().resolve()
+                try:
+                    resolved.relative_to(self.root)
+                except ValueError:
+                    continue
+                if not resolved.is_file():
+                    continue
+                refreshed[self._id_for(resolved)] = TrackAsset(
+                    path=resolved,
+                    title=asset.title,
+                    artist=asset.artist,
+                    album=asset.album,
+                    duration_seconds=asset.duration_seconds,
+                    source=asset.source,
+                )
+        with self._lock:
+            self._assets = refreshed
+        return len(refreshed)
 
     def get(self, media_id: str) -> TrackAsset | None:
-        asset = self._assets.get(media_id)
+        with self._lock:
+            asset = self._assets.get(media_id)
         if asset is None:
             return None
         try:
@@ -75,6 +106,24 @@ class MediaRegistry:
             source=asset.source,
         )
 
+    def list_assets(self) -> list[tuple[str, TrackAsset]]:
+        with self._lock:
+            media_ids = tuple(self._assets)
+        assets = [
+            (media_id, asset)
+            for media_id in media_ids
+            if (asset := self.get(media_id)) is not None
+        ]
+        return sorted(
+            assets,
+            key=lambda item: (
+                item[1].artist.casefold(),
+                item[1].album.casefold(),
+                item[1].title.casefold(),
+                item[0],
+            ),
+        )
+
 
 class MediaServer:
     def __init__(
@@ -85,25 +134,88 @@ class MediaServer:
         bind_host: str,
         bind_port: int,
         link_ttl_seconds: int,
+        web_session_store: WebSessionStore | None = None,
+        cors_allowed_origins: tuple[str, ...] | list[str] = (),
+        web_link_ttl_seconds: int = 3600,
     ):
+        if web_link_ttl_seconds <= 0:
+            raise ValueError("web_link_ttl_seconds must be positive")
         self.registry = registry
         self.signer = signer
         self.public_base_url = public_base_url.rstrip("/")
         self.bind_host = bind_host
         self.bind_port = bind_port
         self.link_ttl_seconds = link_ttl_seconds
+        self.web_session_store = web_session_store
+        self.cors_allowed_origins = frozenset(
+            _normalize_origin(origin) for origin in cors_allowed_origins
+        )
+        self.web_link_ttl_seconds = web_link_ttl_seconds
         self._runner: web.AppRunner | None = None
 
     def create_app(self) -> web.Application:
-        app = web.Application()
+        def apply_cors_headers(
+            response: web.StreamResponse,
+            origin: str,
+        ) -> None:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = _append_vary(
+                response.headers.get("Vary"),
+                "Origin",
+            )
+            response.headers["Access-Control-Allow-Methods"] = (
+                "GET, HEAD, PUT, OPTIONS"
+            )
+            response.headers["Access-Control-Allow-Headers"] = (
+                "Authorization, Content-Type"
+            )
+            response.headers["Access-Control-Max-Age"] = "600"
+
+        @web.middleware
+        async def cors_middleware(request: web.Request, handler):
+            origin = request.headers.get("Origin")
+            if origin and not self._origin_allowed(request, origin):
+                return web.json_response(
+                    {"error": "origin_not_allowed"},
+                    status=403,
+                )
+            if request.method == "OPTIONS":
+                response: web.StreamResponse = web.Response(status=204)
+            else:
+                try:
+                    response = await handler(request)
+                except web.HTTPException as exc:
+                    if origin:
+                        apply_cors_headers(exc, origin)
+                    raise
+            if origin:
+                apply_cors_headers(response, origin)
+            return response
+
+        app = web.Application(
+            client_max_size=256 * 1024,
+            middlewares=[cors_middleware],
+        )
         app.router.add_get("/playlist/{media_id}.m3u8", self._playlist)
         app.router.add_get("/media/{media_id}", self._media)
+        if self.web_session_store is not None:
+            app.router.add_get("/api/v1/health", self._api_health)
+            app.router.add_get("/api/v1/tracks", self._api_tracks)
+            app.router.add_get("/api/v1/me", self._api_me)
+            app.router.add_get("/api/v1/player-state", self._api_player_state)
+            app.router.add_put("/api/v1/player-state", self._api_save_player_state)
+            app.router.add_get(
+                "/api/v1/tracks/{media_id}/stream",
+                self._api_stream,
+            )
+            app.router.add_route("OPTIONS", "/api/{tail:.*}", self._api_options)
         return app
 
     async def start(self) -> None:
         if not self.public_base_url:
             return
-        self._runner = web.AppRunner(self.create_app())
+        # Signed stream URLs are credentials; keep them out of process logs.
+        self._runner = web.AppRunner(self.create_app(), access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.bind_host, self.bind_port)
         await site.start()
@@ -161,11 +273,199 @@ class MediaServer:
 
     async def _media(self, request: web.Request) -> web.StreamResponse:
         asset = self._authorize(request, "media")
+        return self._file_response(asset)
+
+    def _file_response(self, asset: TrackAsset) -> web.FileResponse:
         content_type = mimetypes.guess_type(asset.path.name)[0] or "application/octet-stream"
         response = web.FileResponse(asset.path, headers={"Cache-Control": "private, no-store"})
         response.content_type = content_type
         response.headers["Content-Disposition"] = _content_disposition(asset.path.name)
         return response
+
+    def _origin_allowed(self, request: web.Request, origin: str) -> bool:
+        try:
+            normalized = _normalize_origin(origin)
+        except ValueError:
+            return False
+        request_origin = _normalize_origin(f"{request.scheme}://{request.host}")
+        public_origin = (
+            _url_origin(self.public_base_url)
+            if self.public_base_url
+            else request_origin
+        )
+        return normalized in self.cors_allowed_origins or normalized in {
+            request_origin,
+            public_origin,
+        }
+
+    def _require_web_identity(self, request: web.Request) -> WebIdentity:
+        if self.web_session_store is None:
+            raise web.HTTPServiceUnavailable(text="web sessions are not configured")
+        authorization = request.headers.get("Authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if separator != " " or scheme.casefold() != "bearer" or not token:
+            raise web.HTTPUnauthorized(
+                text="bearer session required",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        try:
+            identity = self.web_session_store.authenticate(token)
+        except WebSessionStoreError as exc:
+            raise web.HTTPServiceUnavailable(text="session store unavailable") from exc
+        if identity is None:
+            raise web.HTTPUnauthorized(
+                text="invalid or expired session",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return identity
+
+    def _stream_url(
+        self,
+        request: web.Request,
+        media_id: str,
+        *,
+        now: int | None = None,
+    ) -> tuple[str, int]:
+        current = int(time.time()) if now is None else now
+        expires_at = current + self.web_link_ttl_seconds
+        signature = self.signer.signature("web-stream", media_id, expires_at)
+        base_url = self.public_base_url or f"{request.scheme}://{request.host}"
+        query = urlencode({"exp": expires_at, "sig": signature})
+        encoded_id = quote(media_id, safe="")
+        return (
+            f"{base_url.rstrip('/')}/api/v1/tracks/{encoded_id}/stream?{query}",
+            expires_at,
+        )
+
+    def _track_payload(
+        self,
+        request: web.Request,
+        media_id: str,
+        asset: TrackAsset,
+    ) -> dict[str, object]:
+        stream_url, expires_at = self._stream_url(request, media_id)
+        try:
+            size_bytes: int | None = asset.path.stat().st_size
+        except OSError:
+            size_bytes = None
+        return {
+            "id": media_id,
+            "title": asset.title,
+            "artist": asset.artist,
+            "album": asset.album,
+            "duration_seconds": asset.duration_seconds,
+            "source": asset.source,
+            "format": asset.path.suffix.casefold().lstrip("."),
+            "mime_type": (
+                mimetypes.guess_type(asset.path.name)[0]
+                or "application/octet-stream"
+            ),
+            "size_bytes": size_bytes,
+            "availability": "ready",
+            "stream_url": stream_url,
+            "stream_expires_at": expires_at,
+        }
+
+    async def _api_health(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "status": "ok",
+                "tracks": len(self.registry.list_assets()),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async def _api_tracks(self, request: web.Request) -> web.Response:
+        self._require_web_identity(request)
+        query = " ".join(request.query.get("q", "").split())
+        if len(query) > 200:
+            raise web.HTTPBadRequest(text="query is too long")
+        try:
+            limit = int(request.query.get("limit", "50"))
+            offset = int(request.query.get("offset", "0"))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="invalid pagination") from exc
+        if limit < 1 or limit > 100 or offset < 0:
+            raise web.HTTPBadRequest(text="invalid pagination")
+
+        entries = self.registry.list_assets()
+        if query:
+            entries = _search_entries(entries, query)
+        total = len(entries)
+        selected = entries[offset : offset + limit]
+        return web.json_response(
+            {
+                "items": [
+                    self._track_payload(request, media_id, asset)
+                    for media_id, asset in selected
+                ],
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            },
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    async def _api_me(self, request: web.Request) -> web.Response:
+        identity = self._require_web_identity(request)
+        return web.json_response(
+            {
+                "user_id": identity.user_id,
+                "role": identity.role,
+                "session_expires_at": identity.expires_at,
+            },
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    async def _api_player_state(self, request: web.Request) -> web.Response:
+        identity = self._require_web_identity(request)
+        assert self.web_session_store is not None
+        try:
+            state = self.web_session_store.get_player_state(identity.user_id)
+        except WebSessionStoreError as exc:
+            raise web.HTTPServiceUnavailable(text="player state unavailable") from exc
+        return web.json_response(
+            state.to_dict(),
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    async def _api_save_player_state(self, request: web.Request) -> web.Response:
+        identity = self._require_web_identity(request)
+        assert self.web_session_store is not None
+        try:
+            body = await request.json()
+            state = validate_player_state(
+                body,
+                max_queue_items=self.web_session_store.max_queue_items,
+            )
+            saved = self.web_session_store.save_player_state(
+                identity.user_id,
+                state,
+                expected_revision=state.revision,
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise web.HTTPBadRequest(text="invalid player state") from exc
+        except PlayerStateConflict as exc:
+            return web.json_response(
+                {
+                    "error": "revision_conflict",
+                    "current": exc.current.to_dict(),
+                },
+                status=409,
+            )
+        except WebSessionStoreError as exc:
+            raise web.HTTPServiceUnavailable(text="player state unavailable") from exc
+        return web.json_response(
+            saved.to_dict(),
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    async def _api_stream(self, request: web.Request) -> web.StreamResponse:
+        asset = self._authorize(request, "web-stream")
+        return self._file_response(asset)
+
+    async def _api_options(self, request: web.Request) -> web.Response:
+        return web.Response(status=204)
 
 
 def _content_disposition(filename: str) -> str:
@@ -174,3 +474,59 @@ def _content_disposition(filename: str) -> str:
     ascii_name = ascii_name.replace("\\", "_").replace('"', "_")
     encoded_name = quote(cleaned, safe="")
     return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
+
+
+def _normalize_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("invalid origin")
+    if parsed.username or parsed.password or parsed.path not in {"", "/"}:
+        raise ValueError("invalid origin")
+    if parsed.query or parsed.fragment:
+        raise ValueError("invalid origin")
+    return f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}"
+
+
+def _url_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("invalid URL origin")
+    if parsed.username or parsed.password:
+        raise ValueError("invalid URL origin")
+    return f"{parsed.scheme.casefold()}://{parsed.netloc.casefold()}"
+
+
+def _append_vary(existing: str | None, value: str) -> str:
+    values = [item.strip() for item in (existing or "").split(",") if item.strip()]
+    if value.casefold() not in {item.casefold() for item in values}:
+        values.append(value)
+    return ", ".join(values)
+
+
+def _search_entries(
+    entries: list[tuple[str, TrackAsset]],
+    query: str,
+) -> list[tuple[str, TrackAsset]]:
+    normalized = normalize_query(query)
+    if not normalized:
+        return entries
+    query_tokens = set(normalized.split())
+    scored: list[tuple[float, str, str, TrackAsset]] = []
+    for media_id, asset in entries:
+        title = normalize_query(asset.title)
+        primary = normalize_query(f"{asset.artist} {asset.title}")
+        searchable = normalize_query(
+            f"{asset.artist} {asset.title} {asset.album} {asset.path.stem}"
+        )
+        searchable_tokens = set(searchable.split())
+        overlap = len(query_tokens & searchable_tokens) / max(1, len(query_tokens))
+        ratio = max(
+            SequenceMatcher(None, normalized, primary).ratio(),
+            SequenceMatcher(None, normalized, title).ratio(),
+        )
+        contains = 1.0 if normalized in searchable else 0.0
+        score = (0.50 * overlap) + (0.35 * ratio) + (0.15 * contains)
+        if score >= 0.42:
+            scored.append((score, asset.display_name.casefold(), media_id, asset))
+    scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return [(media_id, asset) for _, _, media_id, asset in scored]
