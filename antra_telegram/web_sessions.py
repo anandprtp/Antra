@@ -29,6 +29,13 @@ class WebIdentity:
 
 
 @dataclass(frozen=True)
+class PlayerLaunch:
+    user_id: int
+    role: str
+    media_id: str | None
+
+
+@dataclass(frozen=True)
 class PlayerState:
     queue_ids: tuple[str, ...] = ()
     current_id: str | None = None
@@ -159,6 +166,16 @@ class WebSessionStore:
                     CREATE INDEX IF NOT EXISTS web_sessions_user_id
                         ON web_sessions(user_id);
 
+                    CREATE TABLE IF NOT EXISTS player_launches (
+                        token_hash TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        media_id TEXT,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL,
+                        consumed_at INTEGER
+                    );
+
                     CREATE TABLE IF NOT EXISTS player_states (
                         user_id INTEGER PRIMARY KEY,
                         queue_json TEXT NOT NULL,
@@ -277,6 +294,115 @@ class WebSessionStore:
         except sqlite3.Error as exc:
             raise WebSessionStoreError("failed to revoke user sessions") from exc
         return max(0, cursor.rowcount)
+
+    def issue_launch(
+        self,
+        user_id: int,
+        *,
+        role: str = "member",
+        media_id: str | None = None,
+        ttl_seconds: int = 300,
+        now: int | None = None,
+    ) -> str:
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
+        if role not in {"admin", "member"}:
+            raise ValueError("role must be admin or member")
+        if media_id is not None and (
+            not isinstance(media_id, str)
+            or not media_id
+            or len(media_id) > 128
+        ):
+            raise ValueError("media_id is invalid")
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+
+        current = int(time.time()) if now is None else now
+        token = secrets.token_urlsafe(32)
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM player_launches WHERE expires_at < ? OR consumed_at IS NOT NULL",
+                    (current,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO player_launches (
+                        token_hash, user_id, role, media_id, created_at,
+                        expires_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        self._token_hash(token),
+                        user_id,
+                        role,
+                        media_id,
+                        current,
+                        current + ttl_seconds,
+                    ),
+                )
+        except sqlite3.Error as exc:
+            raise WebSessionStoreError("failed to issue player launch") from exc
+        return token
+
+    def consume_launch(
+        self,
+        token: str,
+        *,
+        now: int | None = None,
+    ) -> PlayerLaunch | None:
+        if not isinstance(token, str) or not token or len(token) > 128:
+            return None
+        current = int(time.time()) if now is None else now
+        try:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM player_launches WHERE expires_at < ? OR consumed_at IS NOT NULL",
+                    (current,),
+                )
+                row = connection.execute(
+                    """
+                    SELECT user_id, role, media_id
+                    FROM player_launches
+                    WHERE token_hash = ? AND consumed_at IS NULL AND expires_at >= ?
+                    """,
+                    (self._token_hash(token), current),
+                ).fetchone()
+                if row is None:
+                    connection.commit()
+                    return None
+                updated = connection.execute(
+                    """
+                    UPDATE player_launches
+                    SET consumed_at = ?
+                    WHERE token_hash = ? AND consumed_at IS NULL AND expires_at >= ?
+                    """,
+                    (current, self._token_hash(token), current),
+                )
+                if updated.rowcount != 1:
+                    connection.rollback()
+                    return None
+                role = str(row["role"])
+                if role not in {"admin", "member"}:
+                    raise WebSessionStoreError("stored player launch role is invalid")
+                launch = PlayerLaunch(
+                    user_id=int(row["user_id"]),
+                    role=role,
+                    media_id=str(row["media_id"]) if row["media_id"] else None,
+                )
+                connection.commit()
+                return launch
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        except WebSessionStoreError:
+            raise
+        except sqlite3.Error as exc:
+            raise WebSessionStoreError("failed to consume player launch") from exc
 
     def get_player_state(self, user_id: int) -> PlayerState:
         try:

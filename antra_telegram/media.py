@@ -174,6 +174,7 @@ class MediaServer:
         cors_allowed_origins: tuple[str, ...] | list[str] = (),
         web_link_ttl_seconds: int = 3600,
         player_upstream_url: str = "",
+        player_base_url: str = "",
     ):
         if web_link_ttl_seconds <= 0:
             raise ValueError("web_link_ttl_seconds must be positive")
@@ -193,6 +194,11 @@ class MediaServer:
             if player_upstream_url
             else ""
         )
+        self.player_base_url = (
+            _normalize_origin(player_base_url)
+            if player_base_url
+            else self.public_base_url
+        )
         self._runner: web.AppRunner | None = None
 
     def create_app(self) -> web.Application:
@@ -206,7 +212,7 @@ class MediaServer:
                 "Origin",
             )
             response.headers["Access-Control-Allow-Methods"] = (
-                "GET, HEAD, PUT, OPTIONS"
+                "GET, HEAD, POST, PUT, OPTIONS"
             )
             response.headers["Access-Control-Allow-Headers"] = (
                 "Authorization, Content-Type"
@@ -246,6 +252,10 @@ class MediaServer:
             app.router.add_get("/api/v1/health", self._api_health)
             app.router.add_get("/api/v1/tracks", self._api_tracks)
             app.router.add_get("/api/v1/me", self._api_me)
+            app.router.add_post(
+                "/api/v1/player-launch",
+                self._api_player_launch,
+            )
             app.router.add_get("/api/v1/player-state", self._api_player_state)
             app.router.add_put("/api/v1/player-state", self._api_save_player_state)
             app.router.add_get(
@@ -471,6 +481,43 @@ class MediaServer:
                 "user_id": identity.user_id,
                 "role": identity.role,
                 "session_expires_at": identity.expires_at,
+            },
+            headers={"Cache-Control": "private, no-store"},
+        )
+
+    async def _api_player_launch(self, request: web.Request) -> web.Response:
+        assert self.web_session_store is not None
+        try:
+            body = await request.json()
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise web.HTTPBadRequest(text="invalid player launch") from exc
+        launch_token = body.get("launch") if isinstance(body, dict) else None
+        if (
+            not isinstance(launch_token, str)
+            or not launch_token
+            or len(launch_token) > 128
+        ):
+            raise web.HTTPBadRequest(text="invalid player launch")
+        try:
+            launch = self.web_session_store.consume_launch(launch_token)
+            if launch is None:
+                raise web.HTTPUnauthorized(text="invalid or expired player launch")
+            session_token = self.web_session_store.issue(
+                launch.user_id,
+                role=launch.role,
+            )
+        except WebSessionStoreError as exc:
+            raise web.HTTPServiceUnavailable(text="session store unavailable") from exc
+
+        fragment_values = {
+            "token": session_token,
+            "api": self.public_base_url,
+        }
+        if launch.media_id:
+            fragment_values["track"] = launch.media_id
+        return web.json_response(
+            {
+                "url": f"{self.player_base_url}/#{urlencode(fragment_values)}",
             },
             headers={"Cache-Control": "private, no-store"},
         )

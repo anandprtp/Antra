@@ -22,25 +22,32 @@ from antra_telegram.web_sessions import (
 SECRET = b"player-api-test-secret-that-is-long-enough"
 
 
-def test_bot_player_link_keeps_credentials_in_fragment(tmp_path: Path):
+def test_bot_player_link_uses_one_time_launch_instead_of_bearer_token(
+    tmp_path: Path,
+):
     sessions = WebSessionStore(tmp_path / "web.sqlite3")
     bot = TelegramMusicBot.__new__(TelegramMusicBot)
     bot.config = SimpleNamespace(
         player_url="https://player.example",
         public_base_url="https://music.example",
+        web_session_ttl_seconds=2_592_000,
     )
     bot.web_session_store = sessions
 
     url = bot._player_url(777, "opaque-track")
     parsed = urlsplit(url)
-    fragment = dict(parse_qsl(parsed.fragment))
+    query = dict(parse_qsl(parsed.query))
 
     assert parsed.scheme == "https"
     assert parsed.netloc == "player.example"
-    assert parsed.query == ""
-    assert fragment["api"] == "https://music.example"
-    assert fragment["track"] == "opaque-track"
-    assert sessions.authenticate(fragment["token"]).user_id == 777
+    assert parsed.path == "/open"
+    assert parsed.fragment == ""
+    assert set(query) == {"launch"}
+    launch = sessions.consume_launch(query["launch"])
+    assert launch is not None
+    assert launch.user_id == 777
+    assert launch.media_id == "opaque-track"
+    assert sessions.consume_launch(query["launch"]) is None
 
 
 def test_web_sessions_are_hashed_expiring_and_revocable(tmp_path: Path):
@@ -159,6 +166,7 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             web_session_store=sessions,
             cors_allowed_origins=("https://player.example",),
             web_link_ttl_seconds=120,
+            player_base_url="https://player.example",
         )
         client = TestClient(TestServer(server.create_app()))
         await client.start_server()
@@ -173,6 +181,29 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             )
             assert response.status == 200
             assert await response.json() == {"status": "ok", "tracks": 2}
+
+            launch_token = sessions.issue_launch(777, role="admin")
+            response = await client.post(
+                "/api/v1/player-launch",
+                headers={"Origin": "https://player.example"},
+                json={"launch": launch_token},
+            )
+            assert response.status == 200
+            launch_payload = await response.json()
+            launched = urlsplit(launch_payload["url"])
+            launched_fragment = dict(parse_qsl(launched.fragment))
+            assert launched.scheme == "https"
+            assert launched.netloc == "player.example"
+            assert launched.query == ""
+            assert launched_fragment["api"] == "https://music.example"
+            assert sessions.authenticate(launched_fragment["token"]).user_id == 777
+
+            response = await client.post(
+                "/api/v1/player-launch",
+                headers={"Origin": "https://player.example"},
+                json={"launch": launch_token},
+            )
+            assert response.status == 401
 
             response = await client.get("/api/v1/tracks")
             assert response.status == 401

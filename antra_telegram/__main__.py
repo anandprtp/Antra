@@ -45,6 +45,7 @@ def build_application(config: TelegramConfig) -> Application:
         cors_allowed_origins=(config.player_url,) if config.player_url else (),
         web_link_ttl_seconds=min(config.web_session_ttl_seconds, 86_400),
         player_upstream_url=config.player_upstream_url,
+        player_base_url=config.player_url,
     )
     resolver = MusicResolver(config, library)
     coordinator = JobCoordinator(

@@ -483,7 +483,7 @@ export function PlayerApp() {
     }, 0);
 
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+      navigator.serviceWorker.register("/sw.js?v=2").catch(() => undefined);
     }
 
     const markOnline = () => setOffline(false);

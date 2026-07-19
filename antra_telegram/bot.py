@@ -4,7 +4,12 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlencode
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ChatAction, ChatType
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
@@ -129,7 +134,12 @@ class TelegramMusicBot:
                 None,
             )
             reply_markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("▶ Открыть Antra Player", url=player_url)]]
+                [[
+                    InlineKeyboardButton(
+                        "▶ Открыть Antra Player",
+                        web_app=WebAppInfo(url=player_url),
+                    )
+                ]]
             )
         await update.effective_message.reply_text(
             "Напишите название песни и исполнителя или отправьте публичную ссылку на "
@@ -170,7 +180,12 @@ class TelegramMusicBot:
         await update.effective_message.reply_text(
             "Ваша медиатека готова.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("▶ Открыть Antra Player", url=url)]]
+                [[
+                    InlineKeyboardButton(
+                        "▶ Открыть Antra Player",
+                        web_app=WebAppInfo(url=url),
+                    )
+                ]]
             ),
         )
 
@@ -610,14 +625,12 @@ class TelegramMusicBot:
     def _player_url(self, user_id: int, media_id: str | None) -> str:
         if not self._player_is_ready() or self.web_session_store is None:
             raise RuntimeError("web player is not configured")
-        token = self.web_session_store.issue(user_id)
-        fragment_values = {
-            "token": token,
-            "api": self.config.public_base_url,
-        }
-        if media_id:
-            fragment_values["track"] = media_id
-        return f"{self.config.player_url}/#{urlencode(fragment_values)}"
+        launch = self.web_session_store.issue_launch(
+            user_id,
+            media_id=media_id,
+            ttl_seconds=min(self.config.web_session_ttl_seconds, 86_400),
+        )
+        return f"{self.config.player_url}/open?{urlencode({'launch': launch})}"
 
     async def _send_player(self, message, asset: TrackAsset) -> None:
         user = message.from_user
@@ -629,7 +642,12 @@ class TelegramMusicBot:
         await message.reply_text(
             f"Сохранено в медиатеку:\n{asset.display_name}",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("▶ Слушать в Antra", url=url)]]
+                [[
+                    InlineKeyboardButton(
+                        "▶ Слушать в Antra",
+                        web_app=WebAppInfo(url=url),
+                    )
+                ]]
             ),
         )
         if self.telegram_storage is not None:

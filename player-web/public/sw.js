@@ -1,4 +1,4 @@
-const CACHE_NAME = "antra-shell-v1";
+const CACHE_NAME = "antra-shell-v2";
 const SHELL = [
   "/",
   "/manifest.webmanifest",
@@ -32,6 +32,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (
     url.origin !== self.location.origin ||
+    url.pathname.startsWith("/open") ||
     url.pathname.startsWith("/api/") ||
     request.destination === "audio" ||
     request.headers.has("range")

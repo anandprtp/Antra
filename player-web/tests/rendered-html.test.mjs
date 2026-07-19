@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-async function render() {
+async function render(path = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(`http://localhost${path}`, {
       headers: { accept: "text/html" },
     }),
     {
@@ -37,9 +37,20 @@ test("server-renders the branded player shell", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
+test("server-renders the external-browser launcher separately", async () => {
+  const response = await render("/open?launch=test-launch");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /Открыть внешний браузер/i);
+  assert.match(html, /Готовим безопасную ссылку/i);
+  assert.doesNotMatch(html, /Открываем вашу медиатеку/i);
+});
+
 test("ships PWA and private-player integration surfaces", async () => {
-  const [player, layout, manifest, serviceWorker, packageJson] = await Promise.all([
+  const [player, launcher, layout, manifest, serviceWorker, packageJson] = await Promise.all([
     readFile(new URL("../app/player-app.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/open/external-browser-launcher.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
     readFile(new URL("../public/sw.js", import.meta.url), "utf8"),
@@ -59,8 +70,14 @@ test("ships PWA and private-player integration surfaces", async () => {
   assert.match(player, /payload as \{ items: unknown\[\] \}/);
   assert.match(player, /navigator\.mediaSession/);
   assert.match(player, /NEXT_PUBLIC_PLAYER_DEMO/);
+  assert.match(launcher, /telegram\.openLink/);
+  assert.match(launcher, /\/api\/v1\/player-launch/);
+  assert.match(launcher, /navigator\.clipboard\.writeText/);
+  assert.doesNotMatch(launcher, /\/api\/v1\/tracks|new Audio|mediaSession/);
+  assert.doesNotMatch(launcher, /window\.open/);
   assert.match(serviceWorker, /request\.destination === "audio"/);
   assert.match(serviceWorker, /request\.headers\.has\("range"\)/);
+  assert.match(serviceWorker, /url\.pathname\.startsWith\("\/open"\)/);
   assert.match(layout, /appleWebApp/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 

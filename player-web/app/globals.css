@@ -923,6 +923,60 @@ button:disabled {
   line-height: 1.6;
 }
 
+.external-launcher {
+  gap: 28px;
+}
+
+.external-launch-card {
+  width: min(100%, 500px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 34px 28px;
+  border: 1px solid var(--border-strong);
+  border-radius: 24px;
+  background: rgba(16, 35, 32, 0.82);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
+}
+
+.external-launch-card h1 {
+  margin: 22px 0 10px;
+  font-size: clamp(25px, 6vw, 34px);
+  letter-spacing: -0.04em;
+}
+
+.external-launch-card > p {
+  max-width: 410px;
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.launcher-actions {
+  width: min(100%, 360px);
+  display: grid;
+  gap: 10px;
+  margin-top: 26px;
+}
+
+.launcher-actions .primary-action,
+.launcher-actions .secondary-action,
+.external-launch-card > .primary-action {
+  width: 100%;
+}
+
+.external-launch-card > .primary-action {
+  max-width: 360px;
+  margin-top: 26px;
+}
+
+.external-launch-card .launcher-note {
+  margin-top: 18px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 .mini-player {
   --progress: 0%;
   position: fixed;
