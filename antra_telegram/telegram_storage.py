@@ -2,10 +2,12 @@ import asyncio
 import hashlib
 import math
 import mimetypes
+import os
 import tempfile
 from pathlib import Path
 
 from telegram import Bot
+from telegram.error import RetryAfter
 
 from .models import TrackAsset
 from .storage_db import StorageCatalog, StoredPart
@@ -15,6 +17,10 @@ CLOUD_MAX_PART_BYTES = 19_000_000
 
 
 class TelegramStorageError(RuntimeError):
+    pass
+
+
+class TelegramStorageCorruptionError(TelegramStorageError):
     pass
 
 
@@ -84,7 +90,13 @@ class TelegramStorage:
             if total_bytes <= 0:
                 raise TelegramStorageError("cannot archive an empty media file")
             whole_sha = await asyncio.to_thread(sha256_file, path)
-            if await asyncio.to_thread(self.catalog.is_ready, track_id, whole_sha):
+            if await asyncio.to_thread(
+                self.catalog.is_ready,
+                track_id,
+                whole_sha,
+                part_bytes=self.part_bytes,
+                total_bytes=total_bytes,
+            ):
                 return False
 
             part_count = math.ceil(total_bytes / self.part_bytes)
@@ -97,6 +109,7 @@ class TelegramStorage:
                 total_bytes=total_bytes,
                 sha256=whole_sha,
                 part_count=part_count,
+                part_bytes=self.part_bytes,
                 storage_chat_id=chat_id,
             )
             existing = await asyncio.to_thread(
@@ -124,19 +137,29 @@ class TelegramStorage:
                             length=length,
                         )
                         with part_path.open("rb") as handle:
-                            message = await bot.send_document(
-                                chat_id=chat_id,
-                                document=handle,
-                                filename=part_path.name,
-                                caption=(
-                                    f"#antra_part_v1 id={track_id} "
-                                    f"part={part_index + 1}/{part_count} "
-                                    f"sha256={part_sha}"
-                                ),
-                                disable_notification=True,
-                                read_timeout=300,
-                                write_timeout=300,
-                            )
+                            for attempt in range(3):
+                                try:
+                                    message = await bot.send_document(
+                                        chat_id=chat_id,
+                                        document=handle,
+                                        filename=part_path.name,
+                                        caption=(
+                                            f"#antra_part_v1 id={track_id} "
+                                            f"part={part_index + 1}/{part_count} "
+                                            f"sha256={part_sha}"
+                                        ),
+                                        disable_notification=True,
+                                        read_timeout=300,
+                                        write_timeout=300,
+                                    )
+                                    break
+                                except RetryAfter as exc:
+                                    if attempt >= 2:
+                                        raise
+                                    handle.seek(0)
+                                    await asyncio.sleep(
+                                        float(exc.retry_after) + 0.5
+                                    )
                         document = message.document
                         if document is None:
                             raise TelegramStorageError(
@@ -157,6 +180,13 @@ class TelegramStorage:
                             ),
                         )
                 await asyncio.to_thread(self.catalog.mark_ready, track_id)
+            except asyncio.CancelledError:
+                await asyncio.to_thread(
+                    self.catalog.mark_failed,
+                    track_id,
+                    "upload cancelled; safe to retry",
+                )
+                raise
             except Exception as exc:
                 await asyncio.to_thread(
                     self.catalog.mark_failed,
@@ -165,6 +195,133 @@ class TelegramStorage:
                 )
                 raise
             return True
+
+    async def restore(
+        self,
+        bot: Bot,
+        *,
+        track_id: str,
+        destination: Path,
+    ) -> TrackAsset:
+        lock = await self._lock_for(track_id)
+        async with lock:
+            stored = await asyncio.to_thread(
+                self.catalog.ready_track,
+                track_id,
+            )
+            if stored is None:
+                raise TelegramStorageError("track is not ready in Telegram storage")
+            destination = destination.expanduser().resolve()
+            if destination.is_file():
+                current_sha = await asyncio.to_thread(sha256_file, destination)
+                if current_sha == stored.sha256:
+                    return TrackAsset(
+                        destination,
+                        stored.title,
+                        stored.artist,
+                        stored.album,
+                        stored.duration_seconds,
+                        source="telegram",
+                    )
+
+            parts = await asyncio.to_thread(self.catalog.parts_for, track_id)
+            self._validate_layout(stored.total_bytes, stored.part_count, parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary_output: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=destination.parent,
+                    prefix=f".{destination.name}.restore-",
+                    delete=False,
+                ) as output:
+                    temporary_output = Path(output.name)
+                    whole_digest = hashlib.sha256()
+                    written = 0
+                    with tempfile.TemporaryDirectory(
+                        prefix="antra-telegram-restore-"
+                    ) as temp_dir:
+                        for part in parts:
+                            part_path = Path(temp_dir) / (
+                                f"{track_id}-{part.part_index:04d}.bin"
+                            )
+                            telegram_file = await bot.get_file(part.file_id)
+                            await telegram_file.download_to_drive(
+                                custom_path=part_path,
+                            )
+                            payload = await asyncio.to_thread(
+                                part_path.read_bytes,
+                            )
+                            if (
+                                len(payload) != part.byte_length
+                                or hashlib.sha256(payload).hexdigest()
+                                != part.sha256
+                            ):
+                                raise TelegramStorageCorruptionError(
+                                    f"Telegram part {part.part_index} failed checksum"
+                                )
+                            if part.byte_offset != written:
+                                raise TelegramStorageCorruptionError(
+                                    "Telegram part layout has a gap or overlap"
+                                )
+                            output.write(payload)
+                            whole_digest.update(payload)
+                            written += len(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+
+                if (
+                    written != stored.total_bytes
+                    or whole_digest.hexdigest() != stored.sha256
+                ):
+                    raise TelegramStorageCorruptionError(
+                        "restored Telegram object failed checksum"
+                    )
+                os.replace(temporary_output, destination)
+                temporary_output = None
+                return TrackAsset(
+                    destination,
+                    stored.title,
+                    stored.artist,
+                    stored.album,
+                    stored.duration_seconds,
+                    source="telegram",
+                )
+            except TelegramStorageCorruptionError as exc:
+                await asyncio.to_thread(
+                    self.catalog.mark_failed,
+                    track_id,
+                    str(exc),
+                )
+                raise
+            finally:
+                if temporary_output is not None:
+                    temporary_output.unlink(missing_ok=True)
+
+    @staticmethod
+    def _validate_layout(
+        total_bytes: int,
+        part_count: int,
+        parts: list[StoredPart],
+    ) -> None:
+        if len(parts) != part_count:
+            raise TelegramStorageCorruptionError(
+                "Telegram storage object is incomplete"
+            )
+        expected_offset = 0
+        for expected_index, part in enumerate(parts):
+            if (
+                part.part_index != expected_index
+                or part.byte_offset != expected_offset
+                or part.byte_length <= 0
+            ):
+                raise TelegramStorageCorruptionError(
+                    "Telegram storage part layout is invalid"
+                )
+            expected_offset += part.byte_length
+        if expected_offset != total_bytes:
+            raise TelegramStorageCorruptionError(
+                "Telegram storage object size is invalid"
+            )
 
     async def _lock_for(self, track_id: str) -> asyncio.Lock:
         async with self._locks_guard:

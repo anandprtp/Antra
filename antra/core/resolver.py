@@ -157,16 +157,54 @@ class SourceResolver:
         result: SearchResult,
         actual_bit_depth: Optional[int] = None,
     ) -> None:
-        return
+        key = self._album_source_key(track)
+        if not key or not adapter_name:
+            return
+        inferred_depth = actual_bit_depth or result.bit_depth or 0
+        with self._album_source_lock:
+            wins = self._album_source_wins.setdefault(key, {})
+            wins[adapter_name] = wins.get(adapter_name, 0) + 1
+            if inferred_depth > 0:
+                depths = self._album_source_bit_depths.setdefault(key, {})
+                depths[adapter_name] = max(
+                    inferred_depth,
+                    depths.get(adapter_name, 0),
+                )
 
     def record_album_source_failure(self, track: TrackMetadata, adapter_name: str) -> None:
-        return
+        key = self._album_source_key(track)
+        if not key or not adapter_name:
+            return
+        with self._album_source_lock:
+            self._album_source_wins.get(key, {}).pop(adapter_name, None)
+            self._album_source_bit_depths.get(key, {}).pop(adapter_name, None)
 
     def _preferred_album_adapter_name(self, track: TrackMetadata, excluded: set[str]) -> Optional[str]:
-        return None
+        key = self._album_source_key(track)
+        if not key:
+            return None
+        with self._album_source_lock:
+            wins = dict(self._album_source_wins.get(key, {}))
+        eligible = [
+            (count, name)
+            for name, count in wins.items()
+            if name not in excluded
+            and any(adapter.name == name for adapter in self.adapters)
+        ]
+        if not eligible:
+            return None
+        return max(eligible, key=lambda item: (item[0], item[1]))[1]
 
     def _album_adapter_proven_hires(self, track: TrackMetadata, adapter_name: str) -> bool:
-        return False
+        key = self._album_source_key(track)
+        if not key:
+            return False
+        with self._album_source_lock:
+            depth = self._album_source_bit_depths.get(key, {}).get(
+                adapter_name,
+                0,
+            )
+        return depth > 16
 
     def _rank_by_stats(self, adapters: list[BaseSourceAdapter]) -> list[BaseSourceAdapter]:
         """Reorder a single tier by persistent reliability, preserving input order
@@ -250,9 +288,22 @@ class SourceResolver:
           the very end as absolute last resort. Order: Amazon/HiFi → JioSaavn → YouTube.
         """
         if self.preserve_input_order:
-            return self._rank_within_tiers(
+            ranked = self._rank_within_tiers(
                 [a for a in self.adapters if a.name not in excluded]
             )
+            active = [
+                adapter
+                for adapter in ranked
+                if not self._is_rate_limited(adapter.name)
+                or getattr(adapter, "_premium_endpoints", None)
+            ]
+            cooling = [
+                adapter
+                for adapter in ranked
+                if self._is_rate_limited(adapter.name)
+                and not getattr(adapter, "_premium_endpoints", None)
+            ]
+            return active + cooling
 
         by_priority: dict[int, list[BaseSourceAdapter]] = defaultdict(list)
         for adapter in self.adapters:
@@ -411,9 +462,10 @@ class SourceResolver:
         self,
         track: TrackMetadata,
         adapter: BaseSourceAdapter,
+        excluded: set[str],
     ) -> bool:
         if getattr(track, "amazon_asin", None):
-            amazon_excluded = "amazon" in getattr(self, "_current_excluded_for_track", set())
+            amazon_excluded = "amazon" in excluded
             if not amazon_excluded:
                 # In quality-aware (lossless) mode, don't restrict to Amazon-only —
                 # we want to query Qobuz/HiFi as well so the best-quality source wins.
@@ -809,7 +861,6 @@ class SourceResolver:
           delivers 16-bit streams; Qobuz/HiFi may have true hi-res for the same track.
         """
         excluded = excluded_adapters or set()
-        self._current_excluded_for_track = set(excluded)
         report: dict[str, str] = {}
         self._report_tls.data = report
 
@@ -867,7 +918,7 @@ class SourceResolver:
         resolve_order = self._build_track_resolve_order(track, excluded)
 
         for adapter in resolve_order:
-            if self._should_skip_adapter_for_track(track, adapter):
+            if self._should_skip_adapter_for_track(track, adapter, excluded):
                 logger.debug(
                     "[Resolver] Skipping %s for '%s' — filtered by source-specific rule",
                     adapter.name,
@@ -1173,12 +1224,6 @@ class SourceResolver:
                     track.title,
                 )
                 return None
-            if best_adapter.name == "youtube" and not self._meets_quality_aware_threshold(best_result, best_adapter):
-                logger.info(
-                    "[Resolver] Best YouTube match for '%s' stayed below strict threshold — failing cleanly",
-                    track.title,
-                )
-                return None
             # In lossy-preferred mode: if the best result is a low-confidence lossy
             # source, prefer a lossless fallback (engine will transcode) over a
             # potentially wrong track from a noisy lossy source.
@@ -1186,6 +1231,7 @@ class SourceResolver:
                 lossless_fallback = [
                     (r, a) for r, a in candidates
                     if r.is_lossless
+                    and self._accepts_result_immediately(r, a, track)
                 ]
                 if lossless_fallback:
                     best_lf, best_lf_adapter = max(
@@ -1197,8 +1243,19 @@ class SourceResolver:
                         f"using {best_lf_adapter.name} (lossless, will transcode): '{best_lf.title}'"
                     )
                     return best_lf, best_lf_adapter
+            if not self._accepts_result_immediately(
+                best_result,
+                best_adapter,
+                track,
+            ):
+                logger.info(
+                    "[Resolver] Best match for '%s' stayed below the acceptance "
+                    "threshold — failing cleanly",
+                    track.title,
+                )
+                return None
             logger.info(
-                f"[Resolver] No adapter cleared threshold; using best match via "
+                f"[Resolver] Using best accepted match via "
                 f"{best_adapter.name}: '{best_result.title}' "
                 f"score={best_result.similarity_score:.2f} ({best_result.quality_label})"
             )

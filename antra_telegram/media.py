@@ -9,14 +9,17 @@ import threading
 import time
 from difflib import SequenceMatcher
 from pathlib import Path
+from collections.abc import Callable
 from urllib.parse import quote, urlencode, urlsplit
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
+from .access import AccessStore, AccessStoreError
 from .library import SUPPORTED_AUDIO_EXTENSIONS, inspect_track, normalize_query
 from .models import TrackAsset
 from .playlists import render_m3u8
 from .security import LinkSigner
+from .telegram_storage import TelegramStorage, TelegramStorageError
 from .web_sessions import (
     PlayerStateConflict,
     WebIdentity,
@@ -67,6 +70,7 @@ class MediaRegistry:
         self.root = root.expanduser().resolve()
         self._secret = secret
         self._assets: dict[str, TrackAsset] = {}
+        self._stored_assets: dict[str, TrackAsset] = {}
         self._lock = threading.RLock()
 
     def _id_for(self, path: Path) -> str:
@@ -94,12 +98,30 @@ class MediaRegistry:
         )
         with self._lock:
             self._assets[media_id] = registered
+            self._stored_assets.pop(media_id, None)
         return media_id
+
+    def register_stored(self, media_id: str, asset: TrackAsset) -> None:
+        resolved = asset.path.expanduser().resolve()
+        resolved.relative_to(self.root)
+        registered = TrackAsset(
+            path=resolved,
+            title=asset.title,
+            artist=asset.artist,
+            album=asset.album,
+            duration_seconds=asset.duration_seconds,
+            source=asset.source or "telegram",
+        )
+        with self._lock:
+            self._stored_assets[media_id] = registered
+            self._assets[media_id] = registered
 
     def refresh(self) -> int:
         self.root.mkdir(parents=True, exist_ok=True)
         refreshed: dict[str, TrackAsset] = {}
         for path in sorted(self.root.rglob("*")):
+            if ".antra-telegram-cache" in path.parts:
+                continue
             if path.is_file() and path.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS:
                 asset = inspect_track(self.root, path)
                 resolved = asset.path.expanduser().resolve()
@@ -118,20 +140,27 @@ class MediaRegistry:
                     source=asset.source,
                 )
         with self._lock:
+            for media_id, asset in self._stored_assets.items():
+                refreshed.setdefault(media_id, asset)
             self._assets = refreshed
         return len(refreshed)
 
-    def get(self, media_id: str) -> TrackAsset | None:
+    def get(
+        self,
+        media_id: str,
+        *,
+        allow_missing: bool = False,
+    ) -> TrackAsset | None:
         with self._lock:
             asset = self._assets.get(media_id)
         if asset is None:
             return None
         try:
-            resolved = asset.path.resolve(strict=True)
+            resolved = asset.path.resolve(strict=not allow_missing)
             resolved.relative_to(self.root)
         except (FileNotFoundError, ValueError):
             return None
-        if not resolved.is_file():
+        if not allow_missing and not resolved.is_file():
             return None
         return TrackAsset(
             path=resolved,
@@ -148,7 +177,7 @@ class MediaRegistry:
         assets = [
             (media_id, asset)
             for media_id in media_ids
-            if (asset := self.get(media_id)) is not None
+            if (asset := self.get(media_id, allow_missing=True)) is not None
         ]
         return sorted(
             assets,
@@ -175,6 +204,9 @@ class MediaServer:
         web_link_ttl_seconds: int = 3600,
         player_upstream_url: str = "",
         player_base_url: str = "",
+        access_store: AccessStore | None = None,
+        telegram_storage: TelegramStorage | None = None,
+        storage_bot_provider: Callable[[], object] | None = None,
     ):
         if web_link_ttl_seconds <= 0:
             raise ValueError("web_link_ttl_seconds must be positive")
@@ -199,7 +231,16 @@ class MediaServer:
             if player_base_url
             else self.public_base_url
         )
+        self.access_store = access_store
+        self.telegram_storage = telegram_storage
+        self.storage_bot_provider = storage_bot_provider
         self._runner: web.AppRunner | None = None
+
+    def configure_storage_bot(
+        self,
+        provider: Callable[[], object],
+    ) -> None:
+        self.storage_bot_provider = provider
 
     def create_app(self) -> web.Application:
         def apply_cors_headers(
@@ -305,7 +346,13 @@ class MediaServer:
             current + self.link_ttl_seconds,
         )
 
-    def _authorize(self, request: web.Request, kind: str) -> TrackAsset:
+    def _authorize(
+        self,
+        request: web.Request,
+        kind: str,
+        *,
+        allow_missing: bool = False,
+    ) -> TrackAsset:
         media_id = request.match_info["media_id"]
         try:
             expires_at = int(request.query.get("exp", "0"))
@@ -313,13 +360,17 @@ class MediaServer:
             raise web.HTTPForbidden(text="invalid link") from exc
         if not self.signer.verify(kind, media_id, expires_at, request.query.get("sig", "")):
             raise web.HTTPForbidden(text="expired or invalid link")
-        asset = self.registry.get(media_id)
+        asset = self.registry.get(media_id, allow_missing=allow_missing)
         if asset is None:
             raise web.HTTPNotFound(text="media not found")
         return asset
 
     async def _playlist(self, request: web.Request) -> web.Response:
-        asset = self._authorize(request, "playlist")
+        asset = self._authorize(
+            request,
+            "playlist",
+            allow_missing=self.telegram_storage is not None,
+        )
         media_id = request.match_info["media_id"]
         expires_at = int(request.query["exp"])
         media_url = self.signer.build_url(
@@ -340,8 +391,40 @@ class MediaServer:
         )
 
     async def _media(self, request: web.Request) -> web.StreamResponse:
-        asset = self._authorize(request, "media")
+        media_id = request.match_info["media_id"]
+        asset = self._authorize(
+            request,
+            "media",
+            allow_missing=self.telegram_storage is not None,
+        )
+        asset = await self._materialize(media_id, asset)
         return self._file_response(asset)
+
+    async def _materialize(
+        self,
+        media_id: str,
+        asset: TrackAsset,
+    ) -> TrackAsset:
+        if asset.path.is_file():
+            return asset
+        if self.telegram_storage is None or self.storage_bot_provider is None:
+            raise web.HTTPNotFound(text="media not found")
+        try:
+            restored = await self.telegram_storage.restore(
+                self.storage_bot_provider(),
+                track_id=media_id,
+                destination=asset.path,
+            )
+        except TelegramStorageError as exc:
+            LOGGER.exception(
+                "Telegram storage restore failed for media %s",
+                media_id,
+            )
+            raise web.HTTPServiceUnavailable(
+                text="archived media is temporarily unavailable",
+            ) from exc
+        self.registry.register_stored(media_id, restored)
+        return restored
 
     def _file_response(self, asset: TrackAsset) -> web.FileResponse:
         content_type = mimetypes.guess_type(asset.path.name)[0] or "application/octet-stream"
@@ -366,7 +449,7 @@ class MediaServer:
             public_origin,
         }
 
-    def _require_web_identity(self, request: web.Request) -> WebIdentity:
+    async def _require_web_identity(self, request: web.Request) -> WebIdentity:
         if self.web_session_store is None:
             raise web.HTTPServiceUnavailable(text="web sessions are not configured")
         authorization = request.headers.get("Authorization", "")
@@ -377,13 +460,40 @@ class MediaServer:
                 headers={"WWW-Authenticate": "Bearer"},
             )
         try:
-            identity = self.web_session_store.authenticate(token)
+            identity = await asyncio.to_thread(
+                self.web_session_store.authenticate,
+                token,
+            )
         except WebSessionStoreError as exc:
             raise web.HTTPServiceUnavailable(text="session store unavailable") from exc
         if identity is None:
             raise web.HTTPUnauthorized(
                 text="invalid or expired session",
                 headers={"WWW-Authenticate": "Bearer"},
+            )
+        if self.access_store is not None:
+            try:
+                decision = await asyncio.to_thread(
+                    self.access_store.authorize_existing,
+                    identity.user_id,
+                )
+            except AccessStoreError as exc:
+                raise web.HTTPServiceUnavailable(
+                    text="access store unavailable",
+                ) from exc
+            if not decision.allowed:
+                await asyncio.to_thread(
+                    self.web_session_store.revoke_user,
+                    identity.user_id,
+                )
+                raise web.HTTPUnauthorized(
+                    text="access revoked",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            identity = WebIdentity(
+                identity.user_id,
+                decision.role or identity.role,
+                identity.expires_at,
             )
         return identity
 
@@ -429,7 +539,7 @@ class MediaServer:
                 or "application/octet-stream"
             ),
             "size_bytes": size_bytes,
-            "availability": "ready",
+            "availability": "ready" if asset.path.is_file() else "archived",
             "stream_url": stream_url,
             "stream_expires_at": expires_at,
         }
@@ -444,7 +554,7 @@ class MediaServer:
         )
 
     async def _api_tracks(self, request: web.Request) -> web.Response:
-        self._require_web_identity(request)
+        await self._require_web_identity(request)
         query = " ".join(request.query.get("q", "").split())
         if len(query) > 200:
             raise web.HTTPBadRequest(text="query is too long")
@@ -475,7 +585,7 @@ class MediaServer:
         )
 
     async def _api_me(self, request: web.Request) -> web.Response:
-        identity = self._require_web_identity(request)
+        identity = await self._require_web_identity(request)
         return web.json_response(
             {
                 "user_id": identity.user_id,
@@ -499,20 +609,21 @@ class MediaServer:
         ):
             raise web.HTTPBadRequest(text="invalid player launch")
         try:
-            launch = self.web_session_store.consume_launch(launch_token)
+            launch = await asyncio.to_thread(
+                self.web_session_store.consume_launch,
+                launch_token,
+            )
             if launch is None:
                 raise web.HTTPUnauthorized(text="invalid or expired player launch")
-            session_token = self.web_session_store.issue(
+            session_token = await asyncio.to_thread(
+                self.web_session_store.issue,
                 launch.user_id,
                 role=launch.role,
             )
         except WebSessionStoreError as exc:
             raise web.HTTPServiceUnavailable(text="session store unavailable") from exc
 
-        fragment_values = {
-            "token": session_token,
-            "api": self.public_base_url,
-        }
+        fragment_values = {"token": session_token}
         if launch.media_id:
             fragment_values["track"] = launch.media_id
         return web.json_response(
@@ -523,10 +634,13 @@ class MediaServer:
         )
 
     async def _api_player_state(self, request: web.Request) -> web.Response:
-        identity = self._require_web_identity(request)
+        identity = await self._require_web_identity(request)
         assert self.web_session_store is not None
         try:
-            state = self.web_session_store.get_player_state(identity.user_id)
+            state = await asyncio.to_thread(
+                self.web_session_store.get_player_state,
+                identity.user_id,
+            )
         except WebSessionStoreError as exc:
             raise web.HTTPServiceUnavailable(text="player state unavailable") from exc
         return web.json_response(
@@ -535,7 +649,7 @@ class MediaServer:
         )
 
     async def _api_save_player_state(self, request: web.Request) -> web.Response:
-        identity = self._require_web_identity(request)
+        identity = await self._require_web_identity(request)
         assert self.web_session_store is not None
         try:
             body = await request.json()
@@ -543,7 +657,8 @@ class MediaServer:
                 body,
                 max_queue_items=self.web_session_store.max_queue_items,
             )
-            saved = self.web_session_store.save_player_state(
+            saved = await asyncio.to_thread(
+                self.web_session_store.save_player_state,
                 identity.user_id,
                 state,
                 expected_revision=state.revision,
@@ -566,7 +681,13 @@ class MediaServer:
         )
 
     async def _api_stream(self, request: web.Request) -> web.StreamResponse:
-        asset = self._authorize(request, "web-stream")
+        media_id = request.match_info["media_id"]
+        asset = self._authorize(
+            request,
+            "web-stream",
+            allow_missing=self.telegram_storage is not None,
+        )
+        asset = await self._materialize(media_id, asset)
         return self._file_response(asset)
 
     async def _api_fallback(self, request: web.Request) -> web.Response:

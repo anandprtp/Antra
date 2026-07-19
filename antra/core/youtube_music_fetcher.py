@@ -18,6 +18,7 @@ import re
 from typing import Optional
 
 from antra.core.models import TrackMetadata
+from antra.utils.url_safety import is_exact_http_host
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ _TOPIC_RE = re.compile(r"\s*-\s*Topic$", re.IGNORECASE)
 
 def is_youtube_music_url(url: str) -> bool:
     """Return True for any music.youtube.com URL."""
-    return "music.youtube.com" in (url or "")
+    return is_exact_http_host(url, "music.youtube.com")
 
 
 class YouTubeMusicFetcher:

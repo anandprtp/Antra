@@ -275,13 +275,36 @@ class JobCoordinator:
                     raise PendingQueueFull("too many pending music requests")
                 task = asyncio.create_task(self._run(blocking))
                 self._inflight[key] = task
+                task.add_done_callback(
+                    lambda completed, task_key=key: self._schedule_cleanup(
+                        task_key,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(task)
+
+    def _schedule_cleanup(self, key: str, task: asyncio.Task[Any]) -> None:
         try:
-            return await asyncio.shield(task)
-        finally:
-            if task.done():
-                async with self._lock:
-                    if self._inflight.get(key) is task:
-                        self._inflight.pop(key, None)
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            # The result is still delivered to active waiters. Reading the
+            # exception here only prevents orphaned jobs from producing an
+            # unhandled-task warning after every waiter was cancelled.
+            pass
+        try:
+            asyncio.create_task(self._discard_completed(key, task))
+        except RuntimeError:
+            # The loop can already be closing during process shutdown.
+            pass
+
+    async def _discard_completed(
+        self,
+        key: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        async with self._lock:
+            if self._inflight.get(key) is task:
+                self._inflight.pop(key, None)
 
     async def _run(self, blocking: Callable[[], Any]) -> Any:
         async with self._semaphore:

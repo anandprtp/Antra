@@ -9,9 +9,13 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from antra_telegram.access import AccessStore
 from antra_telegram.bot import TelegramMusicBot
 from antra_telegram.media import MediaRegistry, MediaServer
+from antra_telegram.models import TrackAsset
 from antra_telegram.security import LinkSigner
+from antra_telegram.storage_db import StorageCatalog
+from antra_telegram.telegram_storage import TelegramStorage
 from antra_telegram.web_sessions import (
     PlayerStateConflict,
     WebSessionStore,
@@ -156,6 +160,10 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
         registry.refresh()
         sessions = WebSessionStore(tmp_path / "player.sqlite3")
         token = sessions.issue(777, role="admin")
+        access = AccessStore(
+            tmp_path / "access.sqlite3",
+            static_allowed_user_ids=frozenset({777}),
+        )
         server = MediaServer(
             registry,
             LinkSigner(SECRET),
@@ -167,6 +175,7 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             cors_allowed_origins=("https://player.example",),
             web_link_ttl_seconds=120,
             player_base_url="https://player.example",
+            access_store=access,
         )
         client = TestClient(TestServer(server.create_app()))
         await client.start_server()
@@ -195,7 +204,7 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             assert launched.scheme == "https"
             assert launched.netloc == "player.example"
             assert launched.query == ""
-            assert launched_fragment["api"] == "https://music.example"
+            assert "api" not in launched_fragment
             assert sessions.authenticate(launched_fragment["token"]).user_id == 777
 
             response = await client.post(
@@ -324,9 +333,112 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             )
             assert response.status == 403
 
-            assert sessions.revoke(token)
+            access.static_allowed_user_ids = frozenset()
             response = await client.get("/api/v1/me", headers=headers)
             assert response.status == 401
+            assert sessions.authenticate(token) is None
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_archived_track_survives_restart_and_restores_on_stream(tmp_path: Path):
+    async def scenario():
+        library = tmp_path / "Music"
+        source = library / "Artist" / "Album" / "01 - Track.mp3"
+        source.parent.mkdir(parents=True)
+        payload = b"telegram-backed-audio-payload"
+        source.write_bytes(payload)
+        asset = TrackAsset(source, "Track", "Artist", "Album", 120)
+        cloud_parts: dict[str, bytes] = {}
+
+        class FakeBot:
+            async def send_document(self, chat_id, document, **kwargs):
+                file_id = f"file-{len(cloud_parts) + 1}"
+                cloud_parts[file_id] = document.read()
+                return SimpleNamespace(
+                    chat_id=chat_id,
+                    message_id=len(cloud_parts),
+                    document=SimpleNamespace(
+                        file_id=file_id,
+                        file_unique_id=f"unique-{file_id}",
+                    ),
+                )
+
+            async def get_file(self, file_id):
+                class File:
+                    async def download_to_drive(self, custom_path):
+                        Path(custom_path).write_bytes(cloud_parts[file_id])
+
+                return File()
+
+        bot = FakeBot()
+        first_registry = MediaRegistry(library, SECRET)
+        media_id = first_registry.register(asset)
+        catalog = StorageCatalog(tmp_path / "storage.sqlite3")
+        storage = TelegramStorage(catalog, part_bytes=8)
+        await storage.archive(
+            bot,
+            asset,
+            track_id=media_id,
+            chat_id=777,
+        )
+        source.unlink()
+
+        restarted_registry = MediaRegistry(library, SECRET)
+        restarted_registry.refresh()
+        stored = catalog.ready_track(media_id)
+        assert stored is not None
+        cache_path = (
+            library
+            / ".antra-telegram-cache"
+            / media_id
+            / stored.filename
+        )
+        restarted_registry.register_stored(
+            media_id,
+            TrackAsset(
+                cache_path,
+                stored.title,
+                stored.artist,
+                stored.album,
+                stored.duration_seconds,
+                source="telegram",
+            ),
+        )
+        sessions = WebSessionStore(tmp_path / "sessions.sqlite3")
+        token = sessions.issue(777)
+        server = MediaServer(
+            restarted_registry,
+            LinkSigner(SECRET),
+            "https://music.example",
+            "127.0.0.1",
+            0,
+            3600,
+            web_session_store=sessions,
+            telegram_storage=storage,
+            storage_bot_provider=lambda: bot,
+        )
+        client = TestClient(TestServer(server.create_app()))
+        await client.start_server()
+        try:
+            response = await client.get(
+                "/api/v1/tracks",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert response.status == 200
+            track = (await response.json())["items"][0]
+            assert track["availability"] == "archived"
+
+            stream = urlsplit(track["stream_url"])
+            response = await client.get(
+                stream.path + "?" + stream.query,
+                headers={"Range": "bytes=2-8"},
+            )
+            assert response.status == 206
+            assert await response.read() == payload[2:9]
+            assert cache_path.read_bytes() == payload
         finally:
             await client.close()
 

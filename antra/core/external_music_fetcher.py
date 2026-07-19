@@ -6,6 +6,7 @@ TrackMetadata so the existing Antra resolver/download engine can process them.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Optional

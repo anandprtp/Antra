@@ -3,11 +3,13 @@ import concurrent.futures
 import hashlib
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer
+import pytest
 from telegram.ext import CallbackQueryHandler
 
 from antra.core.config import Config
@@ -36,7 +38,11 @@ from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
 from antra_telegram.splitter import estimate_segment_seconds
 from antra_telegram.storage_db import StorageCatalog
-from antra_telegram.telegram_storage import TelegramStorage, copy_part
+from antra_telegram.telegram_storage import (
+    TelegramStorage,
+    TelegramStorageCorruptionError,
+    copy_part,
+)
 from antra_telegram.tunnel_supervisor import (
     QUICK_TUNNEL_URL,
     update_dotenv_value,
@@ -227,6 +233,35 @@ def test_identical_jobs_are_coalesced():
         )
         assert first == second
         assert resolver.calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_job_waiter_does_not_permanently_fill_queue():
+    class BlockingResolver:
+        def __init__(self):
+            self.release = threading.Event()
+
+        def resolve(self, query: str):
+            self.release.wait(timeout=2)
+            return TrackAsset(Path(f"/tmp/{query}.mp3"), query)
+
+    async def scenario():
+        resolver = BlockingResolver()
+        coordinator = JobCoordinator(resolver, max_concurrent=1, max_pending=1)
+        waiter = asyncio.create_task(coordinator.resolve("first"))
+        await asyncio.sleep(0.02)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        resolver.release.set()
+        for _ in range(100):
+            if not coordinator._inflight:
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator._inflight == {}
+        assert (await coordinator.resolve("second")).title == "second"
 
     asyncio.run(scenario())
 
@@ -685,6 +720,8 @@ def test_application_registers_playlist_callback_handler(tmp_path: Path):
     handlers = [handler for group in application.handlers.values() for handler in group]
 
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 1
+    assert application.update_processor.max_concurrent_updates >= 2
+    assert application.error_handlers
 
 
 def test_youtube_adapter_uses_exact_source_video_without_text_search():
@@ -800,10 +837,20 @@ def test_telegram_storage_archives_restorable_cloud_parts(tmp_path: Path):
                     ),
                 )
 
+            async def get_file(self, file_id):
+                index = int(file_id.removeprefix("file-")) - 1
+
+                class File:
+                    async def download_to_drive(self, custom_path):
+                        Path(custom_path).write_bytes(sent_payloads[index])
+
+                return File()
+
+        bot = FakeBot()
         catalog = StorageCatalog(tmp_path / "storage.sqlite3")
         storage = TelegramStorage(catalog, part_bytes=41)
         uploaded = await storage.archive(
-            FakeBot(),
+            bot,
             asset,
             track_id="opaque-track-id",
             chat_id=123,
@@ -825,12 +872,45 @@ def test_telegram_storage_archives_restorable_cloud_parts(tmp_path: Path):
         ]
 
         uploaded_again = await storage.archive(
-            FakeBot(),
+            bot,
             asset,
             track_id="opaque-track-id",
             chat_id=123,
         )
         assert uploaded_again is False
+
+        reconfigured = TelegramStorage(catalog, part_bytes=30)
+        assert await reconfigured.archive(
+            bot,
+            asset,
+            track_id="opaque-track-id",
+            chat_id=123,
+        )
+        parts = catalog.parts_for("opaque-track-id")
+        assert [part.byte_offset for part in parts] == [
+            index * 30 for index in range(len(parts))
+        ]
+
+        source.unlink()
+        restored = await reconfigured.restore(
+            bot,
+            track_id="opaque-track-id",
+            destination=source,
+        )
+        assert restored.path.read_bytes() == payload
+        assert restored.title == "Track"
+
+        source.unlink()
+        first_part = catalog.parts_for("opaque-track-id")[0]
+        stored_index = int(first_part.file_id.removeprefix("file-")) - 1
+        sent_payloads[stored_index] = b"corrupted"
+        with pytest.raises(TelegramStorageCorruptionError):
+            await reconfigured.restore(
+                bot,
+                track_id="opaque-track-id",
+                destination=source,
+            )
+        assert catalog.ready_track("opaque-track-id") is None
 
     asyncio.run(scenario())
 
@@ -959,6 +1039,23 @@ def test_config_accepts_local_player_upstream_for_single_public_origin(
     assert config.player_upstream_url == "http://127.0.0.1:3000"
 
 
+def test_config_rejects_public_base_url_with_path(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("ANTRA_TELEGRAM_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL",
+        "https://music.example/not-an-origin",
+    )
+    monkeypatch.setenv(
+        "ANTRA_TELEGRAM_LINK_SECRET",
+        "public-origin-test-secret-that-is-long-enough",
+    )
+
+    with pytest.raises(ConfigError):
+        TelegramConfig.from_env()
+
+
 def test_config_allows_explicit_first_user_claim_without_allowlist(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "")
@@ -1029,4 +1126,18 @@ def test_admin_can_create_single_use_member_invite(tmp_path: Path):
     assert joined.allowed and joined.joined_by_invite and joined.role == "member"
     assert store.authorize_or_claim(222).allowed
     assert store.redeem_invite(333, token, now=1_002).allowed is False
+    assert store.list_members(111) == [(111, "admin"), (222, "member")]
+
+
+def test_static_admin_invite_persists_member_access(tmp_path: Path):
+    store = AccessStore(
+        tmp_path / "access.sqlite3",
+        static_allowed_user_ids=frozenset({111}),
+    )
+
+    token = store.create_invite(111, ttl_seconds=3600, now=1_000)
+    joined = store.redeem_invite(222, token, now=1_001)
+
+    assert joined.allowed and joined.role == "member"
+    assert store.authorize_or_claim(222).allowed
     assert store.list_members(111) == [(111, "admin"), (222, "member")]

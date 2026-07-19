@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-runtime.txt
+            requirements-telegram.txt
+            requirements-dev.txt
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Check runtime-name and syntax errors
+        run: ruff check --select F821,E9 antra antra_shared antra_telegram tests
+
+      - name: Run Python tests
+        run: python -m pytest -q
+
+  player-web:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: player-web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: player-web/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test

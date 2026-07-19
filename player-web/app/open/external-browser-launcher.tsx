@@ -5,11 +5,12 @@ import {
   Copy,
   ExternalLink,
   LoaderCircle,
+  RefreshCw,
   ShieldCheck,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
-type LaunchStatus = "preparing" | "ready" | "opened" | "error";
+type LaunchStatus = "preparing" | "ready" | "opened" | "expired" | "error";
 
 type TelegramWebApp = {
   ready?: () => void;
@@ -66,7 +67,7 @@ function validatedExternalUrl(value: unknown): string {
       return "";
     }
     const credentials = new URLSearchParams(target.hash.replace(/^#/, ""));
-    if (!credentials.get("token") || credentials.get("api") !== target.origin) {
+    if (!credentials.get("token") || credentials.has("api")) {
       return "";
     }
     return target.toString();
@@ -98,6 +99,7 @@ export function ExternalBrowserLauncher() {
   const [copied, setCopied] = useState(false);
   const [sdkResolved, setSdkResolved] = useState(false);
   const [bridgeReady, setBridgeReady] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -127,10 +129,15 @@ export function ExternalBrowserLauncher() {
       cache: "no-store",
     })
       .then(async (response) => {
+        if (response.status === 400 || response.status === 401) {
+          setStatus("expired");
+          return null;
+        }
         if (!response.ok) throw new Error(`launch exchange failed: ${response.status}`);
         return response.json() as Promise<{ url?: unknown }>;
       })
       .then((payload) => {
+        if (!payload) return;
         const url = validatedExternalUrl(payload.url);
         if (!url) throw new Error("invalid external player URL");
         setExternalUrl(url);
@@ -143,7 +150,7 @@ export function ExternalBrowserLauncher() {
       });
 
     return () => controller.abort();
-  }, []);
+  }, [retryKey]);
 
   const openExternally = () => {
     if (!externalUrl) return;
@@ -180,13 +187,29 @@ export function ExternalBrowserLauncher() {
           )}
         </div>
 
-        {status === "error" ? (
+        {status === "expired" ? (
           <>
             <h1>Ссылка уже использована</h1>
             <p>Вернитесь в бот и нажмите команду /player ещё раз.</p>
             <a className="primary-action" href="https://t.me/fnnlinkbot">
               Вернуться в Telegram
             </a>
+          </>
+        ) : status === "error" ? (
+          <>
+            <h1>Не удалось подготовить плеер</h1>
+            <p>Проверьте подключение и повторите попытку — новая ссылка пока не нужна.</p>
+            <button
+              className="primary-action"
+              type="button"
+              onClick={() => {
+                setStatus("preparing");
+                setRetryKey((current) => current + 1);
+              }}
+            >
+              <RefreshCw size={18} aria-hidden="true" />
+              Повторить
+            </button>
           </>
         ) : (
           <>

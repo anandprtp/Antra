@@ -37,6 +37,15 @@ import {
   useState,
 } from "react";
 
+import {
+  mergeUniqueById,
+  refreshQueueItems,
+  resolvePlaybackSelection,
+  shouldIgnoreGlobalShortcut,
+  storedVolumeOrDefault,
+  trustedApiOrigin,
+} from "./player-core";
+
 type Tab = "home" | "search" | "library";
 type RepeatMode = "off" | "all" | "one";
 type LoadState = "booting" | "ready" | "unauthorized" | "offline" | "error";
@@ -53,6 +62,7 @@ type Track = {
   artworkUrl: string;
   availability: string;
   addedAt: string;
+  streamExpiresAt: number;
 };
 
 type RemotePlayerState = {
@@ -83,13 +93,14 @@ type SaveSnapshot = {
 
 const STORAGE = {
   token: "antra.player.token",
-  api: "antra.player.api",
   volume: "antra.player.volume",
   catalog: "antra.player.catalog",
 };
 
 const TELEGRAM_URL = "https://t.me/fnnlinkbot";
 const DEMO_ENABLED = process.env.NEXT_PUBLIC_PLAYER_DEMO === "true";
+const CATALOG_PAGE_SIZE = 100;
+const CATALOG_REFRESH_MS = 5 * 60 * 1000;
 
 const DEMO_TRACKS: Track[] = [
   {
@@ -104,6 +115,7 @@ const DEMO_TRACKS: Track[] = [
     artworkUrl: "",
     availability: "ready",
     addedAt: "2026-07-19T10:32:00Z",
+    streamExpiresAt: 0,
   },
   {
     id: "demo-teardrop",
@@ -117,6 +129,7 @@ const DEMO_TRACKS: Track[] = [
     artworkUrl: "",
     availability: "ready",
     addedAt: "2026-07-18T20:12:00Z",
+    streamExpiresAt: 0,
   },
   {
     id: "demo-avril",
@@ -130,6 +143,7 @@ const DEMO_TRACKS: Track[] = [
     artworkUrl: "",
     availability: "ready",
     addedAt: "2026-07-17T13:45:00Z",
+    streamExpiresAt: 0,
   },
   {
     id: "demo-hoppipolla",
@@ -143,6 +157,7 @@ const DEMO_TRACKS: Track[] = [
     artworkUrl: "",
     availability: "ready",
     addedAt: "2026-07-16T18:10:00Z",
+    streamExpiresAt: 0,
   },
   {
     id: "demo-windowlicker",
@@ -156,6 +171,7 @@ const DEMO_TRACKS: Track[] = [
     artworkUrl: "",
     availability: "ready",
     addedAt: "2026-07-15T09:18:00Z",
+    streamExpiresAt: 0,
   },
 ];
 
@@ -168,24 +184,16 @@ class ApiError extends Error {
   }
 }
 
-function safeApiOrigin(value: string): string {
-  try {
-    const url = new URL(value);
-    if (!["http:", "https:"].includes(url.protocol)) return "";
-    return url.origin;
-  } catch {
-    return "";
-  }
-}
-
 function readCredentials(): Credentials {
   const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   const tokenFromLink = params.get("token")?.trim() ?? "";
-  const apiFromLink = safeApiOrigin(params.get("api")?.trim() ?? "");
   const deepTrackId = params.get("track")?.trim() ?? "";
 
   if (tokenFromLink) localStorage.setItem(STORAGE.token, tokenFromLink);
-  if (apiFromLink) localStorage.setItem(STORAGE.api, apiFromLink);
+  // Older builds persisted a configurable API origin. The player and API now
+  // intentionally share one origin so a crafted hash cannot exfiltrate the
+  // stored bearer token to another server.
+  localStorage.removeItem("antra.player.api");
 
   if (window.location.hash) {
     window.history.replaceState(
@@ -197,10 +205,7 @@ function readCredentials(): Credentials {
 
   return {
     token: tokenFromLink || localStorage.getItem(STORAGE.token) || "",
-    apiOrigin:
-      apiFromLink ||
-      safeApiOrigin(localStorage.getItem(STORAGE.api) || "") ||
-      window.location.origin,
+    apiOrigin: trustedApiOrigin(window.location.origin),
     deepTrackId,
   };
 }
@@ -228,6 +233,7 @@ function normalizeTrack(raw: Record<string, unknown>, index: number, apiOrigin: 
     artworkUrl: absoluteUrl(raw.artwork_url ?? raw.cover_url ?? raw.image_url, apiOrigin),
     availability: String(raw.availability ?? raw.status ?? "ready").toLowerCase(),
     addedAt: String(raw.added_at ?? raw.created_at ?? ""),
+    streamExpiresAt: Math.max(0, Number(raw.stream_expires_at ?? 0) || 0),
   };
 }
 
@@ -299,7 +305,14 @@ function formatSize(bytes: number): string {
 }
 
 function isReady(track: Track): boolean {
-  return ["ready", "available", "complete", "completed", ""].includes(track.availability);
+  return [
+    "ready",
+    "archived",
+    "available",
+    "complete",
+    "completed",
+    "",
+  ].includes(track.availability);
 }
 
 function mergeClass(...values: Array<string | false | undefined>): string {
@@ -398,6 +411,8 @@ export function PlayerApp() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const pendingSeekRef = useRef(0);
   const saveInFlightRef = useRef(false);
+  const catalogRefreshRef = useRef<Promise<Track[]> | null>(null);
+  const streamRetryRef = useRef<string | null>(null);
   const snapshotRef = useRef<SaveSnapshot>({
     revision: 0,
     queueIds: [],
@@ -473,26 +488,23 @@ export function PlayerApp() {
 
   useEffect(() => {
     const parsed = readCredentials();
-    const storedVolume = Number(localStorage.getItem(STORAGE.volume));
+    const storedVolume = storedVolumeOrDefault(
+      localStorage.getItem(STORAGE.volume),
+    );
     const initialize = window.setTimeout(() => {
-      if (Number.isFinite(storedVolume) && storedVolume >= 0 && storedVolume <= 1) {
-        setVolume(storedVolume);
-      }
+      setVolume(storedVolume);
       setCredentials(parsed);
       setOffline(!navigator.onLine);
     }, 0);
 
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js?v=2").catch(() => undefined);
+      navigator.serviceWorker.register("/sw.js?v=3").catch(() => undefined);
     }
 
-    const markOnline = () => setOffline(false);
     const markOffline = () => setOffline(true);
-    window.addEventListener("online", markOnline);
     window.addEventListener("offline", markOffline);
     return () => {
       window.clearTimeout(initialize);
-      window.removeEventListener("online", markOnline);
       window.removeEventListener("offline", markOffline);
     };
   }, []);
@@ -516,6 +528,70 @@ export function PlayerApp() {
     [credentials],
   );
 
+  const fetchCatalog = useCallback(async (): Promise<Track[]> => {
+    if (!credentials) return [];
+    let offset = 0;
+    let total = Number.POSITIVE_INFINITY;
+    let catalog: Track[] = [];
+
+    while (offset < total) {
+      const response = await apiFetch(
+        `/api/v1/tracks?limit=${CATALOG_PAGE_SIZE}&offset=${offset}`,
+      );
+      const payload = await response.json();
+      const page = normalizeTracks(payload, credentials.apiOrigin);
+      catalog = mergeUniqueById(catalog, page);
+
+      const rawItems =
+        payload &&
+        typeof payload === "object" &&
+        Array.isArray((payload as { items?: unknown[] }).items)
+          ? (payload as { items: unknown[] }).items
+          : page;
+      const advertisedTotal = Number(
+        payload && typeof payload === "object"
+          ? (payload as { total?: unknown }).total
+          : rawItems.length,
+      );
+      total =
+        Number.isFinite(advertisedTotal) && advertisedTotal >= 0
+          ? advertisedTotal
+          : offset + rawItems.length;
+      if (!rawItems.length) break;
+      offset += rawItems.length;
+      if (rawItems.length < CATALOG_PAGE_SIZE && offset >= total) break;
+    }
+    return catalog;
+  }, [apiFetch, credentials]);
+
+  const refreshCatalog = useCallback(async (): Promise<Track[]> => {
+    if (!credentials?.token || demoMode) return tracks;
+    if (catalogRefreshRef.current) return catalogRefreshRef.current;
+
+    const refresh = fetchCatalog()
+      .then((catalog) => {
+        setTracks(catalog);
+        setQueue((current) => refreshQueueItems(current, catalog));
+        localStorage.setItem(STORAGE.catalog, JSON.stringify(catalog));
+        setOffline(false);
+        setStatusMessage("");
+        return catalog;
+      })
+      .catch((error) => {
+        if (error instanceof ApiError && [401, 403].includes(error.status)) {
+          setLoadState("unauthorized");
+        } else {
+          setOffline(!navigator.onLine);
+        }
+        throw error;
+      })
+      .finally(() => {
+        catalogRefreshRef.current = null;
+      });
+    catalogRefreshRef.current = refresh;
+    return refresh;
+  }, [credentials, demoMode, fetchCatalog, tracks]);
+
   const loadLibrary = useCallback(async () => {
     if (!credentials) return;
     setLoadState("booting");
@@ -535,44 +611,35 @@ export function PlayerApp() {
     }
 
     try {
-      const [tracksResponse, meResponse, stateResponse] = await Promise.all([
-        apiFetch("/api/v1/tracks"),
+      const catalog = await fetchCatalog();
+      const [meResult, stateResult] = await Promise.allSettled([
         apiFetch("/api/v1/me"),
         apiFetch("/api/v1/player-state"),
       ]);
-      const [tracksPayload, mePayload, statePayload] = await Promise.all([
-        tracksResponse.json(),
-        meResponse.json(),
-        stateResponse.json(),
-      ]);
-      const catalog = normalizeTracks(tracksPayload, credentials.apiOrigin);
+      const mePayload =
+        meResult.status === "fulfilled" ? await meResult.value.json() : {};
+      const statePayload =
+        stateResult.status === "fulfilled" ? await stateResult.value.json() : {};
       const remoteState = normalizeRemoteState(statePayload);
-      const byId = new Map(catalog.map((track) => [track.id, track]));
-      const restoredQueue = remoteState.queue_ids
-        .map((id) => byId.get(id))
-        .filter((track): track is Track => Boolean(track));
-      const deepTrack = credentials.deepTrackId ? byId.get(credentials.deepTrackId) : undefined;
-      const restoredCurrent = deepTrack?.id ?? remoteState.current_id;
-      const effectiveQueue = restoredQueue.length
-        ? restoredQueue
-        : deepTrack
-          ? [deepTrack, ...catalog.filter((track) => track.id !== deepTrack.id)]
-          : catalog;
+      const selection = resolvePlaybackSelection(
+        catalog,
+        remoteState.queue_ids,
+        remoteState.current_id,
+        credentials.deepTrackId,
+      );
 
       setTracks(catalog);
-      setQueue(effectiveQueue);
-      setCurrentId(restoredCurrent && byId.has(restoredCurrent) ? restoredCurrent : catalog[0]?.id ?? null);
+      setQueue(selection.queue);
+      setCurrentId(selection.currentId);
       setShuffle(remoteState.shuffle);
       setRepeatMode(remoteState.repeat_mode);
       setRevision(remoteState.revision);
-      pendingSeekRef.current = deepTrack ? 0 : remoteState.position_ms / 1000;
+      pendingSeekRef.current = credentials.deepTrackId
+        ? 0
+        : remoteState.position_ms / 1000;
       setPosition(pendingSeekRef.current);
       const me = mePayload && typeof mePayload === "object" ? (mePayload as Record<string, unknown>) : {};
-      const tracksUser =
-        tracksPayload && typeof tracksPayload === "object"
-          ? ((tracksPayload as { user?: { id?: unknown } }).user?.id ?? "")
-          : "";
-      setUserId(String(me.user_id ?? tracksUser ?? ""));
+      setUserId(String(me.user_id ?? ""));
       localStorage.setItem(STORAGE.catalog, JSON.stringify(catalog));
       setLoadState("ready");
       setDemoMode(false);
@@ -601,12 +668,33 @@ export function PlayerApp() {
       setLoadState(navigator.onLine ? "error" : "offline");
       setStatusMessage("Не удалось связаться с музыкальной библиотекой.");
     }
-  }, [apiFetch, credentials]);
+  }, [apiFetch, credentials, fetchCatalog]);
 
   useEffect(() => {
     const start = window.setTimeout(() => void loadLibrary(), 0);
     return () => window.clearTimeout(start);
   }, [loadLibrary]);
+
+  useEffect(() => {
+    if (loadState !== "ready" || demoMode || !credentials?.token) return;
+    const refresh = () => {
+      if (document.visibilityState === "visible" && navigator.onLine) {
+        void refreshCatalog().catch(() => undefined);
+      }
+    };
+    const markOnline = () => {
+      setOffline(false);
+      refresh();
+    };
+    const timer = window.setInterval(refresh, CATALOG_REFRESH_MS);
+    window.addEventListener("online", markOnline);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("online", markOnline);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [credentials, demoMode, loadState, refreshCatalog]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -639,14 +727,34 @@ export function PlayerApp() {
         return;
       }
 
+      let playableTrack = track;
+      let latestCatalog = tracks;
+      if (
+        !demoMode &&
+        track.streamExpiresAt > 0 &&
+        track.streamExpiresAt <= Math.floor(Date.now() / 1000) + 30
+      ) {
+        try {
+          const refreshed = await refreshCatalog();
+          latestCatalog = refreshed;
+          playableTrack =
+            refreshed.find((candidate) => candidate.id === track.id) ?? track;
+        } catch {
+          setPlaybackError("Не удалось обновить ссылку на трек. Проверьте подключение.");
+          return;
+        }
+      }
+
       const audio = audioRef.current;
       if (!audio) return;
       setPlaybackError("");
-      if (contextQueue?.length) setQueue(contextQueue);
-      setCurrentId(track.id);
+      if (contextQueue?.length) {
+        setQueue(refreshQueueItems(contextQueue, latestCatalog));
+      }
+      setCurrentId(playableTrack.id);
       pendingSeekRef.current = Math.max(0, startAt);
-      if (audio.src !== track.streamUrl) {
-        audio.src = track.streamUrl;
+      if (audio.src !== playableTrack.streamUrl) {
+        audio.src = playableTrack.streamUrl;
         audio.load();
       } else {
         audio.currentTime = pendingSeekRef.current;
@@ -658,8 +766,35 @@ export function PlayerApp() {
         setPlaybackError("Safari не смог запустить трек. Нажмите Play ещё раз.");
       }
     },
-    [demoMode],
+    [demoMode, refreshCatalog, tracks],
   );
+
+  const handlePlaybackError = useCallback(async () => {
+    setIsPlaying(false);
+    if (
+      currentTrack &&
+      credentials?.token &&
+      !demoMode &&
+      streamRetryRef.current !== currentTrack.id
+    ) {
+      streamRetryRef.current = currentTrack.id;
+      try {
+        const catalog = await refreshCatalog();
+        const refreshed = catalog.find((track) => track.id === currentTrack.id);
+        const audio = audioRef.current;
+        if (refreshed?.streamUrl && audio) {
+          audio.src = refreshed.streamUrl;
+          audio.load();
+          await audio.play();
+          setPlaybackError("");
+          return;
+        }
+      } catch {
+        // Fall through to the actionable playback error below.
+      }
+    }
+    setPlaybackError("Не удалось воспроизвести трек. Обновите библиотеку и попробуйте ещё раз.");
+  }, [credentials, currentTrack, demoMode, refreshCatalog]);
 
   const togglePlayback = useCallback(async () => {
     const audio = audioRef.current;
@@ -755,6 +890,26 @@ export function PlayerApp() {
     setQueue((current) => current.filter((track) => track.id !== trackId));
   };
 
+  const applyRemotePlayerState = useCallback(
+    (remoteState: RemotePlayerState) => {
+      const selection = resolvePlaybackSelection(
+        tracks,
+        remoteState.queue_ids,
+        remoteState.current_id,
+        "",
+      );
+      setRevision(remoteState.revision);
+      setQueue(selection.queue);
+      setCurrentId(selection.currentId);
+      setShuffle(remoteState.shuffle);
+      setRepeatMode(remoteState.repeat_mode);
+      pendingSeekRef.current = remoteState.position_ms / 1000;
+      setPosition(pendingSeekRef.current);
+      if (remoteState.paused) audioRef.current?.pause();
+    },
+    [tracks],
+  );
+
   const saveState = useCallback(
     async (keepalive = false) => {
       if (!credentials?.token || demoMode || saveInFlightRef.current) return;
@@ -784,9 +939,22 @@ export function PlayerApp() {
         } else if (response.status === 401 || response.status === 403) {
           setLoadState("unauthorized");
         } else if (response.status === 409) {
-          const latest = await apiFetch("/api/v1/player-state");
-          const latestState = normalizeRemoteState(await latest.json());
-          setRevision(latestState.revision);
+          const conflictPayload = await response.json();
+          const latestState = normalizeRemoteState(
+            conflictPayload &&
+              typeof conflictPayload === "object" &&
+              (conflictPayload as { current?: unknown }).current
+              ? (conflictPayload as { current: unknown }).current
+              : (await (await apiFetch("/api/v1/player-state")).json()),
+          );
+          applyRemotePlayerState(latestState);
+          setStatusMessage(
+            "Состояние обновлено из другой вкладки, чтобы не потерять изменения.",
+          );
+        } else {
+          setStatusMessage(
+            `Не удалось сохранить состояние плеера (HTTP ${response.status}).`,
+          );
         }
       } catch {
         // State saving is best-effort; playback should continue during a brief outage.
@@ -794,7 +962,7 @@ export function PlayerApp() {
         saveInFlightRef.current = false;
       }
     },
-    [apiFetch, credentials, demoMode],
+    [apiFetch, applyRemotePlayerState, credentials, demoMode],
   );
 
   useEffect(() => {
@@ -888,8 +1056,13 @@ export function PlayerApp() {
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.matches("input, textarea, [contenteditable='true']")) return;
+      if (event.key === "Escape") {
+        setQueueOpen(false);
+        setNowPlayingOpen(false);
+        setSidebarOpen(false);
+        return;
+      }
+      if (shouldIgnoreGlobalShortcut(event.target)) return;
       if (event.code === "Space") {
         event.preventDefault();
         void togglePlayback();
@@ -991,13 +1164,13 @@ export function PlayerApp() {
           )
         }
         onLoadedMetadata={handleLoadedMetadata}
-        onPlay={() => setIsPlaying(true)}
+        onPlay={() => {
+          streamRetryRef.current = null;
+          setIsPlaying(true);
+        }}
         onPause={() => setIsPlaying(false)}
         onEnded={() => void moveToNext(true)}
-        onError={() => {
-          setIsPlaying(false);
-          setPlaybackError("Не удалось воспроизвести этот формат. Попробуйте позже.");
-        }}
+        onError={() => void handlePlaybackError()}
       />
 
       <div className="sr-only" aria-live="polite">
@@ -1141,7 +1314,12 @@ export function PlayerApp() {
       </nav>
 
       {nowPlayingOpen && currentTrack && (
-        <section className="now-playing" aria-label="Сейчас играет">
+        <section
+          className="now-playing"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Сейчас играет"
+        >
           <div className="now-playing-backdrop" style={coverStyle(currentTrack)} />
           <header className="now-header">
             <IconButton label="Свернуть плеер" onClick={() => setNowPlayingOpen(false)}>
@@ -1609,7 +1787,12 @@ function QueueSheet({
   return (
     <div className="sheet-layer">
       <button className="sheet-backdrop" type="button" aria-label="Закрыть очередь" onClick={onClose} />
-      <section className="queue-sheet" aria-label="Очередь воспроизведения">
+      <section
+        className="queue-sheet"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Очередь воспроизведения"
+      >
         <div className="sheet-handle" aria-hidden="true" />
         <header>
           <div>

@@ -82,6 +82,6 @@ test("ships PWA and private-player integration surfaces", async () => {
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 
   await assert.rejects(access(new URL("../app/_sites-preview/", import.meta.url)));
-  await access(new URL("../public/antra-icon.png", import.meta.url));
-  await access(new URL("../.openai/hosting.json", import.meta.url));
+  await assert.rejects(access(new URL("../app/chatgpt-auth.ts", import.meta.url)));
+  await assert.rejects(access(new URL("../db/index.ts", import.meta.url)));
 });

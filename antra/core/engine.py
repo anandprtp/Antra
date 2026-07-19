@@ -154,18 +154,6 @@ class DownloadEngine:
         if not track.artwork_url and getattr(result, "artwork_url", None):
             track.artwork_url = result.artwork_url
 
-    def _fetch_lyrics_if_needed(self, track: TrackMetadata) -> None:
-        if not self.cfg.fetch_lyrics or not self.lyrics:
-            return
-        if track.lyrics or track.synced_lyrics:
-            return
-        try:
-            plain, synced = self.lyrics.fetch(track)
-            track.lyrics = plain
-            track.synced_lyrics = synced
-        except Exception as e:
-            logger.debug(f"  ℹ  Lyrics fetch failed: {e}")
-
     @staticmethod
     def _enrich_genres_if_needed(track: TrackMetadata) -> None:
         """Populate track.genres from MusicBrainz when Spotify didn't provide any."""
@@ -678,6 +666,19 @@ class DownloadEngine:
         track_index: Optional[int] = None,
         track_total: Optional[int] = None,
     ) -> DownloadResult:
+        with self.organizer.track_lock(track):
+            return self._download_track_locked(
+                track,
+                track_index=track_index,
+                track_total=track_total,
+            )
+
+    def _download_track_locked(
+        self,
+        track: TrackMetadata,
+        track_index: Optional[int] = None,
+        track_total: Optional[int] = None,
+    ) -> DownloadResult:
         """Full pipeline for a single track."""
 
         # 1. Resume check — only skip if the existing file meets the current output format.
@@ -725,9 +726,6 @@ class DownloadEngine:
                     status=DownloadStatus.SKIPPED,
                     file_path=existing,
                 )
-
-        # 2. Fetch lyrics once (before download, non-blocking)
-        self._fetch_lyrics_if_needed(track)
 
         excluded_adapters: set[str] = set()
         # Adapters that were rate-limited get a second chance after all other
@@ -818,7 +816,6 @@ class DownloadEngine:
                 used_lossy_fallback = True
             self._hydrate_track_metadata(track, result)
             adapter.hydrate_track_metadata(track, result)
-            self._fetch_lyrics_if_needed(track)
             # Layout must use post-hydration metadata (album/year from the resolver, etc.)
             try:
                 output_base = self.organizer.get_output_path(track)
@@ -994,7 +991,12 @@ class DownloadEngine:
                 pre_enrich_snapshot = self._metadata_debug_snapshot(track)
                 try:
                     from antra.core.metadata_enricher import MetadataEnricher
-                    MetadataEnricher.enrich(track, result)
+                    MetadataEnricher.enrich(
+                        track,
+                        result,
+                        fetch_lyrics=self.cfg.fetch_lyrics,
+                        lyrics_fetcher=self.lyrics,
+                    )
                 except Exception:
                     self._enrich_track_metadata_if_needed(track)
                     self._enrich_genres_if_needed(track)
@@ -1153,6 +1155,13 @@ class DownloadEngine:
 
     def download_playlist(self, tracks: list[TrackMetadata]) -> list[DownloadResult]:
         """Download all tracks in a playlist in parallel, returning results in original order."""
+        self._output_lost.clear()
+        self._output_lost_message = ""
+        try:
+            self.organizer.root.mkdir(parents=True, exist_ok=True)
+            self.organizer.root.stat()
+        except OSError as exc:
+            self._signal_output_lost(exc)
         total = len(tracks)
         playlist_name = tracks[0].playlist_name if tracks and tracks[0].playlist_name else None
         self._emit(

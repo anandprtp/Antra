@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,15 +56,28 @@ class AccessStore:
         self.path = path.expanduser().resolve()
         self.static_allowed_user_ids = static_allowed_user_ids
         self.allow_first_claim = allow_first_claim
+        self._schema_lock = threading.Lock()
+        self._schema_ready = False
 
     def authorize_or_claim(self, user_id: int) -> AccessDecision:
         if user_id in self.static_allowed_user_ids:
             return AccessDecision(True, role="admin")
-        if self.static_allowed_user_ids:
-            return AccessDecision(False)
 
         try:
             with self._connection() as db:
+                self._ensure_schema_once(db)
+                row = db.execute(
+                    "SELECT role FROM bot_users WHERE telegram_user_id = ?",
+                    (user_id,),
+                ).fetchone()
+                if row is not None:
+                    self._protect_file()
+                    return AccessDecision(True, role=str(row[0]))
+
+                if self.static_allowed_user_ids or not self.allow_first_claim:
+                    self._protect_file()
+                    return AccessDecision(False)
+
                 self._begin(db)
                 row = db.execute(
                     "SELECT role FROM bot_users WHERE telegram_user_id = ?",
@@ -71,11 +85,9 @@ class AccessStore:
                 ).fetchone()
                 if row is not None:
                     db.execute("COMMIT")
-                    self._protect_file()
                     return AccessDecision(True, role=str(row[0]))
-
                 user_count = int(db.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0])
-                if user_count == 0 and self.allow_first_claim:
+                if user_count == 0:
                     db.execute(
                         "INSERT INTO bot_users(telegram_user_id, role, added_at) VALUES (?, 'admin', ?)",
                         (user_id, int(time.time())),
@@ -92,6 +104,24 @@ class AccessStore:
             self._protect_file()
             raise AccessStoreError("access database is unavailable") from exc
 
+    def authorize_existing(self, user_id: int) -> AccessDecision:
+        """Check current access without ever claiming first-admin ownership."""
+        if user_id in self.static_allowed_user_ids:
+            return AccessDecision(True, role="admin")
+        try:
+            with self._connection() as db:
+                self._ensure_schema_once(db)
+                row = db.execute(
+                    "SELECT role FROM bot_users WHERE telegram_user_id = ?",
+                    (user_id,),
+                ).fetchone()
+            if row is None:
+                return AccessDecision(False)
+            return AccessDecision(True, role=str(row[0]))
+        except (OSError, sqlite3.Error) as exc:
+            logger.exception("Access database is unavailable")
+            raise AccessStoreError("access database is unavailable") from exc
+
     def create_invite(
         self,
         admin_user_id: int,
@@ -104,6 +134,7 @@ class AccessStore:
         token_hash = self._token_hash(token)
         try:
             with self._connection() as db:
+                self._ensure_schema_once(db)
                 self._begin(db)
                 if not self._is_admin(db, admin_user_id):
                     db.execute("ROLLBACK")
@@ -137,6 +168,7 @@ class AccessStore:
         token_hash = self._token_hash(token)
         try:
             with self._connection() as db:
+                self._ensure_schema_once(db)
                 self._begin(db)
                 existing = db.execute(
                     "SELECT role FROM bot_users WHERE telegram_user_id = ?",
@@ -180,21 +212,20 @@ class AccessStore:
             raise AccessStoreError("access database is unavailable") from exc
 
     def list_members(self, admin_user_id: int) -> list[tuple[int, str]]:
-        if self.static_allowed_user_ids:
-            if admin_user_id not in self.static_allowed_user_ids:
-                raise PermissionError("only an admin can list members")
-            return sorted((user_id, "admin") for user_id in self.static_allowed_user_ids)
         try:
             with self._connection() as db:
-                self._begin(db)
+                self._ensure_schema_once(db)
                 if not self._is_admin(db, admin_user_id):
-                    db.execute("ROLLBACK")
                     raise PermissionError("only an admin can list members")
                 rows = db.execute(
                     "SELECT telegram_user_id, role FROM bot_users ORDER BY role, telegram_user_id"
                 ).fetchall()
-                db.execute("COMMIT")
-                return [(int(row[0]), str(row[1])) for row in rows]
+                members = {
+                    int(user_id): "admin"
+                    for user_id in self.static_allowed_user_ids
+                }
+                members.update((int(row[0]), str(row[1])) for row in rows)
+                return sorted(members.items(), key=lambda item: (item[1], item[0]))
         except PermissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -232,11 +263,16 @@ class AccessStore:
 
     def _begin(self, db: sqlite3.Connection) -> None:
         db.execute("BEGIN IMMEDIATE")
-        try:
+
+    def _ensure_schema_once(self, db: sqlite3.Connection) -> None:
+        if self._schema_ready:
+            return
+        with self._schema_lock:
+            if self._schema_ready:
+                return
             self._ensure_schema(db)
-        except Exception:
-            db.execute("ROLLBACK")
-            raise
+            self._schema_ready = True
+            self._protect_file()
 
     def _is_admin(self, db: sqlite3.Connection, user_id: int) -> bool:
         if user_id in self.static_allowed_user_ids:

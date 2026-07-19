@@ -122,6 +122,7 @@ class TelegramConfig:
                 or not parsed_url.netloc
                 or parsed_url.username
                 or parsed_url.password
+                or parsed_url.path not in {"", "/"}
                 or parsed_url.query
                 or parsed_url.fragment
             ):
@@ -140,6 +141,7 @@ class TelegramConfig:
                 or not parsed_player_url.netloc
                 or parsed_player_url.username
                 or parsed_player_url.password
+                or parsed_player_url.path not in {"", "/"}
                 or parsed_player_url.query
                 or parsed_player_url.fragment
             ):

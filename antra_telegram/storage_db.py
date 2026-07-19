@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS stored_tracks (
     total_bytes INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
     part_count INTEGER NOT NULL,
+    part_bytes INTEGER NOT NULL DEFAULT 18000000,
+    layout_version INTEGER NOT NULL DEFAULT 1,
     storage_chat_id INTEGER NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('uploading', 'ready', 'failed')),
     last_error TEXT,
@@ -58,6 +60,22 @@ class StoredPart:
     file_unique_id: str | None
 
 
+@dataclass(frozen=True)
+class StoredTrack:
+    track_id: str
+    title: str
+    artist: str
+    album: str
+    duration_seconds: float | None
+    filename: str
+    mime_type: str
+    total_bytes: int
+    sha256: str
+    part_count: int
+    part_bytes: int
+    storage_chat_id: int
+
+
 class StorageCatalog:
     """Durable catalog for Telegram-backed music objects.
 
@@ -69,17 +87,28 @@ class StorageCatalog:
         self.path = path.expanduser().resolve()
         self._ensure_schema()
 
-    def is_ready(self, track_id: str, sha256: str) -> bool:
+    def is_ready(
+        self,
+        track_id: str,
+        sha256: str,
+        *,
+        part_bytes: int | None = None,
+        total_bytes: int | None = None,
+    ) -> bool:
         with self._connection() as db:
             row = db.execute(
                 """
-                SELECT part_count, sha256
+                SELECT part_count, sha256, part_bytes, total_bytes
                 FROM stored_tracks
                 WHERE track_id = ? AND state = 'ready'
                 """,
                 (track_id,),
             ).fetchone()
             if row is None or str(row[1]) != sha256:
+                return False
+            if part_bytes is not None and int(row[2]) != part_bytes:
+                return False
+            if total_bytes is not None and int(row[3]) != total_bytes:
                 return False
             stored_parts = int(
                 db.execute(
@@ -98,15 +127,28 @@ class StorageCatalog:
         total_bytes: int,
         sha256: str,
         part_count: int,
+        part_bytes: int,
         storage_chat_id: int,
     ) -> None:
         now = int(time.time())
         with self._connection() as db:
             existing = db.execute(
-                "SELECT sha256 FROM stored_tracks WHERE track_id = ?",
+                """
+                SELECT sha256, total_bytes, part_count, part_bytes,
+                       storage_chat_id
+                FROM stored_tracks
+                WHERE track_id = ?
+                """,
                 (track_id,),
             ).fetchone()
-            if existing is not None and str(existing[0]) != sha256:
+            layout = (
+                sha256,
+                total_bytes,
+                part_count,
+                part_bytes,
+                storage_chat_id,
+            )
+            if existing is not None and tuple(existing) != layout:
                 db.execute(
                     "DELETE FROM telegram_parts WHERE track_id = ?",
                     (track_id,),
@@ -116,9 +158,10 @@ class StorageCatalog:
                 INSERT INTO stored_tracks(
                     track_id, title, artist, album, duration_seconds, filename,
                     mime_type, total_bytes, sha256, part_count, storage_chat_id,
-                    state, last_error, created_at, updated_at
+                    part_bytes, layout_version, state, last_error, created_at,
+                    updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'uploading', NULL, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'uploading', NULL, ?, ?)
                 ON CONFLICT(track_id) DO UPDATE SET
                     title = excluded.title,
                     artist = excluded.artist,
@@ -129,6 +172,8 @@ class StorageCatalog:
                     total_bytes = excluded.total_bytes,
                     sha256 = excluded.sha256,
                     part_count = excluded.part_count,
+                    part_bytes = excluded.part_bytes,
+                    layout_version = excluded.layout_version,
                     storage_chat_id = excluded.storage_chat_id,
                     state = 'uploading',
                     last_error = NULL,
@@ -146,6 +191,7 @@ class StorageCatalog:
                     sha256,
                     part_count,
                     storage_chat_id,
+                    part_bytes,
                     now,
                     now,
                 ),
@@ -242,12 +288,54 @@ class StorageCatalog:
             ).fetchall()
         return [StoredPart(*row) for row in rows]
 
+    def ready_track(self, track_id: str) -> StoredTrack | None:
+        with self._connection() as db:
+            row = db.execute(
+                """
+                SELECT track_id, title, artist, album, duration_seconds,
+                       filename, mime_type, total_bytes, sha256, part_count,
+                       part_bytes, storage_chat_id
+                FROM stored_tracks
+                WHERE track_id = ? AND state = 'ready'
+                """,
+                (track_id,),
+            ).fetchone()
+        return StoredTrack(*row) if row else None
+
+    def ready_tracks(self) -> list[StoredTrack]:
+        with self._connection() as db:
+            rows = db.execute(
+                """
+                SELECT track_id, title, artist, album, duration_seconds,
+                       filename, mime_type, total_bytes, sha256, part_count,
+                       part_bytes, storage_chat_id
+                FROM stored_tracks
+                WHERE state = 'ready'
+                ORDER BY artist, album, title, track_id
+                """
+            ).fetchall()
+        return [StoredTrack(*row) for row in rows]
+
     def _ensure_schema(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as db:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute(CREATE_TRACKS_TABLE)
             db.execute(CREATE_PARTS_TABLE)
+            columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(stored_tracks)")
+            }
+            if "part_bytes" not in columns:
+                db.execute(
+                    "ALTER TABLE stored_tracks ADD COLUMN "
+                    "part_bytes INTEGER NOT NULL DEFAULT 18000000"
+                )
+            if "layout_version" not in columns:
+                db.execute(
+                    "ALTER TABLE stored_tracks ADD COLUMN "
+                    "layout_version INTEGER NOT NULL DEFAULT 1"
+                )
         self._protect_file()
 
     def _connection(self) -> sqlite3.Connection:

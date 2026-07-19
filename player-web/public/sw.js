@@ -1,8 +1,7 @@
-const CACHE_NAME = "antra-shell-v2";
+const CACHE_NAME = "antra-shell-v3";
 const SHELL = [
   "/",
   "/manifest.webmanifest",
-  "/antra-icon.png",
   "/icon-192.png",
   "/icon-512.png",
 ];

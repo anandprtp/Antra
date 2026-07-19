@@ -12,6 +12,8 @@ from antra.core.config import Config, load_config
 from antra.core.control import DownloadController
 from antra.core.engine import DownloadEngine, EngineConfig
 from antra.core.events import EngineEvent
+from antra.core.apple_library import is_apple_library_url
+from antra.core.apple_fetcher import is_apple_music_url
 from antra.core.spotify import SpotifyAvailabilityError, SpotifyResourceError
 from antra.core.models import (
     BulkDownloadProgress,
@@ -304,12 +306,24 @@ class AntraService:
             return False
 
         manifest = None
-        try:
-            from antra.core.endpoint_manifest import load_endpoint_manifest
+        manifest_sources = {
+            "hifi",
+            "tidal",
+            "tidal_mirror",
+            "qobuz",
+            "qobuz_mirror",
+            "deezer",
+            "deezer_mirror",
+            "apple",
+            "amazon",
+        }
+        if not exclusive_sources or exclusive_sources & manifest_sources:
+            try:
+                from antra.core.endpoint_manifest import load_endpoint_manifest
 
-            manifest = load_endpoint_manifest()
-        except Exception as e:
-            logger.debug(f"[Sources] Endpoint manifest unavailable: {e}")
+                manifest = load_endpoint_manifest()
+            except Exception as e:
+                logger.debug(f"[Sources] Endpoint manifest unavailable: {e}")
 
         # Soulseek via slskd
         soulseek_base_url = (getattr(cfg, "soulseek_base_url", "") or "").strip()
@@ -530,7 +544,7 @@ class AntraService:
         env_apple_mirror = (getattr(cfg, "apple_mirror_url", "") or "").strip().rstrip("/")
         if env_apple_mirror:
             mirror_apple_url = env_apple_mirror
-        if not mirror_apple_url:
+        if source_group_enabled("apple") and not mirror_apple_url:
             mirror_apple_url = _fetch_gist_apple_mirror(cfg)
         if mirror_apple_url and mirror_apple_url not in apple_mirrors:
             apple_mirrors = [mirror_apple_url] + apple_mirrors
@@ -898,8 +912,9 @@ class AntraService:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
 
-        from antra.core.apple_library import is_apple_library_url
+        from antra.core.amazon_music_fetcher import is_amazon_music_url
         from antra.core.external_music_fetcher import is_deezer_url, is_qobuz_url, is_tidal_url
+        from antra.core.soundcloud_fetcher import is_soundcloud_url
         from antra.core.youtube_music_fetcher import is_youtube_music_url
 
         # Handle Apple Music library pseudo-URLs
@@ -908,18 +923,18 @@ class AntraService:
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
 
         # Handle Apple Music URLs
-        elif "music.apple.com" in playlist:
+        elif is_apple_music_url(playlist):
             tracks = self._fetch_apple_tracks(playlist, cfg, page_callback=page_callback)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
 
         # Handle SoundCloud URLs
-        elif "soundcloud.com" in playlist:
+        elif is_soundcloud_url(playlist):
             tracks = self._fetch_soundcloud_tracks(playlist, cfg)
             self._apply_request_kind(tracks, playlist)
 
         # Handle Amazon Music URLs
-        elif "music.amazon." in playlist:
+        elif is_amazon_music_url(playlist):
             tracks = self._fetch_amazon_music_tracks(playlist, cfg)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="amazon", rule="exclusive")
@@ -960,7 +975,11 @@ class AntraService:
             # (Tidal mirror, Qobuz mirror, Amazon, Deezer, etc.) based on quality mode.
 
         # Handle Spotify Liked Songs (collection/tracks) — requires sp_dc
-        elif "open.spotify.com/collection/tracks" in playlist:
+        elif (
+            urlparse(playlist).scheme in {"http", "https"}
+            and urlparse(playlist).hostname == "open.spotify.com"
+            and urlparse(playlist).path.rstrip("/") == "/collection/tracks"
+        ):
             sp_dc = getattr(cfg, "spotify_sp_dc", "") or ""
             if not sp_dc:
                 raise ValueError(
@@ -1268,7 +1287,7 @@ class AntraService:
                 original_tracks = list(tracks)
                 tracks = spotify.batch_enrich_album_data(tracks)
                 tracks = self._preserve_track_identity(original_tracks, tracks)
-            elif "music.apple.com" in playlist or is_apple_library_url(playlist):
+            elif is_apple_music_url(playlist) or is_apple_library_url(playlist):
                 tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
             elif not (
                 "soundcloud.com" in playlist

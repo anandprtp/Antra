@@ -65,6 +65,7 @@ class TelegramMusicBot:
         self._playlist_action_lock = asyncio.Lock()
         self._playlist_actions: dict[str, set[int]] = {}
         self._storage_tasks: set[asyncio.Task] = set()
+        self._storage_semaphore = asyncio.Semaphore(2)
 
     async def _authorize(self, update: Update, *, require_admin: bool = False) -> bool:
         user = update.effective_user
@@ -158,6 +159,7 @@ class TelegramMusicBot:
             "/status — проверить состояние бота\n"
             "/files — показать треки в локальной библиотеке\n"
             "/rescan — перечитать локальную музыкальную библиотеку\n"
+            "/archive — сохранить локальную библиотеку в Telegram (администратор)\n"
             "/player — открыть браузерный музыкальный плеер\n"
             "/invite — создать одноразовую ссылку для нового участника\n"
             "/members — показать администратора и участников"
@@ -270,6 +272,88 @@ class TelegramMusicBot:
         await asyncio.to_thread(self.registry.refresh)
         await update.effective_message.reply_text(f"Библиотека обновлена: {count} треков.")
 
+    async def archive_library(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update, require_admin=True):
+            return
+        if self.telegram_storage is None:
+            await update.effective_message.reply_text(
+                "Telegram-хранилище не включено в конфигурации."
+            )
+            return
+        if any(
+            task.get_name() == "telegram-storage-backfill" and not task.done()
+            for task in self._storage_tasks
+        ):
+            await update.effective_message.reply_text(
+                "Архивация библиотеки уже выполняется."
+            )
+            return
+
+        status = await update.effective_message.reply_text(
+            "Начинаю фоновую архивацию локальной библиотеки в Telegram."
+        )
+        storage_chat_id = (
+            self.config.storage_chat_id
+            or await asyncio.to_thread(self.access_store.admin_id)
+            or update.effective_chat.id
+        )
+        task = asyncio.create_task(
+            self._archive_library_task(
+                update.effective_message.get_bot(),
+                status,
+                storage_chat_id,
+            ),
+            name="telegram-storage-backfill",
+        )
+        self._storage_tasks.add(task)
+        task.add_done_callback(self._storage_tasks.discard)
+
+    async def _archive_library_task(self, bot, status, chat_id: int) -> None:
+        assert self.telegram_storage is not None
+        assets = [
+            (media_id, asset)
+            for media_id, asset in self.registry.list_assets()
+            if asset.path.is_file()
+            and ".antra-telegram-cache" not in asset.path.parts
+        ]
+        archived = skipped = failed = 0
+        for index, (media_id, asset) in enumerate(assets, start=1):
+            try:
+                async with self._storage_semaphore:
+                    uploaded = await self.telegram_storage.archive(
+                        bot,
+                        asset,
+                        track_id=media_id,
+                        chat_id=chat_id,
+                    )
+                self.registry.register_stored(media_id, asset)
+                if uploaded:
+                    archived += 1
+                else:
+                    skipped += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failed += 1
+                logger.exception(
+                    "Telegram backfill failed for media %s",
+                    media_id,
+                )
+            if index == len(assets) or index % 10 == 0:
+                try:
+                    await status.edit_text(
+                        f"Архивация: {index}/{len(assets)} • "
+                        f"новых {archived} • уже были {skipped} • ошибок {failed}"
+                    )
+                except TelegramError:
+                    logger.debug("Could not update Telegram archive progress")
+        if not assets:
+            await status.edit_text("В локальной библиотеке пока нет треков.")
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
             return
@@ -320,7 +404,13 @@ class TelegramMusicBot:
             return
 
         await status.edit_text(f"Найдено: {asset.display_name}")
-        await self._deliver(message, asset)
+        try:
+            await self._deliver(message, asset)
+        except (OSError, TelegramError, RuntimeError):
+            logger.exception("Music delivery failed")
+            await status.edit_text(
+                "Трек найден, но его не удалось доставить. Попробуйте ещё раз."
+            )
 
     async def _show_playlist(self, update: Update, url: str) -> None:
         message = update.effective_message
@@ -677,17 +767,41 @@ class TelegramMusicBot:
     ) -> None:
         assert self.telegram_storage is not None
         try:
-            await self.telegram_storage.archive(
-                bot,
-                asset,
-                track_id=media_id,
-                chat_id=chat_id,
+            async with self._storage_semaphore:
+                await self.telegram_storage.archive(
+                    bot,
+                    asset,
+                    track_id=media_id,
+                    chat_id=chat_id,
+                )
+                self.registry.register_stored(media_id, asset)
+        except asyncio.CancelledError:
+            logger.info(
+                "Telegram storage archive cancelled for media %s",
+                media_id,
             )
+            raise
         except Exception:
             logger.exception(
                 "Telegram storage archive failed for media %s",
                 media_id,
             )
+
+    async def shutdown(self) -> None:
+        tasks = tuple(self._storage_tasks)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=30)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            try:
+                task.result()
+            except (asyncio.CancelledError, Exception):
+                # Each archive task already logs its own actionable failure.
+                pass
 
     async def _send_vlc(self, message, asset: TrackAsset) -> None:
         try:

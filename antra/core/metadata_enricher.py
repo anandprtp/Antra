@@ -31,14 +31,24 @@ _enrich_cache: dict[str, dict[str, Any]] = {}
 _enrich_cache_lock = threading.Lock()
 
 
-def _cache_key(track: "TrackMetadata", has_source_meta: bool = False) -> str:
+def _cache_key(
+    track: "TrackMetadata",
+    has_source_meta: bool = False,
+    fetch_lyrics: bool = True,
+) -> str:
     isrc = (track.isrc or "").strip().upper()
     if isrc:
-        return f"isrc:{isrc}:sm:{int(has_source_meta)}"
+        return (
+            f"isrc:{isrc}:sm:{int(has_source_meta)}:"
+            f"lyrics:{int(fetch_lyrics)}"
+        )
     title = (track.title or "").strip().lower()
     artist = (track.primary_artist or "").strip().lower()
     album = (track.album or "").strip().lower()
-    return f"taa:{title}|{artist}|{album}:sm:{int(has_source_meta)}"
+    return (
+        f"taa:{title}|{artist}|{album}:sm:{int(has_source_meta)}:"
+        f"lyrics:{int(fetch_lyrics)}"
+    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -51,6 +61,9 @@ class MetadataEnricher:
     def enrich(
         track: "TrackMetadata",
         result: Optional["SearchResult"] = None,
+        *,
+        fetch_lyrics: bool = True,
+        lyrics_fetcher: Any = None,
     ) -> None:
         """Enrich track in-place.  Never raises — silently degrades on any failure.
 
@@ -58,7 +71,7 @@ class MetadataEnricher:
         fields are available for embedding into the file tags.
         """
         has_sm = bool(result and result.source_metadata)
-        ck = _cache_key(track, has_sm)
+        ck = _cache_key(track, has_sm, fetch_lyrics)
         with _enrich_cache_lock:
             if ck in _enrich_cache:
                 _apply_cache(track, _enrich_cache[ck])
@@ -85,7 +98,8 @@ class MetadataEnricher:
             _enrich_from_musicbrainz(track, enriched, diagnostics["musicbrainz"])
 
             # 3 ── Lyrics ──────────────────────────────────────────────────
-            _enrich_lyrics(track, enriched)
+            if fetch_lyrics:
+                _enrich_lyrics(track, enriched, lyrics_fetcher)
 
             # 4 ── Artwork upgrade ─────────────────────────────────────────
             _upgrade_artwork(track, enriched)
@@ -597,7 +611,11 @@ def _mb_text_search_genre(track: "TrackMetadata", out: dict[str, Any]) -> None:
 # ── 5. Lyrics ────────────────────────────────────────────────────────────────
 
 
-def _enrich_lyrics(track: "TrackMetadata", out: dict[str, Any]) -> None:
+def _enrich_lyrics(
+    track: "TrackMetadata",
+    out: dict[str, Any],
+    lyrics_fetcher: Any = None,
+) -> None:
     if track.lyrics or track.synced_lyrics:
         return
     if not track.title or not track.artists:
@@ -605,7 +623,7 @@ def _enrich_lyrics(track: "TrackMetadata", out: dict[str, Any]) -> None:
 
     try:
         from antra.utils.lyrics import LyricsFetcher
-        fetcher = LyricsFetcher()
+        fetcher = lyrics_fetcher or LyricsFetcher()
         plain, synced = fetcher.fetch(track)
         if plain:
             track.lyrics = plain

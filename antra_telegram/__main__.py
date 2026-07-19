@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -6,6 +7,7 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -16,6 +18,7 @@ from .config import ConfigError, TelegramConfig
 from .jobs import JobCoordinator, MusicResolver
 from .library import LibraryIndex
 from .media import MediaRegistry, MediaServer
+from .models import TrackAsset
 from .playlist_sessions import PlaylistSessionStore
 from .security import LinkSigner
 from .storage_db import StorageCatalog
@@ -30,9 +33,38 @@ def build_application(config: TelegramConfig) -> Application:
     signer = LinkSigner(config.link_secret)
     registry = MediaRegistry(config.library_dir, config.link_secret)
     registry.refresh()
+    telegram_storage = None
+    if config.storage_enabled:
+        storage_catalog = StorageCatalog(config.storage_db_path)
+        telegram_storage = TelegramStorage(
+            storage_catalog,
+            part_bytes=config.storage_part_bytes,
+        )
+        for stored in storage_catalog.ready_tracks():
+            registry.register_stored(
+                stored.track_id,
+                TrackAsset(
+                    (
+                        config.library_dir
+                        / ".antra-telegram-cache"
+                        / stored.track_id
+                        / Path(stored.filename).name
+                    ),
+                    stored.title,
+                    stored.artist,
+                    stored.album,
+                    stored.duration_seconds,
+                    source="telegram",
+                ),
+            )
     web_session_store = WebSessionStore(
         config.web_sessions_db_path,
         default_ttl_seconds=config.web_session_ttl_seconds,
+    )
+    access_store = AccessStore(
+        config.access_db_path,
+        static_allowed_user_ids=config.allowed_user_ids,
+        allow_first_claim=config.claim_first_user,
     )
     media_server = MediaServer(
         registry=registry,
@@ -46,6 +78,8 @@ def build_application(config: TelegramConfig) -> Application:
         web_link_ttl_seconds=min(config.web_session_ttl_seconds, 86_400),
         player_upstream_url=config.player_upstream_url,
         player_base_url=config.player_url,
+        access_store=access_store,
+        telegram_storage=telegram_storage,
     )
     resolver = MusicResolver(config, library)
     coordinator = JobCoordinator(
@@ -53,22 +87,11 @@ def build_application(config: TelegramConfig) -> Application:
         max_concurrent=config.max_concurrent_jobs,
         max_pending=config.max_pending_jobs,
     )
-    access_store = AccessStore(
-        config.access_db_path,
-        static_allowed_user_ids=config.allowed_user_ids,
-        allow_first_claim=config.claim_first_user,
-    )
     playlist_store = PlaylistSessionStore(
         config.playlist_db_path,
         ttl_seconds=config.playlist_session_ttl_seconds,
         max_tracks=config.max_playlist_tracks,
     )
-    telegram_storage = None
-    if config.storage_enabled:
-        telegram_storage = TelegramStorage(
-            StorageCatalog(config.storage_db_path),
-            part_bytes=config.storage_part_bytes,
-        )
     bot = TelegramMusicBot(
         config,
         access_store,
@@ -85,16 +108,27 @@ def build_application(config: TelegramConfig) -> Application:
         await media_server.start()
 
     async def post_shutdown(application: Application) -> None:
+        await bot.shutdown()
         await media_server.stop()
+
+    async def handle_error(
+        update: object,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        logging.getLogger(__name__).exception(
+            "Unhandled Telegram update error",
+            exc_info=context.error,
+        )
 
     application = (
         Application.builder()
         .token(config.bot_token)
-        .concurrent_updates(False)
+        .concurrent_updates(max(2, min(config.max_pending_jobs, 8)))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
     )
+    media_server.configure_storage_bot(lambda: application.bot)
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CommandHandler("help", bot.help))
     application.add_handler(CommandHandler("status", bot.status))
@@ -102,12 +136,14 @@ def build_application(config: TelegramConfig) -> Application:
     application.add_handler(CommandHandler("invite", bot.invite))
     application.add_handler(CommandHandler("members", bot.members))
     application.add_handler(CommandHandler("rescan", bot.rescan))
+    application.add_handler(CommandHandler("archive", bot.archive_library))
     application.add_handler(CommandHandler("player", bot.player))
     application.add_handler(
         CallbackQueryHandler(bot.handle_playlist_callback, pattern=r"^pl:")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_text))
     application.add_handler(MessageHandler(filters.COMMAND, bot.unknown_command))
+    application.add_error_handler(handle_error)
     return application
 
 
