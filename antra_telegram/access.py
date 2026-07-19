@@ -35,6 +35,10 @@ class AccessStoreError(RuntimeError):
     """The access database could not safely authorize or update a user."""
 
 
+class ProtectedAdminError(PermissionError):
+    """An administrator cannot be removed through member management."""
+
+
 @dataclass(frozen=True)
 class AccessDecision:
     allowed: bool
@@ -234,6 +238,85 @@ class AccessStore:
         except PermissionError:
             raise
         except (OSError, sqlite3.Error) as exc:
+            raise AccessStoreError("access database is unavailable") from exc
+
+    def remove_member(
+        self,
+        admin_user_id: int,
+        target_user_id: int,
+    ) -> bool:
+        for name, user_id in (
+            ("admin_user_id", admin_user_id),
+            ("target_user_id", target_user_id),
+        ):
+            if (
+                isinstance(user_id, bool)
+                or not isinstance(user_id, int)
+                or user_id <= 0
+                or user_id > 2**63 - 1
+            ):
+                raise ValueError(f"{name} must be a positive Telegram user ID")
+        try:
+            with self._connection() as db:
+                self._ensure_schema_once(db)
+                self._begin(db)
+                if not self._is_admin(db, admin_user_id):
+                    db.execute("ROLLBACK")
+                    raise PermissionError("only an admin can remove members")
+                if (
+                    target_user_id == admin_user_id
+                    or target_user_id in self.static_allowed_user_ids
+                ):
+                    db.execute("ROLLBACK")
+                    raise ProtectedAdminError("an administrator cannot be removed")
+                row = db.execute(
+                    "SELECT role FROM bot_users WHERE telegram_user_id = ?",
+                    (target_user_id,),
+                ).fetchone()
+                if row is not None and str(row[0]) != "member":
+                    db.execute("ROLLBACK")
+                    raise ProtectedAdminError("an administrator cannot be removed")
+                deleted = db.execute(
+                    """
+                    DELETE FROM bot_users
+                    WHERE telegram_user_id = ? AND role = 'member'
+                    """,
+                    (target_user_id,),
+                ).rowcount
+                db.execute("COMMIT")
+            self._protect_file()
+            return deleted == 1
+        except (PermissionError, ProtectedAdminError, ValueError):
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            self._protect_file()
+            raise AccessStoreError("access database is unavailable") from exc
+
+    def revoke_unused_invites(self, admin_user_id: int) -> int:
+        if (
+            isinstance(admin_user_id, bool)
+            or not isinstance(admin_user_id, int)
+            or admin_user_id <= 0
+            or admin_user_id > 2**63 - 1
+        ):
+            raise ValueError("admin_user_id must be a positive Telegram user ID")
+        try:
+            with self._connection() as db:
+                self._ensure_schema_once(db)
+                self._begin(db)
+                if not self._is_admin(db, admin_user_id):
+                    db.execute("ROLLBACK")
+                    raise PermissionError("only an admin can revoke invitations")
+                deleted = db.execute(
+                    "DELETE FROM bot_invites WHERE used_at IS NULL"
+                ).rowcount
+                db.execute("COMMIT")
+            self._protect_file()
+            return max(0, deleted)
+        except (PermissionError, ValueError):
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            self._protect_file()
             raise AccessStoreError("access database is unavailable") from exc
 
     def admin_id(self) -> int | None:

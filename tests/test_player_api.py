@@ -81,6 +81,66 @@ def test_web_sessions_are_hashed_expiring_and_revocable(tmp_path: Path):
     assert store.authenticate(second, now=2_001) is None
 
 
+def test_revoke_user_invalidates_all_sessions_and_pending_launches(tmp_path: Path):
+    store = WebSessionStore(tmp_path / "web.sqlite3")
+    first = store.issue(123, now=1_000)
+    second = store.issue(123, now=1_000)
+    other = store.issue(456, now=1_000)
+    launch = store.issue_launch(123, now=1_000)
+
+    assert store.revoke_user(123, now=1_001) == 2
+    assert store.authenticate(first, now=1_001) is None
+    assert store.authenticate(second, now=1_001) is None
+    assert store.authenticate(other, now=1_001) is not None
+    assert store.consume_launch(launch, now=1_001) is None
+    assert store.revoke_user(123, now=1_002) == 0
+
+
+def test_player_launch_cannot_recreate_access_after_member_removal(
+    tmp_path: Path,
+):
+    async def scenario():
+        registry = MediaRegistry(tmp_path, SECRET)
+        sessions = WebSessionStore(tmp_path / "web.sqlite3")
+        access = AccessStore(
+            tmp_path / "access.sqlite3",
+            static_allowed_user_ids=frozenset({111}),
+        )
+        invite = access.create_invite(111, ttl_seconds=3600, now=1_000)
+        assert access.redeem_invite(222, invite, now=1_001).allowed
+        launch = sessions.issue_launch(222, now=1_002)
+        assert access.remove_member(111, 222)
+
+        server = MediaServer(
+            registry,
+            LinkSigner(SECRET),
+            "https://music.example",
+            "127.0.0.1",
+            0,
+            3600,
+            web_session_store=sessions,
+            player_base_url="https://music.example",
+            access_store=access,
+        )
+        client = TestClient(TestServer(server.create_app()))
+        await client.start_server()
+        try:
+            response = await client.post(
+                "/api/v1/player-launch",
+                json={"launch": launch},
+            )
+            assert response.status == 401
+            assert sessions.consume_launch(launch) is None
+            with sqlite3.connect(sessions.path) as connection:
+                assert connection.execute(
+                    "SELECT COUNT(*) FROM web_sessions WHERE user_id = 222"
+                ).fetchone()[0] == 0
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+
+
 def test_player_state_is_persistent_owner_scoped_and_revision_checked(tmp_path: Path):
     path = tmp_path / "web.sqlite3"
     store = WebSessionStore(path)

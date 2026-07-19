@@ -1,7 +1,7 @@
 import asyncio
 import concurrent.futures
 import hashlib
-import os
+import json
 import sqlite3
 import threading
 import time
@@ -21,7 +21,11 @@ from antra.core.service import AntraService
 from antra.core.youtube_music_fetcher import YouTubeMusicFetcher
 from antra.sources.amazon import AmazonAdapter
 from antra.sources.youtube import YouTubeAdapter
-from antra_telegram.access import AccessStore, AccessStoreError
+from antra_telegram.access import (
+    AccessStore,
+    AccessStoreError,
+    ProtectedAdminError,
+)
 from antra_telegram.__main__ import _register_stored_tracks, build_application
 from antra_telegram.config import ConfigError, TelegramConfig
 from antra_telegram.bot import TelegramMusicBot
@@ -40,7 +44,11 @@ from antra_telegram.playlist_ui import parse_playlist_callback, render_playlist_
 from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
 from antra_telegram.splitter import estimate_segment_seconds
-from antra_telegram.storage_db import StorageCatalog, StoredPart
+from antra_telegram.storage_db import (
+    StorageCatalog,
+    StorageCatalogBackupError,
+    StoredPart,
+)
 from antra_telegram.telegram_storage import (
     TelegramStorage,
     TelegramStorageCorruptionError,
@@ -51,6 +59,7 @@ from antra_telegram.tunnel_supervisor import (
     QUICK_TUNNEL_URL,
     update_dotenv_value,
 )
+from antra_telegram.web_sessions import WebSessionStore
 
 
 SECRET = b"test-secret-that-is-long-enough-123456"
@@ -1055,6 +1064,282 @@ def test_telegram_storage_archives_restorable_cloud_parts(tmp_path: Path):
     asyncio.run(scenario())
 
 
+def test_storage_catalog_manifest_round_trip_is_portable_and_idempotent(
+    tmp_path: Path,
+):
+    async def scenario():
+        source = tmp_path / "Music" / "Artist" / "Album" / "01 - Track.mp3"
+        source.parent.mkdir(parents=True)
+        media_payload = b"portable-telegram-catalog-payload"
+        source.write_bytes(media_payload)
+        cloud_parts: dict[str, bytes] = {}
+
+        class FakeBot:
+            async def send_document(self, chat_id, document, **kwargs):
+                file_id = f"file-{len(cloud_parts) + 1}"
+                cloud_parts[file_id] = document.read()
+                return SimpleNamespace(
+                    chat_id=chat_id,
+                    message_id=len(cloud_parts),
+                    document=SimpleNamespace(
+                        file_id=file_id,
+                        file_unique_id=f"unique-{file_id}",
+                    ),
+                )
+
+            async def get_file(self, file_id):
+                class File:
+                    async def download_to_drive(self, custom_path):
+                        Path(custom_path).write_bytes(cloud_parts[file_id])
+
+                return File()
+
+        bot = FakeBot()
+        original = StorageCatalog(tmp_path / "original.sqlite3")
+        storage = TelegramStorage(original, part_bytes=8)
+        asset = TrackAsset(source, "Track", "Artist", "Album", 123.5)
+        await storage.archive(
+            bot,
+            asset,
+            track_id="portable-track",
+            chat_id=777,
+        )
+
+        manifest = original.export_manifest(8487952349, now=1_000)
+        decoded = json.loads(manifest)
+        assert decoded["format"] == "antra.telegram-storage-catalog"
+        assert decoded["version"] == 1
+        assert decoded["bot_id"] == 8487952349
+        assert len(decoded["tracks"]) == 1
+
+        recovered = StorageCatalog(tmp_path / "recovered.sqlite3")
+        recovered_storage = TelegramStorage(recovered, part_bytes=8)
+        result = await recovered_storage.import_catalog(
+            manifest,
+            expected_bot_id=8487952349,
+        )
+        assert (result.imported, result.skipped) == (1, 0)
+        repeated = await recovered_storage.import_catalog(
+            manifest,
+            expected_bot_id=8487952349,
+        )
+        assert (repeated.imported, repeated.skipped) == (0, 1)
+
+        source.unlink()
+        restored = await recovered_storage.restore(
+            bot,
+            track_id="portable-track",
+            destination=source,
+        )
+        assert restored.path.read_bytes() == media_payload
+        assert recovered_storage._locks == {}
+
+        with pytest.raises(StorageCatalogBackupError):
+            recovered.import_manifest(
+                manifest,
+                expected_bot_id=1,
+            )
+
+        tampered = json.loads(manifest)
+        tampered["tracks"][0]["filename"] = "../escape.mp3"
+        with pytest.raises(StorageCatalogBackupError):
+            StorageCatalog(tmp_path / "tampered.sqlite3").import_manifest(
+                json.dumps(tampered).encode(),
+                expected_bot_id=8487952349,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_storage_catalog_manifest_excludes_incomplete_tracks_and_rolls_back_conflicts(
+    tmp_path: Path,
+):
+    asset_path = tmp_path / "track.mp3"
+    asset_path.write_bytes(b"payload")
+    asset = TrackAsset(asset_path, "Track", "Artist", "Album", 1.0)
+    source = StorageCatalog(tmp_path / "source.sqlite3")
+    source.begin_upload(
+        track_id="incomplete",
+        asset=asset,
+        mime_type="audio/mpeg",
+        total_bytes=7,
+        sha256=hashlib.sha256(b"payload").hexdigest(),
+        part_count=1,
+        part_bytes=8,
+        storage_chat_id=777,
+    )
+    assert json.loads(source.export_manifest(99))["tracks"] == []
+
+    first_payload = b"first"
+    second_payload = b"second"
+
+    def add_ready(
+        catalog: StorageCatalog,
+        track_id: str,
+        payload: bytes,
+        message_id: int,
+    ) -> None:
+        catalog.begin_upload(
+            track_id=track_id,
+            asset=asset,
+            mime_type="audio/mpeg",
+            total_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            part_count=1,
+            part_bytes=8,
+            storage_chat_id=777,
+        )
+        catalog.record_part(
+            StoredPart(
+                track_id,
+                0,
+                0,
+                len(payload),
+                hashlib.sha256(payload).hexdigest(),
+                777,
+                message_id,
+                f"file-{message_id}",
+                f"unique-{message_id}",
+            )
+        )
+        catalog.mark_ready(track_id)
+
+    backup_source = StorageCatalog(tmp_path / "backup.sqlite3")
+    add_ready(backup_source, "one", first_payload, 1)
+    add_ready(backup_source, "two", second_payload, 2)
+    manifest = backup_source.export_manifest(99)
+
+    destination = StorageCatalog(tmp_path / "destination.sqlite3")
+    add_ready(destination, "two", b"conflict", 3)
+    with pytest.raises(StorageCatalogBackupError):
+        destination.import_manifest(manifest, expected_bot_id=99)
+    assert destination.ready_track("one") is None
+    assert destination.ready_track("two").sha256 == hashlib.sha256(
+        b"conflict"
+    ).hexdigest()
+
+
+def test_admin_exports_and_imports_storage_catalog_through_telegram(
+    tmp_path: Path,
+):
+    async def scenario():
+        library = tmp_path / "Music"
+        library.mkdir()
+        source_path = library / "track.mp3"
+        source_path.write_bytes(b"audio")
+        source_catalog = StorageCatalog(tmp_path / "source.sqlite3")
+        source_catalog.begin_upload(
+            track_id="track-id",
+            asset=TrackAsset(source_path, "Track", "Artist", "Album", 2.0),
+            mime_type="audio/mpeg",
+            total_bytes=5,
+            sha256=hashlib.sha256(b"audio").hexdigest(),
+            part_count=1,
+            part_bytes=8,
+            storage_chat_id=111,
+        )
+        source_catalog.record_part(
+            StoredPart(
+                "track-id",
+                0,
+                0,
+                5,
+                hashlib.sha256(b"audio").hexdigest(),
+                111,
+                10,
+                "file-10",
+                "unique-10",
+            )
+        )
+        source_catalog.mark_ready("track-id")
+        access = AccessStore(
+            tmp_path / "access.sqlite3",
+            static_allowed_user_ids=frozenset({111}),
+        )
+        exported: list[bytes] = []
+        replies: list[str] = []
+
+        class Message:
+            document = None
+            reply_to_message = None
+
+            async def reply_text(self, text, **kwargs):
+                replies.append(text)
+
+            async def reply_document(self, document, **kwargs):
+                exported.append(document.read())
+                return SimpleNamespace()
+
+        def make_update(message):
+            return SimpleNamespace(
+                effective_user=SimpleNamespace(id=111, is_bot=False),
+                effective_chat=SimpleNamespace(id=111, type="private"),
+                effective_message=message,
+            )
+
+        source_bot = TelegramMusicBot.__new__(TelegramMusicBot)
+        source_bot.access_store = access
+        source_bot.telegram_storage = TelegramStorage(
+            source_catalog,
+            part_bytes=8,
+        )
+        source_bot._storage_pending_ids = set()
+        source_bot._storage_tasks = set()
+        await source_bot.storage_export(
+            make_update(Message()),
+            SimpleNamespace(bot=SimpleNamespace(id=99)),
+        )
+        assert len(exported) == 1
+
+        destination_catalog = StorageCatalog(tmp_path / "destination.sqlite3")
+        destination_bot = TelegramMusicBot.__new__(TelegramMusicBot)
+        destination_bot.access_store = access
+        destination_bot.telegram_storage = TelegramStorage(
+            destination_catalog,
+            part_bytes=8,
+        )
+        destination_bot._storage_pending_ids = set()
+        destination_bot._storage_tasks = set()
+        destination_bot.config = SimpleNamespace(library_dir=library)
+        destination_bot.registry = MediaRegistry(library, SECRET)
+
+        class TelegramFile:
+            async def download_as_bytearray(self):
+                return bytearray(exported[0])
+
+        class ContextBot:
+            id = 99
+
+            async def get_file(self, file_id):
+                assert file_id == "catalog-file"
+                return TelegramFile()
+
+        command = Message()
+        command.reply_to_message = SimpleNamespace(
+            document=SimpleNamespace(
+                file_id="catalog-file",
+                file_size=len(exported[0]),
+            )
+        )
+        await destination_bot.storage_import(
+            make_update(command),
+            SimpleNamespace(bot=ContextBot()),
+        )
+
+        assert destination_catalog.ready_track("track-id") is not None
+        registered = destination_bot.registry.get(
+            "track-id",
+            allow_missing=True,
+        )
+        assert registered is not None
+        assert registered.source == "telegram"
+        assert replies[-1] == (
+            "Каталог восстановлен. Импортировано: 1; уже было: 0."
+        )
+
+    asyncio.run(scenario())
+
+
 def test_storage_archive_queue_is_bounded_deduplicated_and_drained():
     async def scenario():
         release = asyncio.Event()
@@ -1528,3 +1813,90 @@ def test_static_admin_cannot_consume_invite_or_be_downgraded_by_legacy_row(
             """
         )
     assert store.list_members(111) == [(111, "admin"), (222, "member")]
+
+
+def test_admin_removes_member_concurrently_but_never_an_admin(tmp_path: Path):
+    path = tmp_path / "access.sqlite3"
+    store = AccessStore(
+        path,
+        static_allowed_user_ids=frozenset({111, 112}),
+    )
+    token = store.create_invite(111, ttl_seconds=3600, now=1_000)
+    assert store.redeem_invite(222, token, now=1_001).allowed
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        removed = list(
+            pool.map(
+                lambda _: AccessStore(
+                    path,
+                    static_allowed_user_ids=frozenset({111, 112}),
+                ).remove_member(111, 222),
+                range(2),
+            )
+        )
+    assert sorted(removed) == [False, True]
+    assert not store.authorize_existing(222).allowed
+
+    with pytest.raises(ProtectedAdminError):
+        store.remove_member(111, 111)
+    with pytest.raises(ProtectedAdminError):
+        store.remove_member(111, 112)
+    with pytest.raises(PermissionError):
+        store.remove_member(222, 333)
+    with pytest.raises(ValueError):
+        store.remove_member(111, 2**63)
+
+
+def test_admin_can_revoke_all_unused_invites(tmp_path: Path):
+    store = AccessStore(
+        tmp_path / "access.sqlite3",
+        static_allowed_user_ids=frozenset({111}),
+    )
+    first = store.create_invite(111, ttl_seconds=3600, now=1_000)
+    second = store.create_invite(111, ttl_seconds=3600, now=1_000)
+    assert store.redeem_invite(222, first, now=1_001).allowed
+
+    assert store.revoke_unused_invites(111) == 1
+    assert not store.redeem_invite(333, second, now=1_002).allowed
+    assert store.authorize_existing(222).allowed
+
+
+def test_remove_command_revokes_access_and_pending_browser_launches(
+    tmp_path: Path,
+):
+    async def scenario():
+        access = AccessStore(
+            tmp_path / "access.sqlite3",
+            static_allowed_user_ids=frozenset({111}),
+        )
+        invite = access.create_invite(111, ttl_seconds=3600, now=1_000)
+        assert access.redeem_invite(222, invite, now=1_001).allowed
+        sessions = WebSessionStore(tmp_path / "web.sqlite3")
+        bearer = sessions.issue(222)
+        launch = sessions.issue_launch(222)
+        replies: list[str] = []
+
+        class Message:
+            async def reply_text(self, text, **kwargs):
+                replies.append(text)
+
+        bot = TelegramMusicBot.__new__(TelegramMusicBot)
+        bot.access_store = access
+        bot.web_session_store = sessions
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=111, is_bot=False),
+            effective_chat=SimpleNamespace(id=111, type="private"),
+            effective_message=Message(),
+        )
+        context = SimpleNamespace(args=["222"])
+
+        await bot.remove_member(update, context)
+
+        assert not access.authorize_existing(222).allowed
+        assert sessions.authenticate(bearer) is None
+        assert sessions.consume_launch(launch) is None
+        assert replies == [
+            "Доступ пользователя 222 отозван. Web-сессий закрыто: 1."
+        ]
+
+    asyncio.run(scenario())

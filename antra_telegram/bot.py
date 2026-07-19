@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import io
 import logging
 import tempfile
 import time
@@ -16,7 +18,7 @@ from telegram.constants import ChatAction, ChatType
 from telegram.error import RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
-from .access import AccessStore, AccessStoreError
+from .access import AccessStore, AccessStoreError, ProtectedAdminError
 from .config import TelegramConfig
 from .delivery import DeliveryKind, choose_delivery
 from .jobs import (
@@ -35,8 +37,9 @@ from .playlist_sessions import (
 )
 from .playlist_ui import parse_playlist_callback, render_playlist_page
 from .splitter import AudioSplitError, split_audio_copy
+from .storage_db import MAX_CATALOG_BYTES, StorageCatalogBackupError
 from .telegram_storage import TelegramStorage
-from .web_sessions import WebSessionStore
+from .web_sessions import WebSessionStore, WebSessionStoreError
 
 
 logger = logging.getLogger(__name__)
@@ -258,7 +261,11 @@ class TelegramMusicBot:
             "/archive — сохранить локальную библиотеку в Telegram (администратор)\n"
             "/player — открыть браузерный музыкальный плеер\n"
             "/invite — создать одноразовую ссылку для нового участника\n"
-            "/members — показать администратора и участников"
+            "/members — показать администратора и участников\n"
+            "/remove <id> — отозвать доступ участника\n"
+            "/revoke_invites — отозвать неиспользованные приглашения\n"
+            "/storage_export — скачать резервную копию каталога\n"
+            "/storage_import — восстановить каталог из JSON-документа"
         )
 
     async def player(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,8 +365,248 @@ class TelegramMusicBot:
             await update.effective_message.reply_text("Не удалось прочитать список участников.")
             return
         lines = ["Пользователи:"]
-        lines.extend(f"{user_id} — {role}" for user_id, role in rows)
+        lines.extend(
+            (
+                f"{user_id} — {role}"
+                if role == "admin"
+                else f"{user_id} — {role} · удалить: /remove {user_id}"
+            )
+            for user_id, role in rows
+        )
         await update.effective_message.reply_text("\n".join(lines))
+
+    async def remove_member(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update, require_admin=True):
+            return
+        if len(context.args) != 1 or not context.args[0].isdecimal():
+            await update.effective_message.reply_text(
+                "Использование: /remove 123456789"
+            )
+            return
+        target_user_id = int(context.args[0])
+        if target_user_id <= 0 or target_user_id > 2**63 - 1:
+            await update.effective_message.reply_text(
+                "Использование: /remove 123456789"
+            )
+            return
+        try:
+            removed = await asyncio.to_thread(
+                self.access_store.remove_member,
+                update.effective_user.id,
+                target_user_id,
+            )
+        except ProtectedAdminError:
+            await update.effective_message.reply_text(
+                "Администратора удалить нельзя."
+            )
+            return
+        except (AccessStoreError, PermissionError, ValueError):
+            logger.exception("Member removal failed")
+            await update.effective_message.reply_text(
+                "Не удалось отозвать доступ участника."
+            )
+            return
+        if not removed:
+            await update.effective_message.reply_text(
+                f"Участник {target_user_id} не найден или уже удалён."
+            )
+            return
+
+        revoked_sessions = 0
+        if self.web_session_store is not None:
+            try:
+                revoked_sessions = await asyncio.to_thread(
+                    self.web_session_store.revoke_user,
+                    target_user_id,
+                )
+            except WebSessionStoreError:
+                logger.exception(
+                    "Member access was removed, but eager web-session cleanup failed"
+                )
+        await update.effective_message.reply_text(
+            f"Доступ пользователя {target_user_id} отозван. "
+            f"Web-сессий закрыто: {revoked_sessions}."
+        )
+
+    async def revoke_invites(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update, require_admin=True):
+            return
+        try:
+            revoked = await asyncio.to_thread(
+                self.access_store.revoke_unused_invites,
+                update.effective_user.id,
+            )
+        except (AccessStoreError, PermissionError, ValueError):
+            logger.exception("Invitation revocation failed")
+            await update.effective_message.reply_text(
+                "Не удалось отозвать приглашения."
+            )
+            return
+        await update.effective_message.reply_text(
+            f"Неиспользованных приглашений отозвано: {revoked}."
+        )
+
+    async def storage_export(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update, require_admin=True):
+            return
+        if self.telegram_storage is None:
+            await update.effective_message.reply_text(
+                "Telegram-хранилище не включено в конфигурации."
+            )
+            return
+        try:
+            payload = await asyncio.to_thread(
+                self.telegram_storage.catalog.export_manifest,
+                context.bot.id,
+            )
+            digest = hashlib.sha256(payload).hexdigest()
+            ready_count = len(
+                await asyncio.to_thread(
+                    self.telegram_storage.catalog.ready_tracks
+                )
+            )
+            document = io.BytesIO(payload)
+            document.name = "antra-storage-catalog-v1.json"
+
+            async def send_backup():
+                document.seek(0)
+                return await update.effective_message.reply_document(
+                    document=document,
+                    filename=document.name,
+                    caption=(
+                        "#antra_catalog_v1\n"
+                        f"Готовых треков: {ready_count}\n"
+                        f"SHA-256: {digest}\n"
+                        "Для восстановления ответьте на этот документ "
+                        "командой /storage_import."
+                    ),
+                    disable_notification=True,
+                )
+
+            await self._retry_rate_limit(send_backup)
+        except (StorageCatalogBackupError, OSError, TelegramError):
+            logger.exception("Storage catalog export failed")
+            await update.effective_message.reply_text(
+                "Не удалось создать резервную копию каталога."
+            )
+
+    async def storage_import(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not await self._authorize(update, require_admin=True):
+            return
+        if self.telegram_storage is None:
+            await update.effective_message.reply_text(
+                "Telegram-хранилище не включено в конфигурации."
+            )
+            return
+        if self._storage_pending_ids or any(
+            task.get_name() == "telegram-storage-backfill" and not task.done()
+            for task in self._storage_tasks
+        ):
+            await update.effective_message.reply_text(
+                "Дождитесь завершения текущей архивации и повторите импорт."
+            )
+            return
+        message = update.effective_message
+        backup_document = getattr(message, "document", None)
+        reply_to_message = getattr(message, "reply_to_message", None)
+        if backup_document is None and reply_to_message is not None:
+            backup_document = getattr(reply_to_message, "document", None)
+        if backup_document is None:
+            await message.reply_text(
+                "Ответьте командой /storage_import на JSON-файл "
+                "резервной копии каталога."
+            )
+            return
+        if (
+            backup_document.file_size is not None
+            and backup_document.file_size > MAX_CATALOG_BYTES
+        ):
+            await message.reply_text("Файл резервной копии слишком большой.")
+            return
+        try:
+            telegram_file = await self._retry_rate_limit(
+                lambda: context.bot.get_file(backup_document.file_id)
+            )
+            payload = await self._retry_rate_limit(
+                telegram_file.download_as_bytearray
+            )
+            if len(payload) > MAX_CATALOG_BYTES:
+                raise StorageCatalogBackupError(
+                    "catalog backup exceeds the maximum size"
+                )
+            result = await self.telegram_storage.import_catalog(
+                payload,
+                expected_bot_id=context.bot.id,
+            )
+            await asyncio.to_thread(self._register_catalog_tracks)
+        except StorageCatalogBackupError:
+            logger.warning("Rejected invalid storage catalog backup", exc_info=True)
+            await message.reply_text(
+                "Резервная копия недействительна, конфликтует с текущим "
+                "каталогом или создана другим ботом."
+            )
+            return
+        except (OSError, TelegramError, ValueError):
+            logger.exception("Storage catalog import failed")
+            await message.reply_text(
+                "Не удалось скачать или импортировать резервную копию."
+            )
+            return
+        await message.reply_text(
+            "Каталог восстановлен. "
+            f"Импортировано: {result.imported}; "
+            f"уже было: {result.skipped}."
+        )
+
+    def _register_catalog_tracks(self) -> None:
+        if self.telegram_storage is None:
+            return
+        for stored in self.telegram_storage.catalog.ready_tracks():
+            local_asset = self.registry.get(stored.track_id, allow_missing=True)
+            path = (
+                local_asset.path
+                if local_asset is not None and local_asset.path.is_file()
+                else (
+                    self.config.library_dir
+                    / ".antra-telegram-cache"
+                    / stored.track_id
+                    / Path(stored.filename).name
+                )
+            )
+            self.registry.register_stored(
+                stored.track_id,
+                TrackAsset(
+                    path,
+                    stored.title,
+                    stored.artist,
+                    stored.album,
+                    stored.duration_seconds,
+                    source=(
+                        local_asset.source
+                        if (
+                            local_asset is not None
+                            and local_asset.path.is_file()
+                        )
+                        else "telegram"
+                    ),
+                ),
+            )
 
     async def rescan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorize(update):
@@ -493,7 +740,7 @@ class TelegramMusicBot:
         except MusicRequestError as exc:
             await status.edit_text(str(exc))
             return
-        except Exception as exc:
+        except Exception:
             logger.exception("Music request failed")
             await status.edit_text("Не удалось обработать запрос. Подробности записаны в лог.")
             return

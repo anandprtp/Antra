@@ -2,7 +2,8 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -125,6 +126,29 @@ def build_application(config: TelegramConfig) -> Application:
     async def post_init(application: Application) -> None:
         await media_server.start()
         await bot.start_background_tasks()
+        try:
+            await application.bot.set_my_commands(
+                [
+                    BotCommand("start", "Открыть Antra"),
+                    BotCommand("player", "Открыть web-плеер"),
+                    BotCommand("status", "Проверить состояние"),
+                    BotCommand("files", "Показать библиотеку"),
+                    BotCommand("rescan", "Перечитать библиотеку"),
+                    BotCommand("invite", "Пригласить участника"),
+                    BotCommand("members", "Показать пользователей"),
+                    BotCommand("remove", "Отозвать доступ участника"),
+                    BotCommand("revoke_invites", "Отозвать приглашения"),
+                    BotCommand("storage_export", "Скачать каталог хранилища"),
+                    BotCommand("storage_import", "Восстановить каталог"),
+                    BotCommand("archive", "Архивировать библиотеку"),
+                    BotCommand("help", "Показать справку"),
+                ]
+            )
+        except TelegramError:
+            logging.getLogger(__name__).warning(
+                "Could not update Telegram command menu",
+                exc_info=True,
+            )
 
     async def stop_services(application: Application) -> None:
         # post_stop runs before python-telegram-bot closes its HTTP client.
@@ -159,6 +183,10 @@ def build_application(config: TelegramConfig) -> Application:
     application.add_handler(CommandHandler("files", bot.files))
     application.add_handler(CommandHandler("invite", bot.invite))
     application.add_handler(CommandHandler("members", bot.members))
+    application.add_handler(CommandHandler("remove", bot.remove_member))
+    application.add_handler(CommandHandler("revoke_invites", bot.revoke_invites))
+    application.add_handler(CommandHandler("storage_export", bot.storage_export))
+    application.add_handler(CommandHandler("storage_import", bot.storage_import))
     application.add_handler(CommandHandler("rescan", bot.rescan))
     application.add_handler(CommandHandler("archive", bot.archive_library))
     application.add_handler(CommandHandler("player", bot.player))

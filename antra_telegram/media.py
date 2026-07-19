@@ -482,10 +482,17 @@ class MediaServer:
                     text="access store unavailable",
                 ) from exc
             if not decision.allowed:
-                await asyncio.to_thread(
-                    self.web_session_store.revoke_user,
-                    identity.user_id,
-                )
+                try:
+                    await asyncio.to_thread(
+                        self.web_session_store.revoke_user,
+                        identity.user_id,
+                    )
+                except WebSessionStoreError:
+                    LOGGER.warning(
+                        "Could not lazily revoke browser sessions for user %s",
+                        identity.user_id,
+                        exc_info=True,
+                    )
                 raise web.HTTPUnauthorized(
                     text="access revoked",
                     headers={"WWW-Authenticate": "Bearer"},
@@ -615,11 +622,32 @@ class MediaServer:
             )
             if launch is None:
                 raise web.HTTPUnauthorized(text="invalid or expired player launch")
+            role = launch.role
+            if self.access_store is not None:
+                decision = await asyncio.to_thread(
+                    self.access_store.authorize_existing,
+                    launch.user_id,
+                )
+                if not decision.allowed:
+                    try:
+                        await asyncio.to_thread(
+                            self.web_session_store.revoke_user,
+                            launch.user_id,
+                        )
+                    except WebSessionStoreError:
+                        LOGGER.warning(
+                            "Could not revoke sessions for denied player launch",
+                            exc_info=True,
+                        )
+                    raise web.HTTPUnauthorized(text="access revoked")
+                role = decision.role or role
             session_token = await asyncio.to_thread(
                 self.web_session_store.issue,
                 launch.user_id,
-                role=launch.role,
+                role=role,
             )
+        except AccessStoreError as exc:
+            raise web.HTTPServiceUnavailable(text="access store unavailable") from exc
         except WebSessionStoreError as exc:
             raise web.HTTPServiceUnavailable(text="session store unavailable") from exc
 

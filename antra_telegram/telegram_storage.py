@@ -4,7 +4,7 @@ import math
 import mimetypes
 import os
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from telegram import Bot
 from telegram.error import NetworkError, RetryAfter
 
 from .models import TrackAsset
-from .storage_db import StorageCatalog, StoredPart
+from .storage_db import CatalogImportResult, StorageCatalog, StoredPart
 
 
 CLOUD_MAX_PART_BYTES = 19_000_000
@@ -310,6 +310,26 @@ class TelegramStorage:
             finally:
                 if temporary_output is not None:
                     temporary_output.unlink(missing_ok=True)
+
+    async def import_catalog(
+        self,
+        payload: bytes | bytearray,
+        *,
+        expected_bot_id: int,
+    ) -> CatalogImportResult:
+        track_ids = await asyncio.to_thread(
+            self.catalog.manifest_track_ids,
+            payload,
+            expected_bot_id=expected_bot_id,
+        )
+        async with AsyncExitStack() as locks:
+            for track_id in sorted(track_ids):
+                await locks.enter_async_context(self._track_lock(track_id))
+            return await asyncio.to_thread(
+                self.catalog.import_manifest,
+                payload,
+                expected_bot_id=expected_bot_id,
+            )
 
     async def _download_part(
         self,

@@ -280,6 +280,8 @@ class WebSessionStore:
         return cursor.rowcount > 0
 
     def revoke_user(self, user_id: int, *, now: int | None = None) -> int:
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise ValueError("user_id must be a positive integer")
         current = int(time.time()) if now is None else now
         try:
             with self._connect() as connection:
@@ -288,6 +290,14 @@ class WebSessionStore:
                     UPDATE web_sessions
                     SET revoked_at = ?
                     WHERE user_id = ? AND revoked_at IS NULL
+                    """,
+                    (current, user_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE player_launches
+                    SET consumed_at = ?
+                    WHERE user_id = ? AND consumed_at IS NULL
                     """,
                     (current, user_id),
                 )
