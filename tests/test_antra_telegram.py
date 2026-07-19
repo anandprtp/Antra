@@ -935,6 +935,30 @@ def test_config_rejects_forgeable_or_non_https_vlc_settings(monkeypatch, tmp_pat
         raise AssertionError("insecure public link settings should be rejected")
 
 
+def test_config_accepts_local_player_upstream_for_single_public_origin(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("ANTRA_TELEGRAM_LIBRARY_DIR", str(tmp_path))
+    monkeypatch.setenv("ANTRA_TELEGRAM_PUBLIC_BASE_URL", "https://music.example")
+    monkeypatch.setenv("ANTRA_TELEGRAM_PLAYER_URL", "https://music.example")
+    monkeypatch.setenv(
+        "ANTRA_TELEGRAM_PLAYER_UPSTREAM_URL",
+        "http://127.0.0.1:3000/",
+    )
+    monkeypatch.setenv(
+        "ANTRA_TELEGRAM_LINK_SECRET",
+        "single-origin-test-secret-that-is-long-enough",
+    )
+
+    config = TelegramConfig.from_env()
+
+    assert config.player_url == "https://music.example"
+    assert config.player_upstream_url == "http://127.0.0.1:3000"
+
+
 def test_config_allows_explicit_first_user_claim_without_allowlist(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "")

@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import threading
 import time
@@ -9,7 +11,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
-from aiohttp import web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 
 from .library import SUPPORTED_AUDIO_EXTENSIONS, inspect_track, normalize_query
 from .models import TrackAsset
@@ -21,6 +23,40 @@ from .web_sessions import (
     WebSessionStore,
     WebSessionStoreError,
     validate_player_state,
+)
+
+LOGGER = logging.getLogger(__name__)
+
+_PLAYER_PROXY_SESSION = web.AppKey("antra_player_proxy_session", ClientSession)
+_PROXY_BLOCKED_REQUEST_HEADERS = frozenset(
+    {
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+_PROXY_BLOCKED_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
 )
 
 
@@ -137,6 +173,7 @@ class MediaServer:
         web_session_store: WebSessionStore | None = None,
         cors_allowed_origins: tuple[str, ...] | list[str] = (),
         web_link_ttl_seconds: int = 3600,
+        player_upstream_url: str = "",
     ):
         if web_link_ttl_seconds <= 0:
             raise ValueError("web_link_ttl_seconds must be positive")
@@ -151,6 +188,11 @@ class MediaServer:
             _normalize_origin(origin) for origin in cors_allowed_origins
         )
         self.web_link_ttl_seconds = web_link_ttl_seconds
+        self.player_upstream_url = (
+            _normalize_origin(player_upstream_url)
+            if player_upstream_url
+            else ""
+        )
         self._runner: web.AppRunner | None = None
 
     def create_app(self) -> web.Application:
@@ -196,6 +238,8 @@ class MediaServer:
             client_max_size=256 * 1024,
             middlewares=[cors_middleware],
         )
+        if self.player_upstream_url:
+            app.cleanup_ctx.append(self._player_proxy_context)
         app.router.add_get("/playlist/{media_id}.m3u8", self._playlist)
         app.router.add_get("/media/{media_id}", self._media)
         if self.web_session_store is not None:
@@ -208,8 +252,22 @@ class MediaServer:
                 "/api/v1/tracks/{media_id}/stream",
                 self._api_stream,
             )
-            app.router.add_route("OPTIONS", "/api/{tail:.*}", self._api_options)
+        app.router.add_route("*", "/api/{tail:.*}", self._api_fallback)
+        app.router.add_route("*", "/media/{tail:.*}", self._backend_not_found)
+        app.router.add_route("*", "/playlist/{tail:.*}", self._backend_not_found)
+        if self.player_upstream_url:
+            app.router.add_route("*", "/{tail:.*}", self._player_proxy)
         return app
+
+    async def _player_proxy_context(self, app: web.Application):
+        app[_PLAYER_PROXY_SESSION] = ClientSession(
+            timeout=ClientTimeout(total=60, connect=10),
+            auto_decompress=False,
+        )
+        try:
+            yield
+        finally:
+            await app[_PLAYER_PROXY_SESSION].close()
 
     async def start(self) -> None:
         if not self.public_base_url:
@@ -464,8 +522,68 @@ class MediaServer:
         asset = self._authorize(request, "web-stream")
         return self._file_response(asset)
 
-    async def _api_options(self, request: web.Request) -> web.Response:
-        return web.Response(status=204)
+    async def _api_fallback(self, request: web.Request) -> web.Response:
+        if request.method == "OPTIONS":
+            return web.Response(status=204)
+        return web.json_response({"error": "not_found"}, status=404)
+
+    async def _backend_not_found(self, request: web.Request) -> web.Response:
+        return web.json_response({"error": "not_found"}, status=404)
+
+    async def _player_proxy(self, request: web.Request) -> web.Response:
+        if request.method not in {"GET", "HEAD"}:
+            raise web.HTTPMethodNotAllowed(request.method, ("GET", "HEAD"))
+
+        connection_headers = {
+            item.strip().casefold()
+            for item in request.headers.get("Connection", "").split(",")
+            if item.strip()
+        }
+        blocked_headers = _PROXY_BLOCKED_REQUEST_HEADERS | connection_headers
+        headers = {
+            name: value
+            for name, value in request.headers.items()
+            if name.casefold() not in blocked_headers
+        }
+        headers["X-Forwarded-Host"] = request.host
+        headers["X-Forwarded-Proto"] = (
+            urlsplit(self.public_base_url).scheme or request.scheme
+        )
+        target_url = f"{self.player_upstream_url}{request.path_qs}"
+        try:
+            async with app_session(request).request(
+                request.method,
+                target_url,
+                headers=headers,
+                allow_redirects=False,
+            ) as upstream:
+                upstream_connection_headers = {
+                    item.strip().casefold()
+                    for item in upstream.headers.get("Connection", "").split(",")
+                    if item.strip()
+                }
+                blocked_response_headers = (
+                    _PROXY_BLOCKED_RESPONSE_HEADERS
+                    | upstream_connection_headers
+                )
+                response_headers = {
+                    name: value
+                    for name, value in upstream.headers.items()
+                    if name.casefold() not in blocked_response_headers
+                }
+                body = b"" if request.method == "HEAD" else await upstream.read()
+                return web.Response(
+                    body=body,
+                    status=upstream.status,
+                    reason=upstream.reason,
+                    headers=response_headers,
+                )
+        except (ClientError, asyncio.TimeoutError):
+            LOGGER.exception("Web player upstream request failed")
+            return web.json_response(
+                {"error": "player_unavailable"},
+                status=502,
+            )
 
 
 def _content_disposition(filename: str) -> str:
@@ -474,6 +592,10 @@ def _content_disposition(filename: str) -> str:
     ascii_name = ascii_name.replace("\\", "_").replace('"', "_")
     encoded_name = quote(cleaned, safe="")
     return f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
+
+
+def app_session(request: web.Request) -> ClientSession:
+    return request.app[_PLAYER_PROXY_SESSION]
 
 
 def _normalize_origin(value: str) -> str:

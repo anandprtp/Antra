@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from antra_telegram.bot import TelegramMusicBot
@@ -297,5 +298,75 @@ def test_player_api_auth_catalog_state_cors_and_signed_range(tmp_path: Path):
             assert response.status == 401
         finally:
             await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_player_proxy_uses_one_origin_without_exposing_credentials(tmp_path: Path):
+    async def scenario():
+        seen_headers: dict[str, str | None] = {}
+
+        async def frontend(request: web.Request) -> web.Response:
+            seen_headers["authorization"] = request.headers.get("Authorization")
+            seen_headers["cookie"] = request.headers.get("Cookie")
+            seen_headers["forwarded_host"] = request.headers.get("X-Forwarded-Host")
+            seen_headers["forwarded_proto"] = request.headers.get("X-Forwarded-Proto")
+            return web.Response(
+                text="<title>Antra Player</title>",
+                content_type="text/html",
+                headers={"Set-Cookie": "frontend-secret=must-not-escape"},
+            )
+
+        upstream_app = web.Application()
+        upstream_app.router.add_get("/{tail:.*}", frontend)
+        upstream = TestServer(upstream_app)
+        await upstream.start_server()
+
+        registry = MediaRegistry(tmp_path, SECRET)
+        sessions = WebSessionStore(tmp_path / "player.sqlite3")
+        server = MediaServer(
+            registry,
+            LinkSigner(SECRET),
+            "https://music.example",
+            "127.0.0.1",
+            0,
+            3600,
+            web_session_store=sessions,
+            player_upstream_url=str(upstream.make_url("")).rstrip("/"),
+        )
+        client = TestClient(TestServer(server.create_app()))
+        await client.start_server()
+        try:
+            response = await client.get(
+                "/",
+                headers={
+                    "Authorization": "Bearer browser-session",
+                    "Cookie": "private=cookie",
+                    "Host": "music.example",
+                },
+            )
+            assert response.status == 200
+            assert "Antra Player" in await response.text()
+            assert "Set-Cookie" not in response.headers
+            assert seen_headers == {
+                "authorization": None,
+                "cookie": None,
+                "forwarded_host": "music.example",
+                "forwarded_proto": "https",
+            }
+
+            response = await client.get("/api/v1/health")
+            assert response.status == 200
+            assert await response.json() == {"status": "ok", "tracks": 0}
+
+            response = await client.get("/api/v1/does-not-exist")
+            assert response.status == 404
+            assert await response.json() == {"error": "not_found"}
+
+            response = await client.post("/")
+            assert response.status == 405
+        finally:
+            await client.close()
+            await upstream.close()
 
     asyncio.run(scenario())

@@ -76,6 +76,7 @@ class TelegramConfig:
     max_pending_jobs: int = 20
     public_base_url: str = ""
     player_url: str = ""
+    player_upstream_url: str = ""
     web_sessions_db_path: Path = Path(".antra_telegram_web.sqlite3")
     web_session_ttl_seconds: int = 2_592_000
     storage_enabled: bool = False
@@ -149,6 +150,28 @@ class TelegramConfig:
                 raise ConfigError(
                     "ANTRA_TELEGRAM_PUBLIC_BASE_URL is required when the web player is enabled"
                 )
+        player_upstream_url = os.getenv(
+            "ANTRA_TELEGRAM_PLAYER_UPSTREAM_URL",
+            "",
+        ).strip().rstrip("/")
+        if player_upstream_url:
+            parsed_player_upstream = urlparse(player_upstream_url)
+            if (
+                parsed_player_upstream.scheme not in {"http", "https"}
+                or not parsed_player_upstream.netloc
+                or parsed_player_upstream.username
+                or parsed_player_upstream.password
+                or parsed_player_upstream.path not in {"", "/"}
+                or parsed_player_upstream.query
+                or parsed_player_upstream.fragment
+            ):
+                raise ConfigError(
+                    "ANTRA_TELEGRAM_PLAYER_UPSTREAM_URL must be an HTTP(S) origin without credentials, path, query, or fragment"
+                )
+            if not player_url:
+                raise ConfigError(
+                    "ANTRA_TELEGRAM_PLAYER_URL is required when the player upstream is enabled"
+                )
 
         library_dir = Path(
             os.getenv(
@@ -209,6 +232,7 @@ class TelegramConfig:
             max_pending_jobs=_positive_int("ANTRA_TELEGRAM_MAX_PENDING_JOBS", 20),
             public_base_url=public_base_url,
             player_url=player_url,
+            player_upstream_url=player_upstream_url,
             web_sessions_db_path=Path(
                 os.getenv(
                     "ANTRA_TELEGRAM_WEB_SESSIONS_DB",
