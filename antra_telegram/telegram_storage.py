@@ -4,10 +4,12 @@ import math
 import mimetypes
 import os
 import tempfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from telegram import Bot
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter
 
 from .models import TrackAsset
 from .storage_db import StorageCatalog, StoredPart
@@ -22,6 +24,12 @@ class TelegramStorageError(RuntimeError):
 
 class TelegramStorageCorruptionError(TelegramStorageError):
     pass
+
+
+@dataclass
+class _LockEntry:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 def sha256_file(path: Path, *, chunk_bytes: int = 1024 * 1024) -> str:
@@ -72,8 +80,9 @@ class TelegramStorage:
             )
         self.catalog = catalog
         self.part_bytes = part_bytes
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, _LockEntry] = {}
         self._locks_guard = asyncio.Lock()
+        self._restore_semaphore = asyncio.Semaphore(2)
 
     async def archive(
         self,
@@ -83,8 +92,7 @@ class TelegramStorage:
         track_id: str,
         chat_id: int,
     ) -> bool:
-        lock = await self._lock_for(track_id)
-        async with lock:
+        async with self._track_lock(track_id):
             path = asset.path.expanduser().resolve(strict=True)
             total_bytes = path.stat().st_size
             if total_bytes <= 0:
@@ -203,8 +211,7 @@ class TelegramStorage:
         track_id: str,
         destination: Path,
     ) -> TrackAsset:
-        lock = await self._lock_for(track_id)
-        async with lock:
+        async with self._track_lock(track_id):
             stored = await asyncio.to_thread(
                 self.catalog.ready_track,
                 track_id,
@@ -224,11 +231,15 @@ class TelegramStorage:
                         source="telegram",
                     )
 
-            parts = await asyncio.to_thread(self.catalog.parts_for, track_id)
-            self._validate_layout(stored.total_bytes, stored.part_count, parts)
-            destination.parent.mkdir(parents=True, exist_ok=True)
             temporary_output: Path | None = None
             try:
+                parts = await asyncio.to_thread(self.catalog.parts_for, track_id)
+                self._validate_layout(
+                    stored.total_bytes,
+                    stored.part_count,
+                    parts,
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 with tempfile.NamedTemporaryFile(
                     dir=destination.parent,
                     prefix=f".{destination.name}.restore-",
@@ -240,32 +251,35 @@ class TelegramStorage:
                     with tempfile.TemporaryDirectory(
                         prefix="antra-telegram-restore-"
                     ) as temp_dir:
-                        for part in parts:
-                            part_path = Path(temp_dir) / (
-                                f"{track_id}-{part.part_index:04d}.bin"
-                            )
-                            telegram_file = await bot.get_file(part.file_id)
-                            await telegram_file.download_to_drive(
-                                custom_path=part_path,
-                            )
-                            payload = await asyncio.to_thread(
-                                part_path.read_bytes,
-                            )
-                            if (
-                                len(payload) != part.byte_length
-                                or hashlib.sha256(payload).hexdigest()
-                                != part.sha256
-                            ):
-                                raise TelegramStorageCorruptionError(
-                                    f"Telegram part {part.part_index} failed checksum"
+                        async with self._restore_semaphore:
+                            for part in parts:
+                                part_path = Path(temp_dir) / (
+                                    f"{track_id}-{part.part_index:04d}.bin"
                                 )
-                            if part.byte_offset != written:
-                                raise TelegramStorageCorruptionError(
-                                    "Telegram part layout has a gap or overlap"
+                                await self._download_part(
+                                    bot,
+                                    part,
+                                    part_path,
                                 )
-                            output.write(payload)
-                            whole_digest.update(payload)
-                            written += len(payload)
+                                payload = await asyncio.to_thread(
+                                    part_path.read_bytes,
+                                )
+                                if (
+                                    len(payload) != part.byte_length
+                                    or hashlib.sha256(payload).hexdigest()
+                                    != part.sha256
+                                ):
+                                    raise TelegramStorageCorruptionError(
+                                        f"Telegram part {part.part_index} "
+                                        "failed checksum"
+                                    )
+                                if part.byte_offset != written:
+                                    raise TelegramStorageCorruptionError(
+                                        "Telegram part layout has a gap or overlap"
+                                    )
+                                output.write(payload)
+                                whole_digest.update(payload)
+                                written += len(payload)
                     output.flush()
                     os.fsync(output.fileno())
 
@@ -288,7 +302,7 @@ class TelegramStorage:
                 )
             except TelegramStorageCorruptionError as exc:
                 await asyncio.to_thread(
-                    self.catalog.mark_failed,
+                    self.catalog.mark_corrupt,
                     track_id,
                     str(exc),
                 )
@@ -296,6 +310,36 @@ class TelegramStorage:
             finally:
                 if temporary_output is not None:
                     temporary_output.unlink(missing_ok=True)
+
+    async def _download_part(
+        self,
+        bot: Bot,
+        part: StoredPart,
+        destination: Path,
+    ) -> None:
+        for attempt in range(3):
+            destination.unlink(missing_ok=True)
+            try:
+                telegram_file = await bot.get_file(part.file_id)
+                await telegram_file.download_to_drive(
+                    custom_path=destination,
+                )
+                return
+            except RetryAfter as exc:
+                if attempt >= 2:
+                    raise TelegramStorageError(
+                        "Telegram storage restore is rate limited"
+                    ) from exc
+                retry_after = exc.retry_after
+                if hasattr(retry_after, "total_seconds"):
+                    retry_after = retry_after.total_seconds()
+                await asyncio.sleep(max(0.0, float(retry_after)) + 0.25)
+            except NetworkError as exc:
+                if attempt >= 2:
+                    raise TelegramStorageError(
+                        "Telegram storage restore is temporarily unavailable"
+                    ) from exc
+                await asyncio.sleep(0.5 * (2**attempt))
 
     @staticmethod
     def _validate_layout(
@@ -323,6 +367,19 @@ class TelegramStorage:
                 "Telegram storage object size is invalid"
             )
 
-    async def _lock_for(self, track_id: str) -> asyncio.Lock:
+    @asynccontextmanager
+    async def _track_lock(self, track_id: str):
         async with self._locks_guard:
-            return self._locks.setdefault(track_id, asyncio.Lock())
+            entry = self._locks.get(track_id)
+            if entry is None:
+                entry = _LockEntry(asyncio.Lock())
+                self._locks[track_id] = entry
+            entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            async with self._locks_guard:
+                entry.users -= 1
+                if entry.users == 0 and self._locks.get(track_id) is entry:
+                    self._locks.pop(track_id, None)

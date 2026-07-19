@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -11,7 +13,7 @@ from telegram import (
     WebAppInfo,
 )
 from telegram.constants import ChatAction, ChatType
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import ContextTypes
 
 from .access import AccessStore, AccessStoreError
@@ -40,6 +42,14 @@ from .web_sessions import WebSessionStore
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _StorageRequest:
+    bot: object
+    asset: TrackAsset
+    media_id: str
+    chat_id: int
+
+
 class TelegramMusicBot:
     def __init__(
         self,
@@ -66,6 +76,92 @@ class TelegramMusicBot:
         self._playlist_actions: dict[str, set[int]] = {}
         self._storage_tasks: set[asyncio.Task] = set()
         self._storage_semaphore = asyncio.Semaphore(2)
+        self._storage_queue: asyncio.Queue[_StorageRequest] = asyncio.Queue(
+            maxsize=max(
+                1,
+                min(int(getattr(config, "max_pending_jobs", 20)), 100),
+            )
+        )
+        self._storage_pending_ids: set[str] = set()
+        self._storage_workers: set[asyncio.Task] = set()
+        self._storage_accepting = True
+        self._storage_shutdown = False
+
+    @staticmethod
+    def _retry_after_seconds(error: RetryAfter) -> float:
+        value = error.retry_after
+        if hasattr(value, "total_seconds"):
+            value = value.total_seconds()
+        return max(0.0, float(value))
+
+    async def _retry_rate_limit(self, operation, *, attempts: int = 3):
+        for attempt in range(attempts):
+            try:
+                return await operation()
+            except RetryAfter as exc:
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(self._retry_after_seconds(exc) + 0.25)
+        raise RuntimeError("unreachable Telegram retry state")
+
+    @staticmethod
+    async def _best_effort_edit(message, text: str) -> None:
+        try:
+            await message.edit_text(text)
+        except TelegramError:
+            logger.debug("Could not update Telegram progress message")
+
+    async def start_background_tasks(self) -> None:
+        if (
+            self.telegram_storage is None
+            or self._storage_workers
+            or self._storage_shutdown
+        ):
+            return
+        for index in range(2):
+            worker = asyncio.create_task(
+                self._storage_worker(),
+                name=f"telegram-storage-worker-{index + 1}",
+            )
+            self._storage_workers.add(worker)
+            worker.add_done_callback(self._storage_workers.discard)
+
+    async def _storage_worker(self) -> None:
+        while True:
+            request = await self._storage_queue.get()
+            try:
+                await self._archive_in_telegram(
+                    request.bot,
+                    request.asset,
+                    request.media_id,
+                    request.chat_id,
+                )
+            finally:
+                self._storage_pending_ids.discard(request.media_id)
+                self._storage_queue.task_done()
+
+    async def _enqueue_storage(
+        self,
+        bot,
+        asset: TrackAsset,
+        media_id: str,
+        chat_id: int,
+    ) -> bool:
+        if (
+            self.telegram_storage is None
+            or not self._storage_accepting
+            or media_id in self._storage_pending_ids
+        ):
+            return False
+        self._storage_pending_ids.add(media_id)
+        try:
+            await self._storage_queue.put(
+                _StorageRequest(bot, asset, media_id, chat_id)
+            )
+        except BaseException:
+            self._storage_pending_ids.discard(media_id)
+            raise
+        return True
 
     async def _authorize(self, update: Update, *, require_admin: bool = False) -> bool:
         user = update.effective_user
@@ -385,7 +481,10 @@ class TelegramMusicBot:
             else f"Ищу: {query}"
         )
         status = await message.reply_text(status_text)
-        await message.chat.send_action(ChatAction.TYPING)
+        try:
+            await message.chat.send_action(ChatAction.TYPING)
+        except TelegramError:
+            logger.debug("Could not send Telegram typing indicator")
         try:
             asset = await self.coordinator.resolve(query)
         except PendingQueueFull:
@@ -415,7 +514,10 @@ class TelegramMusicBot:
     async def _show_playlist(self, update: Update, url: str) -> None:
         message = update.effective_message
         status = await message.reply_text("Читаю плейлист YouTube Music…")
-        await message.chat.send_action(ChatAction.TYPING)
+        try:
+            await message.chat.send_action(ChatAction.TYPING)
+        except TelegramError:
+            logger.debug("Could not send Telegram typing indicator")
         try:
             preview = await self.coordinator.preview_playlist(url)
             session = await asyncio.to_thread(
@@ -560,25 +662,42 @@ class TelegramMusicBot:
         index: int,
     ) -> None:
         track = session.tracks[index]
-        status = await message.reply_text(
-            f"Скачиваю {index + 1}/{len(session.tracks)}: {track.artist_string} — {track.title}"
-        )
+        status = None
         try:
+            status = await self._retry_rate_limit(
+                lambda: message.reply_text(
+                    f"Скачиваю {index + 1}/{len(session.tracks)}: "
+                    f"{track.artist_string} — {track.title}"
+                )
+            )
             asset = await self.coordinator.resolve_playlist_track(
                 session.token,
                 index,
                 track,
             )
             if asset is None:
-                await status.edit_text(f"Не удалось скачать: {track.artist_string} — {track.title}")
+                await self._best_effort_edit(
+                    status,
+                    f"Не удалось скачать: {track.artist_string} — {track.title}",
+                )
                 return
-            await status.edit_text(f"Готово: {asset.display_name}")
+            await self._best_effort_edit(status, f"Готово: {asset.display_name}")
             await self._deliver(message, asset)
         except PendingQueueFull:
-            await status.edit_text("Очередь занята. Попробуйте чуть позже.")
+            if status is not None:
+                await self._best_effort_edit(
+                    status,
+                    "Очередь занята. Попробуйте чуть позже.",
+                )
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Playlist track download failed")
-            await status.edit_text("Не удалось скачать выбранный трек.")
+            if status is not None:
+                await self._best_effort_edit(
+                    status,
+                    "Не удалось скачать выбранный трек.",
+                )
         finally:
             await self._release_playlist_action(session.token, index)
 
@@ -586,13 +705,22 @@ class TelegramMusicBot:
         total = len(session.tracks)
         ready = 0
         failed = 0
-        status = await message.reply_text(f"Скачиваю плейлист: 0/{total}")
+        status = None
         try:
+            status = await self._retry_rate_limit(
+                lambda: message.reply_text(f"Скачиваю плейлист: 0/{total}")
+            )
+            last_progress_at = 0.0
             for index, track in enumerate(session.tracks):
-                await status.edit_text(
-                    f"Скачиваю плейлист: {index}/{total}\n"
-                    f"Сейчас: {track.artist_string} — {track.title}"
-                )
+                now = time.monotonic()
+                if index == 0 or now - last_progress_at >= 3:
+                    await self._best_effort_edit(
+                        status,
+                        f"Плейлист: {index}/{total} • готово {ready} • "
+                        f"ошибок {failed}\n"
+                        f"Сейчас: {track.artist_string} — {track.title}",
+                    )
+                    last_progress_at = now
                 try:
                     asset = await self.coordinator.resolve_playlist_track(
                         session.token,
@@ -609,12 +737,22 @@ class TelegramMusicBot:
                 except Exception:
                     failed += 1
                     logger.exception("Playlist item %s failed", index)
-                await status.edit_text(
-                    f"Обработано {index + 1}/{total} • готово {ready} • ошибок {failed}"
+            await self._retry_rate_limit(
+                lambda: status.edit_text(
+                    f"Плейлист обработан: готово {ready}/{total} • "
+                    f"ошибок {failed}."
                 )
-            await status.edit_text(
-                f"Плейлист обработан: готово {ready}/{total} • ошибок {failed}."
             )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Playlist download-all task failed")
+            if status is not None:
+                await self._best_effort_edit(
+                    status,
+                    f"Плейлист остановлен: готово {ready}/{total} • "
+                    f"ошибок {failed}.",
+                )
         finally:
             await self._release_playlist_action(session.token, -1)
 
@@ -637,26 +775,36 @@ class TelegramMusicBot:
             return
 
         try:
-            await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            try:
+                await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            except TelegramError:
+                logger.debug("Could not send Telegram upload indicator")
             with asset.path.open("rb") as audio_file:
-                if decision.kind == DeliveryKind.AUDIO:
-                    await message.reply_audio(
-                        audio=audio_file,
-                        filename=asset.path.name,
-                        title=asset.title,
-                        performer=asset.artist or None,
-                        duration=int(asset.duration_seconds) if asset.duration_seconds else None,
-                        read_timeout=180,
-                        write_timeout=180,
-                    )
-                else:
-                    await message.reply_document(
+                async def send_file():
+                    audio_file.seek(0)
+                    if decision.kind == DeliveryKind.AUDIO:
+                        return await message.reply_audio(
+                            audio=audio_file,
+                            filename=asset.path.name,
+                            title=asset.title,
+                            performer=asset.artist or None,
+                            duration=(
+                                int(asset.duration_seconds)
+                                if asset.duration_seconds
+                                else None
+                            ),
+                            read_timeout=180,
+                            write_timeout=180,
+                        )
+                    return await message.reply_document(
                         document=audio_file,
                         filename=asset.path.name,
                         caption=asset.display_name,
                         read_timeout=180,
                         write_timeout=180,
                     )
+
+                await self._retry_rate_limit(send_file)
         except TelegramError:
             logger.exception("Telegram upload failed; falling back to VLC")
             await self._send_vlc(message, asset)
@@ -729,16 +877,18 @@ class TelegramMusicBot:
             return
         media_id = self.registry.register(asset)
         url = await asyncio.to_thread(self._player_url, user.id, media_id)
-        await message.reply_text(
-            f"Сохранено в медиатеку:\n{asset.display_name}",
-            reply_markup=InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton(
-                        "▶ Слушать в Antra",
-                        web_app=WebAppInfo(url=url),
-                    )
-                ]]
-            ),
+        await self._retry_rate_limit(
+            lambda: message.reply_text(
+                f"Сохранено в медиатеку:\n{asset.display_name}",
+                reply_markup=InlineKeyboardMarkup(
+                    [[
+                        InlineKeyboardButton(
+                            "▶ Слушать в Antra",
+                            web_app=WebAppInfo(url=url),
+                        )
+                    ]]
+                ),
+            )
         )
         if self.telegram_storage is not None:
             storage_chat_id = (
@@ -746,17 +896,12 @@ class TelegramMusicBot:
                 or await asyncio.to_thread(self.access_store.admin_id)
                 or message.chat_id
             )
-            task = asyncio.create_task(
-                self._archive_in_telegram(
-                    message.get_bot(),
-                    asset,
-                    media_id,
-                    storage_chat_id,
-                ),
-                name=f"telegram-storage-{media_id}",
+            await self._enqueue_storage(
+                message.get_bot(),
+                asset,
+                media_id,
+                storage_chat_id,
             )
-            self._storage_tasks.add(task)
-            task.add_done_callback(self._storage_tasks.discard)
 
     async def _archive_in_telegram(
         self,
@@ -788,20 +933,45 @@ class TelegramMusicBot:
             )
 
     async def shutdown(self) -> None:
-        tasks = tuple(self._storage_tasks)
-        if not tasks:
+        if self._storage_shutdown:
             return
-        done, pending = await asyncio.wait(tasks, timeout=30)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            try:
-                task.result()
-            except (asyncio.CancelledError, Exception):
-                # Each archive task already logs its own actionable failure.
-                pass
+        self._storage_accepting = False
+        tasks = tuple(self._storage_tasks)
+        workers = tuple(self._storage_workers)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    self._storage_queue.join(),
+                    *tasks,
+                    return_exceptions=True,
+                ),
+                timeout=30,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Telegram storage did not drain within 30 seconds; "
+                "cancelling remaining work"
+            )
+            for task in (*tasks, *workers):
+                task.cancel()
+        finally:
+            for worker in workers:
+                worker.cancel()
+            if tasks or workers:
+                await asyncio.gather(
+                    *tasks,
+                    *workers,
+                    return_exceptions=True,
+                )
+            while True:
+                try:
+                    request = self._storage_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._storage_pending_ids.discard(request.media_id)
+                self._storage_queue.task_done()
+            self._storage_pending_ids.clear()
+            self._storage_shutdown = True
 
     async def _send_vlc(self, message, asset: TrackAsset) -> None:
         try:

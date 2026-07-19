@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  claimStreamRetry,
   mergeUniqueById,
   refreshQueueItems,
+  resetStreamRetry,
   resolvePlaybackSelection,
   storedVolumeOrDefault,
   trustedApiOrigin,
@@ -59,4 +61,16 @@ test("queue keeps its order while receiving refreshed stream metadata", () => {
     { id: "b", url: "new-b" },
     { id: "a", url: "new-a" },
   ]);
+});
+
+test("automatic stream recovery is bounded until the user retries", () => {
+  const initial = resetStreamRetry("track-a");
+  const first = claimStreamRetry(initial, "track-a");
+  const second = claimStreamRetry(first.state, "track-a");
+  const otherTrack = claimStreamRetry(second.state, "track-b");
+
+  assert.equal(first.allowed, true);
+  assert.equal(second.allowed, false);
+  assert.equal(otherTrack.allowed, true);
+  assert.equal(claimStreamRetry(resetStreamRetry("track-a"), "track-a").allowed, true);
 });

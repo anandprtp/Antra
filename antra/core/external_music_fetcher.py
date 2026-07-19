@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -23,19 +23,35 @@ _DEEZER_API = "https://api.deezer.com"
 _ODESLI_API = "https://api.song.link/v1-alpha.1/links"
 
 
+def _is_http_url_for_hosts(url: str, hosts: tuple[str, ...]) -> bool:
+    parsed = urlparse((url or "").strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.username
+        or parsed.password
+        or not parsed.hostname
+    ):
+        return False
+    hostname = parsed.hostname.rstrip(".").casefold()
+    return any(
+        hostname == allowed or hostname.endswith(f".{allowed}")
+        for allowed in hosts
+    )
+
+
 def is_tidal_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return host.endswith("tidal.com") or host.endswith("listen.tidal.com")
+    return _is_http_url_for_hosts(url, ("tidal.com",))
 
 
 def is_qobuz_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return host.endswith("qobuz.com") or host == "open.qobuz.com"
+    return _is_http_url_for_hosts(url, ("qobuz.com",))
 
 
 def is_deezer_url(url: str) -> bool:
-    host = urlparse(url).netloc.lower()
-    return host.endswith("deezer.com") or host in {"deezer.page.link", "link.deezer.com"}
+    return _is_http_url_for_hosts(
+        url,
+        ("deezer.com", "deezer.page.link"),
+    )
 
 
 class ExternalMusicFetcher:
@@ -1072,11 +1088,29 @@ class ExternalMusicFetcher:
     # -- Shared -------------------------------------------------------------
 
     def _resolve_redirect(self, url: str) -> str:
-        if not any(host in url for host in ("deezer.page.link", "link.deezer.com")):
+        hostname = (urlparse(url).hostname or "").rstrip(".").casefold()
+        if hostname not in {"deezer.page.link", "link.deezer.com"}:
             return url
         try:
-            resp = self._session.get(url, timeout=15, allow_redirects=True)
-            return resp.url or url
+            current = url
+            for _ in range(5):
+                resp = self._session.get(
+                    current,
+                    timeout=15,
+                    allow_redirects=False,
+                )
+                if not 300 <= resp.status_code < 400:
+                    return current
+                location = resp.headers.get("Location")
+                if not location:
+                    return current
+                candidate = urljoin(current, location)
+                if not is_deezer_url(candidate):
+                    raise ValueError(
+                        "Deezer short link redirected outside trusted hosts"
+                    )
+                current = candidate
+            raise ValueError("Deezer short link has too many redirects")
         except Exception as exc:
             logger.debug(f"[ExternalMusic] Could not resolve short Deezer URL: {exc}")
             return url

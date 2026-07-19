@@ -7,6 +7,34 @@ export type PlaybackSelection<T extends Identified> = {
   currentId: string | null;
 };
 
+export type StreamRetryState = {
+  trackId: string | null;
+  retries: number;
+};
+
+export type StreamRetryDecision = {
+  allowed: boolean;
+  state: StreamRetryState;
+};
+
+export function resetStreamRetry(trackId: string | null): StreamRetryState {
+  return { trackId, retries: 0 };
+}
+
+export function claimStreamRetry(
+  current: StreamRetryState,
+  trackId: string,
+  maxRetries = 1,
+): StreamRetryDecision {
+  const state =
+    current.trackId === trackId ? current : resetStreamRetry(trackId);
+  if (state.retries >= maxRetries) return { allowed: false, state };
+  return {
+    allowed: true,
+    state: { trackId, retries: state.retries + 1 },
+  };
+}
+
 export function trustedApiOrigin(currentOrigin: string): string {
   return new URL(currentOrigin).origin;
 }

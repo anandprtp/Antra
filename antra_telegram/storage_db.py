@@ -274,6 +274,26 @@ class StorageCatalog:
                 ((error or "unknown storage error")[:1000], int(time.time()), track_id),
             )
 
+    def mark_corrupt(self, track_id: str, error: str) -> None:
+        """Invalidate damaged cloud parts so a later archive uploads clean bytes."""
+        with self._connection() as db:
+            db.execute(
+                "DELETE FROM telegram_parts WHERE track_id = ?",
+                (track_id,),
+            )
+            db.execute(
+                """
+                UPDATE stored_tracks
+                SET state = 'failed', last_error = ?, updated_at = ?
+                WHERE track_id = ?
+                """,
+                (
+                    (error or "corrupt Telegram storage object")[:1000],
+                    int(time.time()),
+                    track_id,
+                ),
+            )
+
     def parts_for(self, track_id: str) -> list[StoredPart]:
         with self._connection() as db:
             rows = db.execute(

@@ -7,6 +7,12 @@ from antra.core import endpoint_manifest
 from antra.core import metadata_enricher
 from antra.core.amazon_music_fetcher import is_amazon_music_url
 from antra.core.apple_fetcher import is_apple_music_url
+from antra.core.external_music_fetcher import (
+    ExternalMusicFetcher,
+    is_deezer_url,
+    is_qobuz_url,
+    is_tidal_url,
+)
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.core.resolver import SourceResolver
 from antra.core.service import AntraService, RuntimeOptions
@@ -22,6 +28,9 @@ from antra.utils.organizer import LibraryOrganizer
         (is_apple_music_url, "https://music.apple.com/us/album/name/123"),
         (is_soundcloud_url, "https://soundcloud.com/artist/track"),
         (is_amazon_music_url, "https://music.amazon.co.uk/albums/ABC123"),
+        (is_tidal_url, "https://listen.tidal.com/album/123"),
+        (is_qobuz_url, "https://open.qobuz.com/album/abc"),
+        (is_deezer_url, "https://www.deezer.com/track/123"),
     ],
 )
 def test_music_url_checks_accept_only_the_intended_host(checker, valid):
@@ -33,6 +42,41 @@ def test_music_url_checks_accept_only_the_intended_host(checker, valid):
         f"https://{parsed.hostname}.evil.example{parsed.path}"
         f"?{parsed.query}",
     )
+
+
+@pytest.mark.parametrize(
+    ("checker", "spoofed"),
+    [
+        (is_tidal_url, "https://eviltidal.com/album/123"),
+        (is_qobuz_url, "https://fakeqobuz.com/album/abc"),
+        (is_deezer_url, "https://maliciousdeezer.com/track/123"),
+    ],
+)
+def test_external_music_url_checks_reject_lookalike_parent_domains(
+    checker,
+    spoofed,
+):
+    assert not checker(spoofed)
+
+
+def test_deezer_shortlink_never_follows_redirect_to_untrusted_host():
+    requested: list[str] = []
+
+    class Response:
+        status_code = 302
+        headers = {"Location": "http://127.0.0.1/internal"}
+
+    class Session:
+        def get(self, url, **kwargs):
+            requested.append(url)
+            return Response()
+
+    fetcher = ExternalMusicFetcher.__new__(ExternalMusicFetcher)
+    fetcher._session = Session()
+    original = "https://deezer.page.link/track123"
+
+    assert fetcher._resolve_redirect(original) == original
+    assert requested == [original]
 
 
 @pytest.mark.parametrize(

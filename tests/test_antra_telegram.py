@@ -5,12 +5,14 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from aiohttp.test_utils import TestClient, TestServer
 import pytest
 from telegram.ext import CallbackQueryHandler
+from telegram.error import NetworkError, RetryAfter, TelegramError
 
 from antra.core.config import Config
 from antra.core.models import DownloadResult, DownloadStatus, TrackMetadata
@@ -20,8 +22,9 @@ from antra.core.youtube_music_fetcher import YouTubeMusicFetcher
 from antra.sources.amazon import AmazonAdapter
 from antra.sources.youtube import YouTubeAdapter
 from antra_telegram.access import AccessStore, AccessStoreError
-from antra_telegram.__main__ import build_application
+from antra_telegram.__main__ import _register_stored_tracks, build_application
 from antra_telegram.config import ConfigError, TelegramConfig
+from antra_telegram.bot import TelegramMusicBot
 from antra_telegram.delivery import DeliveryKind, choose_delivery
 from antra_telegram.jobs import (
     JobCoordinator,
@@ -37,10 +40,11 @@ from antra_telegram.playlist_ui import parse_playlist_callback, render_playlist_
 from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
 from antra_telegram.splitter import estimate_segment_seconds
-from antra_telegram.storage_db import StorageCatalog
+from antra_telegram.storage_db import StorageCatalog, StoredPart
 from antra_telegram.telegram_storage import (
     TelegramStorage,
     TelegramStorageCorruptionError,
+    TelegramStorageError,
     copy_part,
 )
 from antra_telegram.tunnel_supervisor import (
@@ -722,6 +726,122 @@ def test_application_registers_playlist_callback_handler(tmp_path: Path):
     assert sum(isinstance(handler, CallbackQueryHandler) for handler in handlers) == 1
     assert application.update_processor.max_concurrent_updates >= 2
     assert application.error_handlers
+    assert application.post_stop is not None
+    assert application.post_shutdown is not None
+
+
+def test_playlist_download_all_retries_429_throttles_progress_and_releases_action(
+    monkeypatch,
+):
+    tracks = tuple(
+        TrackMetadata(
+            title=f"Track {index}",
+            artists=["Artist"],
+            album="Album",
+        )
+        for index in range(12)
+    )
+    session = PlaylistSession(
+        token="playlist-token",
+        owner_user_id=1,
+        chat_id=1,
+        message_id=1,
+        source_url="https://music.youtube.com/playlist?list=PL12345678",
+        name="Playlist",
+        tracks=tracks,
+        expires_at=int(time.time()) + 60,
+    )
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = 0
+
+        async def resolve_playlist_track(self, token, index, track):
+            self.calls += 1
+            return TrackAsset(Path(f"/tmp/{index}.mp3"), track.title, "Artist")
+
+    class Status:
+        def __init__(self):
+            self.edits: list[str] = []
+
+        async def edit_text(self, text, **kwargs):
+            self.edits.append(text)
+
+    class Message:
+        def __init__(self):
+            self.replies = 0
+            self.status = Status()
+
+        async def reply_text(self, text, **kwargs):
+            self.replies += 1
+            if self.replies == 1:
+                raise RetryAfter(timedelta(0))
+            return self.status
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def scenario():
+        coordinator = Coordinator()
+        bot = TelegramMusicBot(
+            SimpleNamespace(),
+            None,
+            None,
+            coordinator,
+            None,
+            None,
+            None,
+        )
+
+        async def deliver(_message, _asset):
+            return None
+
+        bot._deliver = deliver
+        assert await bot._claim_playlist_action(session.token, -1)
+        message = Message()
+        await bot._download_playlist_all(message, session)
+
+        assert message.replies == 2
+        assert coordinator.calls == len(tracks)
+        assert len(message.status.edits) == 2
+        assert message.status.edits[-1].startswith("Плейлист обработан")
+        assert await bot._claim_playlist_action(session.token, -1)
+
+    monkeypatch.setattr("antra_telegram.bot.asyncio.sleep", no_sleep)
+    asyncio.run(scenario())
+
+
+def test_playlist_action_is_released_when_status_message_fails():
+    session = PlaylistSession(
+        token="playlist-token",
+        owner_user_id=1,
+        chat_id=1,
+        message_id=1,
+        source_url="https://music.youtube.com/playlist?list=PL12345678",
+        name="Playlist",
+        tracks=(TrackMetadata("Track", ["Artist"], "Album"),),
+        expires_at=int(time.time()) + 60,
+    )
+
+    class Message:
+        async def reply_text(self, text, **kwargs):
+            raise TelegramError("status unavailable")
+
+    async def scenario():
+        bot = TelegramMusicBot(
+            SimpleNamespace(),
+            None,
+            None,
+            SimpleNamespace(),
+            None,
+            None,
+            None,
+        )
+        assert await bot._claim_playlist_action(session.token, 0)
+        await bot._download_playlist_track(Message(), session, 0)
+        assert await bot._claim_playlist_action(session.token, 0)
+
+    asyncio.run(scenario())
 
 
 def test_youtube_adapter_uses_exact_source_video_without_text_search():
@@ -911,8 +1031,224 @@ def test_telegram_storage_archives_restorable_cloud_parts(tmp_path: Path):
                 destination=source,
             )
         assert catalog.ready_track("opaque-track-id") is None
+        assert catalog.parts_for("opaque-track-id") == []
+
+        sent_before_repair = len(sent_payloads)
+        source.write_bytes(payload)
+        assert await reconfigured.archive(
+            bot,
+            asset,
+            track_id="opaque-track-id",
+            chat_id=123,
+        )
+        repaired_parts = catalog.parts_for("opaque-track-id")
+        assert len(sent_payloads) - sent_before_repair == len(repaired_parts)
+        source.unlink()
+        repaired = await reconfigured.restore(
+            bot,
+            track_id="opaque-track-id",
+            destination=source,
+        )
+        assert repaired.path.read_bytes() == payload
+        assert reconfigured._locks == {}
 
     asyncio.run(scenario())
+
+
+def test_storage_archive_queue_is_bounded_deduplicated_and_drained():
+    async def scenario():
+        release = asyncio.Event()
+
+        class Storage:
+            def __init__(self):
+                self.calls: list[str] = []
+
+            async def archive(self, bot, asset, *, track_id, chat_id):
+                self.calls.append(track_id)
+                await release.wait()
+                return True
+
+        storage = Storage()
+        registered: list[str] = []
+        music_bot = TelegramMusicBot(
+            SimpleNamespace(max_pending_jobs=2),
+            None,
+            None,
+            None,
+            SimpleNamespace(
+                register_stored=lambda media_id, asset: registered.append(media_id)
+            ),
+            None,
+            None,
+            telegram_storage=storage,
+        )
+        await music_bot.start_background_tasks()
+        asset = TrackAsset(Path("/tmp/track.mp3"), "Track", "Artist")
+        producers = [
+            asyncio.create_task(
+                music_bot._enqueue_storage(
+                    SimpleNamespace(),
+                    asset,
+                    f"track-{index}",
+                    123,
+                )
+            )
+            for index in range(8)
+        ]
+        await asyncio.sleep(0.02)
+
+        assert len(music_bot._storage_workers) == 2
+        assert music_bot._storage_queue.qsize() <= 2
+        assert not await music_bot._enqueue_storage(
+            SimpleNamespace(),
+            asset,
+            "track-0",
+            123,
+        )
+
+        release.set()
+        assert all(await asyncio.gather(*producers))
+        await music_bot._storage_queue.join()
+        await music_bot.shutdown()
+
+        assert sorted(storage.calls) == [
+            f"track-{index}" for index in range(8)
+        ]
+        assert sorted(registered) == sorted(storage.calls)
+        assert music_bot._storage_pending_ids == set()
+        assert music_bot._storage_workers == set()
+
+    asyncio.run(scenario())
+
+
+def test_telegram_restore_retries_transient_failures_without_invalidating_catalog(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def no_sleep(_seconds):
+        return None
+
+    async def scenario():
+        destination = tmp_path / "Music" / "Artist" / "Track.mp3"
+        payload = b"restorable-payload"
+        asset = TrackAsset(destination, "Track", "Artist", "Album", 120)
+        catalog = StorageCatalog(tmp_path / "storage.sqlite3")
+        digest = hashlib.sha256(payload).hexdigest()
+        catalog.begin_upload(
+            track_id="track-id",
+            asset=asset,
+            mime_type="audio/mpeg",
+            total_bytes=len(payload),
+            sha256=digest,
+            part_count=1,
+            part_bytes=18_000_000,
+            storage_chat_id=123,
+        )
+        catalog.record_part(
+            StoredPart(
+                track_id="track-id",
+                part_index=0,
+                byte_offset=0,
+                byte_length=len(payload),
+                sha256=digest,
+                chat_id=123,
+                message_id=456,
+                file_id="file-id",
+                file_unique_id="unique-id",
+            )
+        )
+        catalog.mark_ready("track-id")
+        storage = TelegramStorage(catalog)
+
+        class RetryBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def get_file(self, file_id):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RetryAfter(timedelta(0))
+
+                class File:
+                    async def download_to_drive(self, custom_path):
+                        Path(custom_path).write_bytes(payload)
+
+                return File()
+
+        retry_bot = RetryBot()
+        restored = await storage.restore(
+            retry_bot,
+            track_id="track-id",
+            destination=destination,
+        )
+        assert restored.path.read_bytes() == payload
+        assert retry_bot.calls == 2
+
+        destination.unlink()
+
+        class OfflineBot:
+            async def get_file(self, file_id):
+                raise NetworkError("temporary outage")
+
+        with pytest.raises(TelegramStorageError):
+            await storage.restore(
+                OfflineBot(),
+                track_id="track-id",
+                destination=destination,
+            )
+        assert catalog.ready_track("track-id") is not None
+        assert storage._locks == {}
+
+    monkeypatch.setattr("antra_telegram.telegram_storage.asyncio.sleep", no_sleep)
+    asyncio.run(scenario())
+
+
+def test_storage_catalog_registration_preserves_existing_local_original(
+    tmp_path: Path,
+):
+    library = tmp_path / "Music"
+    source = library / "Artist" / "Album" / "01 - Track.mp3"
+    source.parent.mkdir(parents=True)
+    payload = b"local-original"
+    source.write_bytes(payload)
+    asset = TrackAsset(source, "Track", "Artist", "Album", 120)
+
+    initial_registry = MediaRegistry(library, SECRET)
+    media_id = initial_registry.register(asset)
+    catalog = StorageCatalog(tmp_path / "storage.sqlite3")
+    catalog.begin_upload(
+        track_id=media_id,
+        asset=asset,
+        mime_type="audio/mpeg",
+        total_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+        part_count=1,
+        part_bytes=18_000_000,
+        storage_chat_id=123,
+    )
+    catalog.record_part(
+        StoredPart(
+            track_id=media_id,
+            part_index=0,
+            byte_offset=0,
+            byte_length=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            chat_id=123,
+            message_id=456,
+            file_id="file-id",
+            file_unique_id="unique-id",
+        )
+    )
+    catalog.mark_ready(media_id)
+
+    restarted_registry = MediaRegistry(library, SECRET)
+    restarted_registry.refresh()
+    _register_stored_tracks(restarted_registry, catalog, library)
+
+    registered = restarted_registry.get(media_id)
+    assert registered is not None
+    assert registered.path == source
+    assert registered.path.read_bytes() == payload
 
 
 def test_copy_part_preserves_exact_byte_range(tmp_path: Path):
@@ -1140,4 +1476,31 @@ def test_static_admin_invite_persists_member_access(tmp_path: Path):
 
     assert joined.allowed and joined.role == "member"
     assert store.authorize_or_claim(222).allowed
+    assert store.list_members(111) == [(111, "admin"), (222, "member")]
+
+
+def test_static_admin_cannot_consume_invite_or_be_downgraded_by_legacy_row(
+    tmp_path: Path,
+):
+    path = tmp_path / "access.sqlite3"
+    store = AccessStore(
+        path,
+        static_allowed_user_ids=frozenset({111}),
+    )
+    token = store.create_invite(111, ttl_seconds=3600, now=1_000)
+
+    admin = store.redeem_invite(111, token, now=1_001)
+    member = store.redeem_invite(222, token, now=1_002)
+
+    assert admin.allowed and admin.role == "admin"
+    assert not admin.joined_by_invite
+    assert member.allowed and member.role == "member"
+
+    with sqlite3.connect(path) as db:
+        db.execute(
+            """
+            INSERT INTO bot_users(telegram_user_id, role, added_at)
+            VALUES (111, 'member', 1000)
+            """
+        )
     assert store.list_members(111) == [(111, "admin"), (222, "member")]

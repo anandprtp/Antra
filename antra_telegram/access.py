@@ -164,6 +164,8 @@ class AccessStore:
         *,
         now: int | None = None,
     ) -> AccessDecision:
+        if user_id in self.static_allowed_user_ids:
+            return AccessDecision(True, role="admin")
         current = int(time.time()) if now is None else now
         token_hash = self._token_hash(token)
         try:
@@ -221,10 +223,13 @@ class AccessStore:
                     "SELECT telegram_user_id, role FROM bot_users ORDER BY role, telegram_user_id"
                 ).fetchall()
                 members = {
-                    int(user_id): "admin"
-                    for user_id in self.static_allowed_user_ids
+                    int(row[0]): str(row[1])
+                    for row in rows
                 }
-                members.update((int(row[0]), str(row[1])) for row in rows)
+                members.update(
+                    (int(user_id), "admin")
+                    for user_id in self.static_allowed_user_ids
+                )
                 return sorted(members.items(), key=lambda item: (item[1], item[0]))
         except PermissionError:
             raise

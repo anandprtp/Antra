@@ -26,6 +26,36 @@ from .telegram_storage import TelegramStorage
 from .web_sessions import WebSessionStore
 
 
+def _register_stored_tracks(
+    registry: MediaRegistry,
+    catalog: StorageCatalog,
+    library_dir: Path,
+) -> None:
+    for stored in catalog.ready_tracks():
+        local_asset = registry.get(stored.track_id)
+        path = (
+            local_asset.path
+            if local_asset is not None
+            else (
+                library_dir
+                / ".antra-telegram-cache"
+                / stored.track_id
+                / Path(stored.filename).name
+            )
+        )
+        registry.register_stored(
+            stored.track_id,
+            TrackAsset(
+                path,
+                stored.title,
+                stored.artist,
+                stored.album,
+                stored.duration_seconds,
+                source=local_asset.source if local_asset is not None else "telegram",
+            ),
+        )
+
+
 def build_application(config: TelegramConfig) -> Application:
     library = LibraryIndex(config.library_dir)
     library.refresh()
@@ -40,23 +70,11 @@ def build_application(config: TelegramConfig) -> Application:
             storage_catalog,
             part_bytes=config.storage_part_bytes,
         )
-        for stored in storage_catalog.ready_tracks():
-            registry.register_stored(
-                stored.track_id,
-                TrackAsset(
-                    (
-                        config.library_dir
-                        / ".antra-telegram-cache"
-                        / stored.track_id
-                        / Path(stored.filename).name
-                    ),
-                    stored.title,
-                    stored.artist,
-                    stored.album,
-                    stored.duration_seconds,
-                    source="telegram",
-                ),
-            )
+        _register_stored_tracks(
+            registry,
+            storage_catalog,
+            config.library_dir,
+        )
     web_session_store = WebSessionStore(
         config.web_sessions_db_path,
         default_ttl_seconds=config.web_session_ttl_seconds,
@@ -106,10 +124,15 @@ def build_application(config: TelegramConfig) -> Application:
 
     async def post_init(application: Application) -> None:
         await media_server.start()
+        await bot.start_background_tasks()
 
-    async def post_shutdown(application: Application) -> None:
-        await bot.shutdown()
+    async def stop_services(application: Application) -> None:
+        # post_stop runs before python-telegram-bot closes its HTTP client.
+        # Stop new restore requests first, then let uploads finish/cancel while
+        # the Bot API is still usable. The same callback is an idempotent
+        # post_shutdown fallback for non-standard lifecycle callers.
         await media_server.stop()
+        await bot.shutdown()
 
     async def handle_error(
         update: object,
@@ -125,7 +148,8 @@ def build_application(config: TelegramConfig) -> Application:
         .token(config.bot_token)
         .concurrent_updates(max(2, min(config.max_pending_jobs, 8)))
         .post_init(post_init)
-        .post_shutdown(post_shutdown)
+        .post_stop(stop_services)
+        .post_shutdown(stop_services)
         .build()
     )
     media_server.configure_storage_bot(lambda: application.bot)

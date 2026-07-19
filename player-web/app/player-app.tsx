@@ -38,11 +38,14 @@ import {
 } from "react";
 
 import {
+  claimStreamRetry,
   mergeUniqueById,
   refreshQueueItems,
+  resetStreamRetry,
   resolvePlaybackSelection,
   shouldIgnoreGlobalShortcut,
   storedVolumeOrDefault,
+  type StreamRetryState,
   trustedApiOrigin,
 } from "./player-core";
 
@@ -412,7 +415,7 @@ export function PlayerApp() {
   const pendingSeekRef = useRef(0);
   const saveInFlightRef = useRef(false);
   const catalogRefreshRef = useRef<Promise<Track[]> | null>(null);
-  const streamRetryRef = useRef<string | null>(null);
+  const streamRetryRef = useRef<StreamRetryState>(resetStreamRetry(null));
   const snapshotRef = useRef<SaveSnapshot>({
     revision: 0,
     queueIds: [],
@@ -703,15 +706,6 @@ export function PlayerApp() {
     localStorage.setItem(STORAGE.volume, String(volume));
   }, [volume]);
 
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio || !currentTrack?.streamUrl) return;
-    if (audio.src !== currentTrack.streamUrl) {
-      audio.src = currentTrack.streamUrl;
-      audio.load();
-    }
-  }, [currentTrack]);
-
   const playTrack = useCallback(
     async (track: Track, contextQueue?: Track[], startAt = 0) => {
       if (!isReady(track)) {
@@ -747,6 +741,7 @@ export function PlayerApp() {
 
       const audio = audioRef.current;
       if (!audio) return;
+      streamRetryRef.current = resetStreamRetry(playableTrack.id);
       setPlaybackError("");
       if (contextQueue?.length) {
         setQueue(refreshQueueItems(contextQueue, latestCatalog));
@@ -771,13 +766,16 @@ export function PlayerApp() {
 
   const handlePlaybackError = useCallback(async () => {
     setIsPlaying(false);
+    const retryDecision = currentTrack
+      ? claimStreamRetry(streamRetryRef.current, currentTrack.id)
+      : null;
+    if (retryDecision) streamRetryRef.current = retryDecision.state;
     if (
       currentTrack &&
       credentials?.token &&
       !demoMode &&
-      streamRetryRef.current !== currentTrack.id
+      retryDecision?.allowed
     ) {
-      streamRetryRef.current = currentTrack.id;
       try {
         const catalog = await refreshCatalog();
         const refreshed = catalog.find((track) => track.id === currentTrack.id);
@@ -805,11 +803,12 @@ export function PlayerApp() {
       return;
     }
     if (audio.paused) {
-      if (!currentTrack.streamUrl) {
-        await playTrack(currentTrack, queue);
+      if (!currentTrack.streamUrl || audio.src !== currentTrack.streamUrl) {
+        await playTrack(currentTrack, queue, audio.currentTime || position);
         return;
       }
       try {
+        streamRetryRef.current = resetStreamRetry(currentTrack.id);
         await audio.play();
         setPlaybackError("");
       } catch {
@@ -818,7 +817,7 @@ export function PlayerApp() {
     } else {
       audio.pause();
     }
-  }, [currentTrack, playTrack, queue, tracks]);
+  }, [currentTrack, playTrack, position, queue, tracks]);
 
   const moveToNext = useCallback(
     async (fromEnded = false) => {
@@ -1154,7 +1153,7 @@ export function PlayerApp() {
     <div className="app-shell">
       <audio
         ref={audioRef}
-        preload="metadata"
+        preload="none"
         onTimeUpdate={(event) => setPosition(event.currentTarget.currentTime || 0)}
         onDurationChange={(event) =>
           setDuration(
@@ -1165,7 +1164,6 @@ export function PlayerApp() {
         }
         onLoadedMetadata={handleLoadedMetadata}
         onPlay={() => {
-          streamRetryRef.current = null;
           setIsPlaying(true);
         }}
         onPause={() => setIsPlaying(false)}
