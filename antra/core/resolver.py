@@ -363,6 +363,25 @@ class SourceResolver:
         excluded: set[str],
     ) -> list[BaseSourceAdapter]:
         base_order = self._build_resolve_order(excluded)
+        # A user-pasted, strictly validated YouTube video is already an exact
+        # identity match. In lossy output modes, try that deterministic source
+        # before slow catalog text searches. Keep the remaining adapters as a
+        # fallback if the exact video itself cannot be downloaded.
+        if (
+            self._is_lossy_preferred_mode()
+            and (getattr(track, "source_service", None) or "").lower() == "youtube"
+        ):
+            direct_url = (getattr(track, "source_url", None) or "").strip()
+            try:
+                from antra.sources.youtube import YouTubeAdapter
+
+                is_direct = YouTubeAdapter._is_direct_video_url(direct_url)
+            except Exception:
+                is_direct = False
+            if is_direct:
+                exact = [adapter for adapter in base_order if adapter.name == "youtube"]
+                fallback = [adapter for adapter in base_order if adapter.name != "youtube"]
+                return exact + fallback
         rule = (getattr(track, "source_rule", None) or "").lower()
         service = getattr(track, "source_service", None)
 

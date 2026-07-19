@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from antra.core.models import DownloadResult, DownloadStatus, TrackMetadata
 from antra.core.service import AntraService, RuntimeOptions
+from antra.sources.youtube import YouTubeAdapter
 
 from .config import TelegramConfig
 from .library import LibraryIndex, normalize_query
@@ -88,14 +89,32 @@ class MusicResolver:
         # library searches may run in parallel, but provider downloads are serial.
         with self._download_lock:
             service = self._get_service()
-            options = self._runtime_options()
             if youtube_music_kind == "track":
-                results = service.download_playlist(query, options=options)
+                metadata_options = self._runtime_options(exact_youtube=True)
+                tracks = service.fetch_playlist_tracks(query, options=metadata_options)
+                if len(tracks) != 1:
+                    raise MusicRequestError(
+                        "Не удалось получить данные трека по прямой ссылке."
+                    )
+                track = tracks[0]
+                track.request_kind = "track"
+                options = self._runtime_options(
+                    track=track,
+                    exact_youtube=True,
+                )
+                results = service.download_tracks([track], options=options)
             else:
+                options = self._runtime_options()
                 track = service.search_track(query, options=options)
                 if track is None:
                     return None
-                results = service.download_tracks([track], options=options)
+                results = service.download_tracks(
+                    [track],
+                    options=self._runtime_options(
+                        track=track,
+                        exact_youtube=self.config.fast_mode,
+                    ),
+                )
         return self._first_asset(results)
 
     def preview_playlist(self, url: str) -> PlaylistPreview:
@@ -131,14 +150,48 @@ class MusicResolver:
         with self._download_lock:
             results = self._get_service().download_tracks(
                 [selected],
-                options=self._runtime_options(),
+                options=self._runtime_options(
+                    track=selected,
+                    exact_youtube=self._is_exact_youtube_track(selected),
+                ),
             )
         return self._first_asset(results)
 
-    def _runtime_options(self) -> RuntimeOptions:
+    def _runtime_options(
+        self,
+        *,
+        track: TrackMetadata | None = None,
+        exact_youtube: bool = False,
+    ) -> RuntimeOptions:
+        output_format = self.config.download_format
+        if exact_youtube and track is not None and self._should_preserve_source(track):
+            output_format = "source"
         return RuntimeOptions(
             output_dir=str(self.config.library_dir),
-            output_format=self.config.download_format,
+            output_format=output_format,
+            source_preference="youtube" if exact_youtube else None,
+            source_exclusive=exact_youtube,
+        )
+
+    def _should_preserve_source(self, track: TrackMetadata) -> bool:
+        duration = track.duration_seconds
+        if duration is None or duration <= 0:
+            return False
+        bitrate = {
+            "mp3": 320_000,
+            "aac": 320_000,
+            "m4a": 256_000,
+        }.get(self.config.download_format)
+        if bitrate is None:
+            return False
+        predicted_bytes = duration * bitrate / 8
+        return predicted_bytes >= self.config.max_upload_bytes * 0.85
+
+    @staticmethod
+    def _is_exact_youtube_track(track: TrackMetadata) -> bool:
+        return (
+            (track.source_service or "").lower() == "youtube"
+            and YouTubeAdapter._is_direct_video_url((track.source_url or "").strip())
         )
 
     def _get_service(self) -> AntraService:
@@ -161,6 +214,22 @@ class MusicResolver:
                 album=result.track.album or asset.album,
                 duration_seconds=result.track.duration_seconds or asset.duration_seconds,
                 source=result.source_used or "antra",
+            )
+        if results:
+            failures = [
+                result.error_message
+                for result in results
+                if result.error_message
+            ]
+            if failures:
+                logger_message = "; ".join(failures[:3])
+                # Avoid leaking provider internals to Telegram while leaving a
+                # useful exception chain for the application log.
+                raise MusicRequestError(
+                    "Источник найден, но аудио не удалось подготовить."
+                ) from RuntimeError(logger_message)
+            raise MusicRequestError(
+                "Источник найден, но аудио не удалось подготовить."
             )
         return None
 

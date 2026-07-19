@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import tempfile
+from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatAction, ChatType
@@ -24,6 +26,7 @@ from .playlist_sessions import (
     PlaylistTooLarge,
 )
 from .playlist_ui import parse_playlist_callback, render_playlist_page
+from .splitter import AudioSplitError, split_audio_copy
 
 
 logger = logging.getLogger(__name__)
@@ -236,7 +239,12 @@ class TelegramMusicBot:
             await self._show_playlist(update, query)
             return
 
-        status = await message.reply_text(f"Ищу: {query}")
+        status_text = (
+            "Обрабатываю прямую ссылку YouTube Music…"
+            if input_kind == "track"
+            else f"Ищу: {query}"
+        )
+        status = await message.reply_text(status_text)
         await message.chat.send_action(ChatAction.TYPING)
         try:
             asset = await self.coordinator.resolve(query)
@@ -471,7 +479,12 @@ class TelegramMusicBot:
             self.config.delivery_mode,
         )
         if decision.kind == DeliveryKind.VLC:
-            await self._send_vlc(message, asset)
+            if self.config.public_base_url:
+                await self._send_vlc(message, asset)
+            elif self.config.split_large_audio:
+                await self._send_split_audio(message, asset)
+            else:
+                await self._send_vlc(message, asset)
             return
 
         try:
@@ -498,6 +511,50 @@ class TelegramMusicBot:
         except TelegramError:
             logger.exception("Telegram upload failed; falling back to VLC")
             await self._send_vlc(message, asset)
+
+    async def _send_split_audio(self, message, asset: TrackAsset) -> None:
+        if not asset.duration_seconds:
+            await message.reply_text(
+                "Файл слишком большой, а его длительность не удалось определить для деления."
+            )
+            return
+        notice = await message.reply_text(
+            "Запись большая — делю её на части без перекодирования…"
+        )
+        try:
+            with tempfile.TemporaryDirectory(prefix="antra-telegram-split-") as temp_dir:
+                parts = await asyncio.to_thread(
+                    split_audio_copy,
+                    asset.path,
+                    Path(temp_dir),
+                    duration_seconds=asset.duration_seconds,
+                    max_part_bytes=self.config.max_upload_bytes,
+                )
+                await notice.edit_text(
+                    f"Отправляю запись частями: {len(parts)}."
+                )
+                for index, part in enumerate(parts, start=1):
+                    await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+                    caption = (
+                        f"{asset.display_name}\n"
+                        f"Часть {index}/{len(parts)}"
+                    )
+                    with part.open("rb") as audio_file:
+                        await message.reply_document(
+                            document=audio_file,
+                            filename=(
+                                f"{asset.path.stem} — часть {index:02d}"
+                                f"{part.suffix}"
+                            ),
+                            caption=caption,
+                            read_timeout=300,
+                            write_timeout=300,
+                        )
+        except (AudioSplitError, OSError, TelegramError):
+            logger.exception("Large audio split/upload failed")
+            await notice.edit_text(
+                "Не удалось разделить или отправить большой файл. Подробности записаны в лог."
+            )
 
     async def _send_vlc(self, message, asset: TrackAsset) -> None:
         try:

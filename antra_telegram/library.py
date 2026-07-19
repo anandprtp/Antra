@@ -9,7 +9,7 @@ from .models import TrackAsset
 
 
 SUPPORTED_AUDIO_EXTENSIONS = frozenset(
-    {".flac", ".m4a", ".mp3", ".wav", ".ogg", ".opus", ".aac", ".mp4"}
+    {".flac", ".m4a", ".mp3", ".wav", ".ogg", ".opus", ".aac", ".mp4", ".webm"}
 )
 
 

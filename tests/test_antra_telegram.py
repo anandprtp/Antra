@@ -10,8 +10,10 @@ from telegram.ext import CallbackQueryHandler
 
 from antra.core.config import Config
 from antra.core.models import DownloadResult, DownloadStatus, TrackMetadata
+from antra.core.resolver import SourceResolver
 from antra.core.service import AntraService
 from antra.core.youtube_music_fetcher import YouTubeMusicFetcher
+from antra.sources.amazon import AmazonAdapter
 from antra.sources.youtube import YouTubeAdapter
 from antra_telegram.access import AccessStore, AccessStoreError
 from antra_telegram.__main__ import build_application
@@ -30,6 +32,7 @@ from antra_telegram.playlist_sessions import PlaylistSessionStore, PlaylistTooLa
 from antra_telegram.playlist_ui import parse_playlist_callback, render_playlist_page
 from antra_telegram.playlists import render_m3u8
 from antra_telegram.security import LinkSigner
+from antra_telegram.splitter import estimate_segment_seconds
 
 
 SECRET = b"test-secret-that-is-long-enough-123456"
@@ -63,6 +66,17 @@ def test_library_search_supports_current_artist_album_layout(tmp_path: Path):
     assert result.artist == "Portishead"
     assert result.album == "Dummy"
     assert index.list_assets() == [result]
+
+
+def test_library_indexes_webm_audio(tmp_path: Path):
+    track = tmp_path / "DJ" / "Live Sets" / "01 - Two Hour Set.webm"
+    track.parent.mkdir(parents=True)
+    track.write_bytes(b"not-real-audio")
+
+    index = LibraryIndex(tmp_path)
+
+    assert index.refresh() == 1
+    assert index.find_best("DJ Two Hour Set") is not None
 
 
 def test_download_mode_requires_high_confidence_local_match(tmp_path: Path):
@@ -218,20 +232,27 @@ def test_youtube_music_track_url_uses_url_pipeline(tmp_path: Path):
         artists=["Artist"],
         album="Album",
         duration_ms=179_000,
+        source_service="youtube",
+        source_url="https://music.youtube.com/watch?v=91dGIROGAa4",
     )
 
     class FakeService:
         def __init__(self):
-            self.urls = []
+            self.fetches = []
+            self.download_options = []
 
         def search_track(self, query, options=None):
             raise AssertionError("a YouTube Music URL must not use free-text search")
 
-        def download_playlist(self, url, options=None):
-            self.urls.append(url)
+        def fetch_playlist_tracks(self, url, options=None):
+            self.fetches.append((url, options))
+            return [track]
+
+        def download_tracks(self, tracks, options=None):
+            self.download_options.append(options)
             return [
                 DownloadResult(
-                    track=track,
+                    track=tracks[0],
                     status=DownloadStatus.COMPLETED,
                     file_path=str(output),
                     source_used="youtube",
@@ -251,11 +272,111 @@ def test_youtube_music_track_url_uses_url_pipeline(tmp_path: Path):
 
     asset = resolver.resolve(url)
 
-    assert service.urls == [url]
+    assert [item[0] for item in service.fetches] == [url]
+    assert service.download_options[0].source_preference == "youtube"
+    assert service.download_options[0].source_exclusive is True
+    assert service.download_options[0].output_format == "mp3"
     assert asset is not None
     assert asset.title == "Song"
     assert asset.artist == "Artist"
     assert asset.duration_seconds == 179
+
+
+def test_long_youtube_music_track_preserves_source_to_avoid_huge_transcode(tmp_path: Path):
+    output = tmp_path / "909 Festival" / "Live" / "01 - Set.webm"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"not-real-audio")
+    track = TrackMetadata(
+        title="NINA KRAVIZ || 909 FESTIVAL 2025",
+        artists=["909 Festival"],
+        album="Live",
+        duration_ms=7_223_000,
+        source_service="youtube",
+        source_url="https://music.youtube.com/watch?v=itXEKDh_YB0",
+    )
+
+    class FakeService:
+        def __init__(self):
+            self.options = None
+
+        def fetch_playlist_tracks(self, url, options=None):
+            return [track]
+
+        def download_tracks(self, tracks, options=None):
+            self.options = options
+            return [
+                DownloadResult(
+                    track=tracks[0],
+                    status=DownloadStatus.COMPLETED,
+                    file_path=str(output),
+                    source_used="youtube",
+                )
+            ]
+
+    service = FakeService()
+    resolver = MusicResolver(
+        TelegramConfig(
+            bot_token="token",
+            allowed_user_ids=frozenset({1}),
+            library_dir=tmp_path,
+            resolve_mode="download",
+            download_format="mp3",
+            max_upload_bytes=49_000_000,
+        ),
+        LibraryIndex(tmp_path),
+        service_factory=lambda: service,
+    )
+
+    asset = resolver.resolve(
+        "https://music.youtube.com/watch?v=itXEKDh_YB0&si=test"
+    )
+
+    assert asset is not None
+    assert service.options.output_format == "source"
+    assert service.options.source_preference == "youtube"
+    assert service.options.source_exclusive is True
+
+
+def test_fast_title_search_downloads_from_youtube_only(tmp_path: Path):
+    output = tmp_path / "Artist" / "Album" / "01 - Song.mp3"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"not-real-audio")
+    track = TrackMetadata(title="Song", artists=["Artist"], album="Album", duration_ms=180_000)
+
+    class FakeService:
+        def __init__(self):
+            self.options = None
+
+        def search_track(self, query, options=None):
+            return track
+
+        def download_tracks(self, tracks, options=None):
+            self.options = options
+            return [
+                DownloadResult(
+                    track=tracks[0],
+                    status=DownloadStatus.COMPLETED,
+                    file_path=str(output),
+                    source_used="youtube",
+                )
+            ]
+
+    service = FakeService()
+    resolver = MusicResolver(
+        TelegramConfig(
+            bot_token="token",
+            allowed_user_ids=frozenset({1}),
+            library_dir=tmp_path,
+            resolve_mode="download",
+            fast_mode=True,
+        ),
+        LibraryIndex(tmp_path),
+        service_factory=lambda: service,
+    )
+
+    assert resolver.resolve("Artist Song") is not None
+    assert service.options.source_preference == "youtube"
+    assert service.options.source_exclusive is True
 
 
 def test_youtube_music_playlist_url_is_redirected_to_preview_without_download(tmp_path: Path):
@@ -586,6 +707,59 @@ def test_youtube_adapter_rejects_spoofed_direct_source_url():
     )
 
     assert YouTubeAdapter._is_direct_video_url(track.source_url) is False
+
+
+def test_lossy_resolver_prioritizes_exact_youtube_source():
+    class Adapter:
+        always_lossy = False
+        is_last_resort = False
+
+        def __init__(self, name, priority):
+            self.name = name
+            self.priority = priority
+
+        def is_available(self):
+            return True
+
+    tidal = Adapter("hifi", 1)
+    youtube = Adapter("youtube", 99)
+    youtube.always_lossy = True
+    youtube.is_last_resort = True
+    resolver = SourceResolver([tidal, youtube], preferred_output_format="mp3")
+    track = TrackMetadata(
+        title="Set",
+        artists=["DJ"],
+        album="Live",
+        source_service="youtube",
+        source_url="https://music.youtube.com/watch?v=itXEKDh_YB0",
+    )
+
+    ordered = resolver._build_track_resolve_order(track, set())
+
+    assert [adapter.name for adapter in ordered] == ["youtube", "hifi"]
+
+
+def test_amazon_marketplace_miss_is_not_retried():
+    adapter = AmazonAdapter([])
+
+    assert adapter.should_retry_download(
+        None,
+        RuntimeError(
+            "Track not available from the current Amazon marketplace/account"
+        ),
+    ) is False
+
+
+def test_large_audio_segment_estimate_keeps_upload_margin():
+    segment_seconds = estimate_segment_seconds(
+        size_bytes=123_000_000,
+        duration_seconds=7_223,
+        max_part_bytes=49_000_000,
+    )
+
+    estimated_part_bytes = 123_000_000 * segment_seconds / 7_223
+    assert 60 <= segment_seconds < 7_223
+    assert estimated_part_bytes <= 49_000_000 * 0.83
 
 
 def test_service_search_track_is_public_and_marks_single_request():

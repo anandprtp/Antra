@@ -192,6 +192,7 @@ class RuntimeOptions:
     fetch_lyrics: Optional[bool] = None
     enrich_album_data: Optional[bool] = None
     source_preference: Optional[str] = None
+    source_exclusive: bool = False
     output_format: Optional[str] = None
 
 
@@ -221,6 +222,7 @@ class AntraService:
             cfg.enrich_album_data = options.enrich_album_data
         if options.source_preference is not None:
             cfg.source_preference = serialize_source_preferences(options.source_preference)
+        cfg.runtime_source_exclusive = bool(options.source_exclusive)
         if options.output_format is not None:
             cfg.output_format = normalize_output_format(options.output_format)
         return cfg
@@ -272,8 +274,25 @@ class AntraService:
         """Build the active download chain for the app."""
         adapters: list = []
         enabled_sources = _parse_enabled_sources(getattr(cfg, "sources_enabled", ""))
+        exclusive_sources: set[str] = set()
+        if getattr(cfg, "runtime_source_exclusive", False):
+            source_groups = {
+                "hifi": {"hifi", "tidal", "tidal_mirror"},
+                "qobuz": {"qobuz", "qobuz_mirror"},
+                "deezer": {"deezer", "deezer_mirror"},
+                "apple": {"apple"},
+                "amazon": {"amazon"},
+                "soulseek": {"soulseek"},
+                "youtube": {"youtube"},
+                "jiosaavn": {"jiosaavn"},
+            }
+            for source in normalize_source_preferences(getattr(cfg, "source_preference", "")):
+                if source != "auto":
+                    exclusive_sources.update(source_groups.get(source, {source}))
 
         def source_group_enabled(name: str) -> bool:
+            if exclusive_sources:
+                return name in exclusive_sources
             if not enabled_sources or name in enabled_sources:
                 return True
             # Backward compatibility: existing installs may have a persisted
@@ -297,7 +316,11 @@ class AntraService:
         soulseek_api_key = getattr(cfg, "soulseek_api_key", "") or ""
         soulseek_username = (getattr(cfg, "soulseek_username", "") or "").strip()
         soulseek_password = (getattr(cfg, "soulseek_password", "") or "").strip()
-        if not soulseek_base_url and getattr(cfg, "soulseek_auto_bootstrap", True):
+        if (
+            source_group_enabled("soulseek")
+            and not soulseek_base_url
+            and getattr(cfg, "soulseek_auto_bootstrap", True)
+        ):
             if not soulseek_username or not soulseek_password:
                 logger.info(
                     "[Soulseek] Managed bootstrap skipped — add your Soulseek username and password in Settings to enable the Soulseek source."

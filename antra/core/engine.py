@@ -22,7 +22,7 @@ from antra.utils.matching import duration_close
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
 from antra.utils.tagger import FileTagger
-from antra.utils.transcoder import AudioTranscoder
+from antra.utils.transcoder import AudioConversionError, AudioTranscoder
 
 logger = logging.getLogger(__name__)
 
@@ -888,12 +888,12 @@ class DownloadEngine:
                         )
                         try:
                             candidate_path = self.transcoder.convert(candidate_path, self.cfg.output_format)
-                        except RuntimeError as conv_err:
+                        except AudioConversionError as conv_err:
                             # ffmpeg failed — discard the corrupt source so it does not
                             # linger on disk and re-raise so the engine falls through to
                             # the next adapter (Apple DRM-locked M4A being the primary case).
                             self._discard_file(candidate_path)
-                            raise RuntimeError(
+                            raise AudioConversionError(
                                 f"[{adapter.name}] Audio conversion failed — "
                                 f"source file may be corrupt or DRM-protected: {conv_err}"
                             ) from conv_err
@@ -969,7 +969,11 @@ class DownloadEngine:
                             rate_limited_adapters.add(adapter.name)
                         break
 
-                    will_retry = attempt < self.cfg.max_retries and adapter.should_retry_download(result, e)
+                    will_retry = (
+                        not isinstance(e, AudioConversionError)
+                        and attempt < self.cfg.max_retries
+                        and adapter.should_retry_download(result, e)
+                    )
                     if adapter.name == "hifi" and "all quality levels failed" in str(e).lower():
                         logger.info("  [INFO]  HiFi mirrors could not provide a valid stream. Trying next source...")
                     elif will_retry:

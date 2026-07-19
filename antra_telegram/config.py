@@ -20,6 +20,15 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false")
+
+
 def _allowed_user_ids(raw: str) -> frozenset[int]:
     values: set[int] = set()
     for item in raw.replace(";", ",").split(","):
@@ -44,6 +53,8 @@ class TelegramConfig:
     resolve_mode: str = "library"
     delivery_mode: str = "auto"
     download_format: str = "mp3"
+    fast_mode: bool = True
+    split_large_audio: bool = True
     max_upload_bytes: int = 49_000_000
     max_query_chars: int = 200
     max_playlist_url_chars: int = 2048
@@ -131,6 +142,8 @@ class TelegramConfig:
             resolve_mode=resolve_mode,
             delivery_mode=delivery_mode,
             download_format=os.getenv("ANTRA_TELEGRAM_DOWNLOAD_FORMAT", "mp3").strip().lower(),
+            fast_mode=_boolean("ANTRA_TELEGRAM_FAST_MODE", True),
+            split_large_audio=_boolean("ANTRA_TELEGRAM_SPLIT_LARGE_AUDIO", True),
             max_upload_bytes=_positive_int("ANTRA_TELEGRAM_MAX_UPLOAD_BYTES", 49_000_000),
             max_query_chars=_positive_int("ANTRA_TELEGRAM_MAX_QUERY_CHARS", 200),
             max_playlist_url_chars=_positive_int("ANTRA_TELEGRAM_MAX_PLAYLIST_URL_CHARS", 2048),
