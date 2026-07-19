@@ -52,6 +52,63 @@ def _optional_int(name: str) -> int | None:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+def _load_or_create_link_secret(
+    configured: str,
+    secret_path: Path,
+) -> bytes:
+    if configured:
+        if (
+            configured == "replace-with-at-least-32-random-characters"
+            or len(configured) < 32
+        ):
+            raise ConfigError(
+                "ANTRA_TELEGRAM_LINK_SECRET must contain at least 32 "
+                "non-placeholder characters"
+            )
+        return configured.encode("utf-8")
+
+    path = secret_path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    generated = secrets.token_urlsafe(48)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ConfigError(
+            f"could not create private link secret at {path}"
+        ) from exc
+    else:
+        try:
+            os.write(fd, f"{generated}\n".encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, read_flags)
+        try:
+            secret = os.read(fd, 4096).decode("utf-8").strip()
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(
+            f"could not read private link secret at {path}"
+        ) from exc
+    if len(secret) < 32:
+        raise ConfigError(
+            f"private link secret at {path} is invalid or truncated"
+        )
+    return secret.encode("utf-8")
+
+
 @dataclass(frozen=True)
 class TelegramConfig:
     bot_token: str
@@ -113,8 +170,20 @@ class TelegramConfig:
                 "ANTRA_TELEGRAM_DELIVERY_MODE must be auto, audio, vlc, or player"
             )
 
+        access_db_path = Path(
+            os.getenv(
+                "ANTRA_TELEGRAM_ACCESS_DB",
+                ".antra_telegram_access.sqlite3",
+            )
+        ).expanduser().resolve()
         public_base_url = os.getenv("ANTRA_TELEGRAM_PUBLIC_BASE_URL", "").strip().rstrip("/")
         secret_text = os.getenv("ANTRA_TELEGRAM_LINK_SECRET", "").strip()
+        secret_path = Path(
+            os.getenv(
+                "ANTRA_TELEGRAM_LINK_SECRET_FILE",
+                str(access_db_path.with_name("link_secret")),
+            )
+        )
         if public_base_url:
             parsed_url = urlparse(public_base_url)
             if (
@@ -128,10 +197,6 @@ class TelegramConfig:
             ):
                 raise ConfigError(
                     "ANTRA_TELEGRAM_PUBLIC_BASE_URL must be an HTTPS origin without credentials, query, or fragment"
-                )
-            if secret_text == "replace-with-at-least-32-random-characters" or len(secret_text) < 32:
-                raise ConfigError(
-                    "ANTRA_TELEGRAM_LINK_SECRET must be a unique secret of at least 32 characters when VLC links are enabled"
                 )
         player_url = os.getenv("ANTRA_TELEGRAM_PLAYER_URL", "").strip().rstrip("/")
         if player_url:
@@ -181,12 +246,6 @@ class TelegramConfig:
                 os.getenv("OUTPUT_DIR", "./Music"),
             )
         ).expanduser().resolve()
-        access_db_path = Path(
-            os.getenv(
-                "ANTRA_TELEGRAM_ACCESS_DB",
-                ".antra_telegram_access.sqlite3",
-            )
-        ).expanduser().resolve()
         playlist_page_size = _positive_int("ANTRA_TELEGRAM_PLAYLIST_PAGE_SIZE", 10)
         if playlist_page_size > 20:
             raise ConfigError("ANTRA_TELEGRAM_PLAYLIST_PAGE_SIZE must not exceed 20")
@@ -202,6 +261,10 @@ class TelegramConfig:
             raise ConfigError(
                 "ANTRA_TELEGRAM_STORAGE_PART_BYTES must not exceed 19000000 in cloud mode"
             )
+        link_secret = _load_or_create_link_secret(
+            secret_text,
+            secret_path,
+        )
 
         return cls(
             bot_token=token,
@@ -254,7 +317,7 @@ class TelegramConfig:
                 )
             ).expanduser().resolve(),
             storage_part_bytes=storage_part_bytes,
-            link_secret=(secret_text or secrets.token_urlsafe(32)).encode("utf-8"),
+            link_secret=link_secret,
             link_ttl_seconds=_positive_int("ANTRA_TELEGRAM_LINK_TTL_SECONDS", 86_400),
             bind_host=os.getenv("ANTRA_TELEGRAM_BIND_HOST", "127.0.0.1").strip(),
             bind_port=_positive_int("ANTRA_TELEGRAM_BIND_PORT", 8090),

@@ -1408,6 +1408,30 @@ def test_config_allows_explicit_first_user_claim_without_allowlist(monkeypatch, 
     assert config.access_db_path == (tmp_path / "access.sqlite3").resolve()
 
 
+def test_config_persists_generated_link_secret_when_env_secret_is_empty(
+    monkeypatch,
+    tmp_path: Path,
+):
+    access_path = tmp_path / "data" / "access.sqlite3"
+    monkeypatch.setenv("ANTRA_TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ANTRA_TELEGRAM_ALLOWED_USER_IDS", "1")
+    monkeypatch.setenv("ANTRA_TELEGRAM_ACCESS_DB", str(access_path))
+    monkeypatch.setenv("ANTRA_TELEGRAM_LIBRARY_DIR", str(tmp_path / "Music"))
+    monkeypatch.setenv(
+        "ANTRA_TELEGRAM_PUBLIC_BASE_URL",
+        "https://music.example",
+    )
+    monkeypatch.setenv("ANTRA_TELEGRAM_LINK_SECRET", "")
+
+    first = TelegramConfig.from_env()
+    second = TelegramConfig.from_env()
+    secret_path = access_path.with_name("link_secret")
+
+    assert first.link_secret == second.link_secret
+    assert len(first.link_secret) >= 32
+    assert secret_path.stat().st_mode & 0o777 == 0o600
+
+
 def test_access_store_claim_is_persistent_and_exclusive(tmp_path: Path):
     path = tmp_path / "access.sqlite3"
     store = AccessStore(path, allow_first_claim=True)

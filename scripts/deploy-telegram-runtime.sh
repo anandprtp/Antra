@@ -27,7 +27,9 @@ for file in LICENSE MODIFICATIONS.md; do
   fi
 done
 
-install -m 600 "$repo_root/.env.telegram" "$app_root/.env.telegram"
+if [[ ! -f "$app_root/.env.telegram" ]]; then
+  install -m 600 "$repo_root/.env.telegram" "$app_root/.env.telegram"
+fi
 
 "$venv_root/bin/python" -m compileall -q "$app_root/antra" "$app_root/antra_shared" "$app_root/antra_telegram"
 printf 'Telegram runtime deployed to %s\n' "$runtime_root"
