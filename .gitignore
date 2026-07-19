@@ -55,6 +55,7 @@ ehthumbs.db
 # IDE / tooling
 .vscode/
 .idea/
+.playwright-cli/
 *.swp
 *.swo
 .claude/
