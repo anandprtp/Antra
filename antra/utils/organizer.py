@@ -6,6 +6,10 @@ import logging
 import os
 import re
 import shutil
+import tempfile
+import threading
+import unicodedata
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +90,9 @@ class LibraryOrganizer:
         self.albums_root = self.root
         self.playlists_root = self.root
         self._state_path = self.root / STATE_FILE
+        self._state_lock = threading.RLock()
+        self._track_locks_guard = threading.Lock()
+        self._track_locks: dict[str, threading.Lock] = {}
         self._state = self._load_state()
         self._identity_index: dict[str, str] = {}
         if not full_albums:
@@ -240,10 +247,11 @@ class LibraryOrganizer:
         album and a Best Of compilation) without one blocking the other.
         """
         if self.filename_preferences.get("filename_conflict_behavior") == "skip" and not self.full_albums:
-            for key in self._track_identity_keys(track):
-                existing = self._identity_index.get(key)
-                if existing and os.path.exists(existing):
-                    return existing
+            with self._state_lock:
+                for key in self._track_identity_keys(track):
+                    existing = self._identity_index.get(key)
+                    if existing and os.path.exists(existing):
+                        return existing
 
         # Check the expected canonical path for this exact request.
         base = self.get_output_path(track)
@@ -263,9 +271,20 @@ class LibraryOrganizer:
         self._mark_done(track, file_path)
 
     def mark_failed(self, track: TrackMetadata, reason: str):
-        for key in self._track_identity_keys(track):
-            self._state[f"{FAILED_PREFIX}{key}"] = reason
-        self._save_state()
+        with self._state_lock:
+            for key in self._track_identity_keys(track):
+                self._state[f"{FAILED_PREFIX}{key}"] = reason
+            self._save_state_locked()
+
+    @contextmanager
+    def track_lock(self, track: TrackMetadata):
+        """Serialize check/download/commit for the same musical identity."""
+        keys = self._track_identity_keys(track)
+        lock_key = keys[0] if keys else f"path:{self.get_output_path(track)}"
+        with self._track_locks_guard:
+            lock = self._track_locks.setdefault(lock_key, threading.Lock())
+        with lock:
+            yield
 
     def ensure_playlist_copy(self, track: TrackMetadata, canonical_path: str) -> str:
         if not track.playlist_name or not canonical_path or not os.path.exists(canonical_path):
@@ -328,10 +347,11 @@ class LibraryOrganizer:
 
     def _mark_done(self, track: TrackMetadata, path: str):
         resolved = str(Path(path).resolve())
-        for key in self._track_identity_keys(track):
-            self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
-            self._identity_index[key] = resolved
-        self._save_state()
+        with self._state_lock:
+            for key in self._track_identity_keys(track):
+                self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
+                self._identity_index[key] = resolved
+            self._save_state_locked()
 
     def _track_identity_keys(self, track: TrackMetadata) -> list[str]:
         keys: list[str] = []
@@ -412,10 +432,29 @@ class LibraryOrganizer:
         return {}
 
     def _save_state(self):
+        with self._state_lock:
+            self._save_state_locked()
+
+    def _save_state_locked(self):
+        temporary_path: str | None = None
         try:
-            self._state_path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.root,
+                prefix=".antra-state-",
+                delete=False,
+            ) as handle:
+                temporary_path = handle.name
+                json.dump(self._state, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, self._state_path)
         except Exception as e:
             logger.warning(f"Could not save state: {e}")
+        finally:
+            if temporary_path:
+                Path(temporary_path).unlink(missing_ok=True)
 
     # ── File scan helpers ─────────────────────────────────────────────────
 
@@ -558,10 +597,13 @@ class LibraryOrganizer:
     def _normalize_identity_part(value: Optional[str]) -> str:
         if not value:
             return ""
-        value = value.lower()
-        value = re.sub(r"\s+", " ", value)
-        value = re.sub(r"[^a-z0-9 ]+", "", value)
-        return value.strip()
+        normalized = unicodedata.normalize("NFKC", value).casefold()
+        return " ".join(
+            "".join(
+                character if character.isalnum() else " "
+                for character in normalized
+            ).split()
+        )
 
     @staticmethod
     def _artists_canonical_key(artists: list[str]) -> str:
@@ -579,7 +621,7 @@ class LibraryOrganizer:
         for artist in artists:
             # Split on common multi-artist separators found in tags
             for part in re.split(r"[,&/]+|\s+(?:feat\.?|ft\.?)\s+", artist, flags=re.IGNORECASE):
-                norm = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", "", part.lower())).strip()
+                norm = LibraryOrganizer._normalize_identity_part(part)
                 if norm:
                     parts.add(norm)
         return " ".join(sorted(parts))

@@ -1053,7 +1053,12 @@ class AmazonAdapter(BaseSourceAdapter):
         err = str(error)
         # Marketplace/content misses are deterministic — retrying the same ASIN
         # on the same mirror won't help.
-        if "404" in err or "ContentNotAvailable" in err or "not available in any marketplace" in err:
+        if (
+            "404" in err
+            or "ContentNotAvailable" in err
+            or "not available in any marketplace" in err
+            or "not available from the current amazon marketplace/account" in err.lower()
+        ):
             return False
         # 403 = auth failure (bad creds, region block, session expired) — retrying
         # the same mirror with the same credentials will always fail.

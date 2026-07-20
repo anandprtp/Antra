@@ -19,6 +19,7 @@ from typing import Optional
 import requests
 
 from antra.core.models import TrackMetadata
+from antra.utils.url_safety import is_http_host_or_subdomain
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ _HEADERS = {
 
 def is_soundcloud_url(url: str) -> bool:
     """Return True if the URL looks like a SoundCloud URL."""
-    return "soundcloud.com" in url
+    return is_http_host_or_subdomain(url, "soundcloud.com")
 
 
 class SoundCloudFetcher:

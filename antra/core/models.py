@@ -66,6 +66,7 @@ class TrackMetadata:
     availability_note: Optional[str] = None  # Human-readable market restriction note
     lyrics: Optional[str] = None
     synced_lyrics: Optional[str] = None  # LRC format
+    source_url: Optional[str] = None  # Exact provider URL when deterministic fallback is available
 
     @property
     def primary_artist(self) -> str:

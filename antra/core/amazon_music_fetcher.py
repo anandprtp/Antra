@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 import requests
 
 from antra.core.models import TrackMetadata
+from antra.utils.url_safety import is_amazon_music_host
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ _BASE_HEADERS = {
 
 def is_amazon_music_url(url: str) -> bool:
     """Return True if the URL looks like an Amazon Music URL."""
-    return "music.amazon." in url
+    return is_amazon_music_host(url)
 
 
 class AmazonMusicFetcher:

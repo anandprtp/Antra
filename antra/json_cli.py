@@ -34,6 +34,8 @@ from antra.core.events import EngineEvent
 from antra.utils.runtime import ensure_runtime_environment
 from antra.core.models import TrackMetadata
 
+logger = logging.getLogger(__name__)
+
 
 # ── Mutagen probe fallback ────────────────────────────────────────────────────
 # Used when ffprobe is not available (no system ffprobe and imageio_ffmpeg

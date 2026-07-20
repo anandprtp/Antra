@@ -1,0 +1,4 @@
+-r requirements-telegram.txt
+
+pytest>=8.4,<10
+ruff>=0.15,<0.16

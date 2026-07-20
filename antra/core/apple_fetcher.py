@@ -23,6 +23,7 @@ from typing import Optional
 import requests
 
 from antra.core.models import TrackMetadata
+from antra.utils.url_safety import is_exact_http_host
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ MAX_PLAYLIST_PAGES = 200  # safety cap at 5000 tracks (25 per page)
 
 def is_apple_music_url(url: str) -> bool:
     """Return True if the URL looks like an Apple Music URL."""
-    return "music.apple.com" in url
+    return is_exact_http_host(url, "music.apple.com")
 
 
 class AppleFetcher:

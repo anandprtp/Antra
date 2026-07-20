@@ -18,6 +18,7 @@ import re
 from typing import Optional
 
 from antra.core.models import TrackMetadata
+from antra.utils.url_safety import is_exact_http_host
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ _TOPIC_RE = re.compile(r"\s*-\s*Topic$", re.IGNORECASE)
 
 def is_youtube_music_url(url: str) -> bool:
     """Return True for any music.youtube.com URL."""
-    return "music.youtube.com" in (url or "")
+    return is_exact_http_host(url, "music.youtube.com")
 
 
 class YouTubeMusicFetcher:
@@ -91,6 +92,10 @@ class YouTubeMusicFetcher:
         if not track:
             raise RuntimeError("[YouTube Music] Could not parse track metadata from this URL.")
 
+        # Preserve the exact user-selected video. The YouTube audio adapter can
+        # then use it as a deterministic fallback instead of searching by text
+        # and potentially missing regional or non-Latin releases.
+        track.source_url = url
         track.request_kind = "track"
         logger.info("[YouTube Music] Fetched single track: %s – %s (ISRC: %s)",
                     track.artist_string, track.title, track.isrc or "none")
@@ -258,7 +263,9 @@ class YouTubeMusicFetcher:
             artists=artists,
             album=album or "Unknown Album",
             source_service="youtube",
+            source_url=f"https://music.youtube.com/watch?v={video_id}",
             playlist_name=playlist_name,
+            playlist_position=index if playlist_name else None,
             playlist_artwork_url=playlist_artwork,
             release_year=release_year,
             release_date=release_date,

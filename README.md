@@ -44,6 +44,12 @@ Antra is a desktop music library manager. It helps you bring tracks into a tidy 
 
 Built-in themes let you set the look and feel from Settings.
 
+> [!IMPORTANT]
+> This fork contains modifications described in [MODIFICATIONS.md](MODIFICATIONS.md),
+> including a private, allowlisted Telegram/VLC interface. The Elastic License 2.0
+> does not permit offering substantial Antra functionality to third parties as a
+> hosted or managed service.
+
 No Python. No setup. One binary.
 
 ```
@@ -78,6 +84,43 @@ Download the build for your platform from [Releases](https://github.com/anandprt
 4. Press **Add to Library**
 
 Everything is fetched, tagged, and filed into the right folder automatically.
+
+## Private Telegram + VLC interface (fork)
+
+The bot is secure-by-default: configure either an explicit Telegram user-ID
+allowlist or the one-time `ANTRA_TELEGRAM_CLAIM_FIRST_USER=true` mode. In claim
+mode the first human who writes in a private chat becomes the administrator,
+stored in a local SQLite file. The administrator can run `/invite`
+to create a single-use deep link for another member (for example a spouse), and
+`/members` to inspect access. The bot searches the operator's local library unless
+personal download mode is deliberately enabled.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-telegram.txt
+cp .env.telegram.example .env.telegram
+# Fill in the bot token, allowed user IDs, library path, and optional HTTPS URL.
+# Generate the VLC signing secret with: openssl rand -hex 32
+python -m antra_telegram
+```
+
+Send a message such as `Massive Attack Teardrop`. MP3/M4A files that fit the
+configured upload ceiling are returned in Telegram's audio player; other small
+formats are sent as documents. Large files receive an expiring M3U8 link that
+VLC can open and seek through. The public base URL must terminate HTTPS and
+forward to the configured bind host/port.
+
+Public YouTube Music playlist links open as a paginated track list. Every row
+has its own download button and the footer has **Download all**. Playlist button
+sessions are owner/chat/message-bound, stored in a local SQLite database, expire
+after the configured TTL, and survive bot restarts. Defaults are 10 tracks per
+page, 100 tracks per playlist, and 24-hour button lifetime; see the
+`ANTRA_TELEGRAM_PLAYLIST_*` settings in `.env.telegram.example`.
+
+`ANTRA_TELEGRAM_RESOLVE_MODE=download` enables Antra's existing provider chain
+only for private, authorised personal use. Public multi-user hosting requires
+separate permission from the licensor and appropriate content rights.
 
 ---
 

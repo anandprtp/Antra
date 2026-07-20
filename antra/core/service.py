@@ -12,6 +12,8 @@ from antra.core.config import Config, load_config
 from antra.core.control import DownloadController
 from antra.core.engine import DownloadEngine, EngineConfig
 from antra.core.events import EngineEvent
+from antra.core.apple_library import is_apple_library_url
+from antra.core.apple_fetcher import is_apple_music_url
 from antra.core.spotify import SpotifyAvailabilityError, SpotifyResourceError
 from antra.core.models import (
     BulkDownloadProgress,
@@ -192,6 +194,7 @@ class RuntimeOptions:
     fetch_lyrics: Optional[bool] = None
     enrich_album_data: Optional[bool] = None
     source_preference: Optional[str] = None
+    source_exclusive: bool = False
     output_format: Optional[str] = None
 
 
@@ -221,6 +224,7 @@ class AntraService:
             cfg.enrich_album_data = options.enrich_album_data
         if options.source_preference is not None:
             cfg.source_preference = serialize_source_preferences(options.source_preference)
+        cfg.runtime_source_exclusive = bool(options.source_exclusive)
         if options.output_format is not None:
             cfg.output_format = normalize_output_format(options.output_format)
         return cfg
@@ -272,8 +276,25 @@ class AntraService:
         """Build the active download chain for the app."""
         adapters: list = []
         enabled_sources = _parse_enabled_sources(getattr(cfg, "sources_enabled", ""))
+        exclusive_sources: set[str] = set()
+        if getattr(cfg, "runtime_source_exclusive", False):
+            source_groups = {
+                "hifi": {"hifi", "tidal", "tidal_mirror"},
+                "qobuz": {"qobuz", "qobuz_mirror"},
+                "deezer": {"deezer", "deezer_mirror"},
+                "apple": {"apple"},
+                "amazon": {"amazon"},
+                "soulseek": {"soulseek"},
+                "youtube": {"youtube"},
+                "jiosaavn": {"jiosaavn"},
+            }
+            for source in normalize_source_preferences(getattr(cfg, "source_preference", "")):
+                if source != "auto":
+                    exclusive_sources.update(source_groups.get(source, {source}))
 
         def source_group_enabled(name: str) -> bool:
+            if exclusive_sources:
+                return name in exclusive_sources
             if not enabled_sources or name in enabled_sources:
                 return True
             # Backward compatibility: existing installs may have a persisted
@@ -285,19 +306,35 @@ class AntraService:
             return False
 
         manifest = None
-        try:
-            from antra.core.endpoint_manifest import load_endpoint_manifest
+        manifest_sources = {
+            "hifi",
+            "tidal",
+            "tidal_mirror",
+            "qobuz",
+            "qobuz_mirror",
+            "deezer",
+            "deezer_mirror",
+            "apple",
+            "amazon",
+        }
+        if not exclusive_sources or exclusive_sources & manifest_sources:
+            try:
+                from antra.core.endpoint_manifest import load_endpoint_manifest
 
-            manifest = load_endpoint_manifest()
-        except Exception as e:
-            logger.debug(f"[Sources] Endpoint manifest unavailable: {e}")
+                manifest = load_endpoint_manifest()
+            except Exception as e:
+                logger.debug(f"[Sources] Endpoint manifest unavailable: {e}")
 
         # Soulseek via slskd
         soulseek_base_url = (getattr(cfg, "soulseek_base_url", "") or "").strip()
         soulseek_api_key = getattr(cfg, "soulseek_api_key", "") or ""
         soulseek_username = (getattr(cfg, "soulseek_username", "") or "").strip()
         soulseek_password = (getattr(cfg, "soulseek_password", "") or "").strip()
-        if not soulseek_base_url and getattr(cfg, "soulseek_auto_bootstrap", True):
+        if (
+            source_group_enabled("soulseek")
+            and not soulseek_base_url
+            and getattr(cfg, "soulseek_auto_bootstrap", True)
+        ):
             if not soulseek_username or not soulseek_password:
                 logger.info(
                     "[Soulseek] Managed bootstrap skipped — add your Soulseek username and password in Settings to enable the Soulseek source."
@@ -507,7 +544,7 @@ class AntraService:
         env_apple_mirror = (getattr(cfg, "apple_mirror_url", "") or "").strip().rstrip("/")
         if env_apple_mirror:
             mirror_apple_url = env_apple_mirror
-        if not mirror_apple_url:
+        if source_group_enabled("apple") and not mirror_apple_url:
             mirror_apple_url = _fetch_gist_apple_mirror(cfg)
         if mirror_apple_url and mirror_apple_url not in apple_mirrors:
             apple_mirrors = [mirror_apple_url] + apple_mirrors
@@ -667,6 +704,9 @@ class AntraService:
            filename numbering — sequential renumbering fixes this.
         """
         from collections import defaultdict, Counter
+        preserve_playlist_order = any(
+            (track.request_kind or "").lower() == "playlist" for track in tracks
+        )
         album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
         for track in tracks:
             key = AntraService._album_group_key(track)
@@ -770,6 +810,8 @@ class AntraService:
             else:
                 reordered_tracks.extend(group)
 
+        if preserve_playlist_order:
+            return tracks
         return reordered_tracks if len(reordered_tracks) == len(tracks) else tracks
 
     @staticmethod
@@ -870,8 +912,9 @@ class AntraService:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
 
-        from antra.core.apple_library import is_apple_library_url
+        from antra.core.amazon_music_fetcher import is_amazon_music_url
         from antra.core.external_music_fetcher import is_deezer_url, is_qobuz_url, is_tidal_url
+        from antra.core.soundcloud_fetcher import is_soundcloud_url
         from antra.core.youtube_music_fetcher import is_youtube_music_url
 
         # Handle Apple Music library pseudo-URLs
@@ -880,18 +923,18 @@ class AntraService:
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
 
         # Handle Apple Music URLs
-        elif "music.apple.com" in playlist:
+        elif is_apple_music_url(playlist):
             tracks = self._fetch_apple_tracks(playlist, cfg, page_callback=page_callback)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="apple", rule="prefer_hires")
 
         # Handle SoundCloud URLs
-        elif "soundcloud.com" in playlist:
+        elif is_soundcloud_url(playlist):
             tracks = self._fetch_soundcloud_tracks(playlist, cfg)
             self._apply_request_kind(tracks, playlist)
 
         # Handle Amazon Music URLs
-        elif "music.amazon." in playlist:
+        elif is_amazon_music_url(playlist):
             tracks = self._fetch_amazon_music_tracks(playlist, cfg)
             self._apply_request_kind(tracks, playlist)
             self._apply_source_intent(tracks, service="amazon", rule="exclusive")
@@ -932,7 +975,11 @@ class AntraService:
             # (Tidal mirror, Qobuz mirror, Amazon, Deezer, etc.) based on quality mode.
 
         # Handle Spotify Liked Songs (collection/tracks) — requires sp_dc
-        elif "open.spotify.com/collection/tracks" in playlist:
+        elif (
+            urlparse(playlist).scheme in {"http", "https"}
+            and urlparse(playlist).hostname == "open.spotify.com"
+            and urlparse(playlist).path.rstrip("/") == "/collection/tracks"
+        ):
             sp_dc = getattr(cfg, "spotify_sp_dc", "") or ""
             if not sp_dc:
                 raise ValueError(
@@ -1240,7 +1287,7 @@ class AntraService:
                 original_tracks = list(tracks)
                 tracks = spotify.batch_enrich_album_data(tracks)
                 tracks = self._preserve_track_identity(original_tracks, tracks)
-            elif "music.apple.com" in playlist or is_apple_library_url(playlist):
+            elif is_apple_music_url(playlist) or is_apple_library_url(playlist):
                 tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
             elif not (
                 "soundcloud.com" in playlist
@@ -1518,6 +1565,27 @@ class AntraService:
         except Exception as e:
             logger.debug(f"[Service] Apple fallback artist search failed: {e}")
         return []
+
+    def search_track(
+        self,
+        query: str,
+        options: Optional[RuntimeOptions] = None,
+    ) -> Optional[TrackMetadata]:
+        """Resolve a free-text song query into normalized track metadata.
+
+        This is the public application-service seam for non-desktop clients such
+        as the private Telegram integration. SpotifyClient already owns the
+        authenticated, anonymous, and iTunes fallback search behaviour.
+        """
+        cleaned_query = " ".join((query or "").split())
+        if not cleaned_query:
+            return None
+
+        cfg = self.build_runtime_config(options)
+        track = self._make_spotify_client(cfg).search_track(cleaned_query)
+        if track is not None:
+            track.request_kind = "track"
+        return track
 
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
         client = self._spotify_client_factory(

@@ -37,6 +37,10 @@ class ConversionPlan:
     codec_args: list[str]
 
 
+class AudioConversionError(RuntimeError):
+    """A deterministic conversion failure that must not re-download the source."""
+
+
 class AudioTranscoder:
     _LOSSY_EXTENSIONS = {".mp3", ".aac"}
 
@@ -94,7 +98,7 @@ class AudioTranscoder:
         from antra.utils.runtime import get_ffmpeg_exe, get_clean_subprocess_env
         ffmpeg = get_ffmpeg_exe()
         if not ffmpeg:
-            raise RuntimeError("ffmpeg is required for output format conversion")
+            raise AudioConversionError("ffmpeg is required for output format conversion")
 
         plan = self._plan(target_format, file_path=file_path)
         base, _ = os.path.splitext(file_path)
@@ -114,11 +118,23 @@ class AudioTranscoder:
             temp_output,
         ]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=240,
-                                    env=get_clean_subprocess_env(), **_SUBPROCESS_FLAGS)
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=self._conversion_timeout(file_path),
+                    env=get_clean_subprocess_env(),
+                    **_SUBPROCESS_FLAGS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AudioConversionError(
+                    f"ffmpeg conversion to {target_format} timed out"
+                ) from exc
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"ffmpeg conversion to {target_format} failed: {result.stderr.strip() or result.stdout.strip()}"
+                raise AudioConversionError(
+                    f"ffmpeg conversion to {target_format} failed: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
                 )
 
             if os.path.exists(final_output) and os.path.normcase(final_output) != os.path.normcase(file_path):
@@ -136,6 +152,18 @@ class AudioTranscoder:
                     pass
             raise
         return final_output
+
+    @staticmethod
+    def _conversion_timeout(file_path: str) -> int:
+        """Scale the timeout for long recordings while keeping a hard ceiling."""
+        try:
+            audio = MutagenFile(file_path)
+            duration = float(getattr(getattr(audio, "info", None), "length", 0) or 0)
+        except Exception:
+            duration = 0
+        if duration <= 0:
+            return 240
+        return max(240, min(1_800, int(duration * 0.25) + 120))
 
     @staticmethod
     def _plan(target_format: str, file_path: str = "") -> ConversionPlan:

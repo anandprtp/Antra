@@ -48,6 +48,9 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -65,11 +68,14 @@ try:
 
     _DATA_DIR = Path(user_data_dir("Antra", "Antra"))
 except Exception:
-    _DATA_DIR = Path(__file__).resolve().parents[2]
+    _DATA_DIR = Path.home() / ".local" / "share" / "Antra"
 
 _CACHE_PATH = _DATA_DIR / "endpoint_manifest_cache.json"
 _REQUEST_TIMEOUT = 5
+_PROCESS_CACHE_TTL = 300
 _GIST_ID_RE = re.compile(r"([0-9a-f]{32})", re.IGNORECASE)
+_PROCESS_CACHE: dict[str, tuple[float, "EndpointManifest"]] = {}
+_PROCESS_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -107,14 +113,26 @@ def load_endpoint_manifest(manifest_url: str | None = None) -> EndpointManifest:
         logger.info("[Endpoints] No manifest URL configured; endpoint manifest loader is idle")
         return EndpointManifest(hifi=[], amazon=[], apple=[])
 
+    with _PROCESS_CACHE_LOCK:
+        cached_process = _PROCESS_CACHE.get(manifest_url)
+        if (
+            cached_process is not None
+            and time.monotonic() - cached_process[0] < _PROCESS_CACHE_TTL
+        ):
+            return cached_process[1]
+
     remote_data = _fetch_remote_manifest(manifest_url)
     if remote_data is not None:
         manifest = _parse_manifest(remote_data)
         _write_cache(manifest)
+        with _PROCESS_CACHE_LOCK:
+            _PROCESS_CACHE[manifest_url] = (time.monotonic(), manifest)
         return manifest
 
     cached = _read_cache()
     if cached is not None:
+        with _PROCESS_CACHE_LOCK:
+            _PROCESS_CACHE[manifest_url] = (time.monotonic(), cached)
         return cached
 
     logger.warning("[Endpoints] No remote manifest and no cache available")
@@ -252,35 +270,54 @@ def _normalize_url_list(value: Any) -> list[str]:
 
 
 def _write_cache(manifest: EndpointManifest) -> None:
+    temporary_path: str | None = None
     try:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        _CACHE_PATH.write_text(
-            json.dumps(
-                {
-                    "hifi": manifest.hifi,
-                    "amazon": manifest.amazon,
-                    "apple": manifest.apple,
-                    "mirrors": {
-                        "tidal":  manifest.mirror_tidal,
-                        "qobuz":  manifest.mirror_qobuz,
-                        "deezer": manifest.mirror_deezer,
-                        "amazon": manifest.mirror_amazon,
-                        "apple":  manifest.mirror_apple,
-                    },
-                    "api_key": manifest.api_key,
+        payload = json.dumps(
+            {
+                "hifi": manifest.hifi,
+                "amazon": manifest.amazon,
+                "apple": manifest.apple,
+                "mirrors": {
+                    "tidal": manifest.mirror_tidal,
+                    "qobuz": manifest.mirror_qobuz,
+                    "deezer": manifest.mirror_deezer,
+                    "amazon": manifest.mirror_amazon,
+                    "apple": manifest.mirror_apple,
                 },
-                indent=2,
-            ),
-            encoding="utf-8",
+                "api_key": manifest.api_key,
+            },
+            indent=2,
         )
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=_DATA_DIR,
+            prefix=".endpoint-manifest-",
+            delete=False,
+        ) as handle:
+            temporary_path = handle.name
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, _CACHE_PATH)
+        os.chmod(_CACHE_PATH, 0o600)
     except Exception as exc:
         logger.debug(f"[Endpoints] Failed to write manifest cache: {exc}")
+    finally:
+        if temporary_path:
+            Path(temporary_path).unlink(missing_ok=True)
 
 
 def _read_cache() -> EndpointManifest | None:
     try:
         if not _CACHE_PATH.exists():
             return None
+        try:
+            os.chmod(_CACHE_PATH, 0o600)
+        except OSError:
+            pass
         payload = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             return None

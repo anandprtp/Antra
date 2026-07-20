@@ -17,6 +17,7 @@ htmlcov/
 
 # Environment / secrets
 .env
+.env.telegram
 *.env.local
 .antra_auth.json
 .antra_qobuz_creds.json
@@ -54,6 +55,7 @@ ehthumbs.db
 # IDE / tooling
 .vscode/
 .idea/
+.playwright-cli/
 *.swp
 *.swo
 .claude/
@@ -64,6 +66,11 @@ CLAUDE.md
 
 # User local state (download history, library index)
 .antra_state.json
+.antra_telegram_access.sqlite3*
+.antra_telegram_playlists.sqlite3*
+playlist_sessions.sqlite3*
+/endpoint_manifest_cache.json
+/provider_stats.db*
 
 # Claude AI session files
 .claude/
