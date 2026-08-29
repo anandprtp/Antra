@@ -104,18 +104,17 @@ func (a *App) maybeRunAutoSync(now time.Time) {
 		return
 	}
 
-	// Schedule matched — spawn auto-sync in background
+	// Schedule matched — spawn auto-sync in background.
+	// Delegate to RunAutoSync() rather than spawning our own process here:
+	// RunAutoSync() registers itself as the App's active command (a.mu /
+	// a.activeCmd), which is what lets shutdown() and a later manual
+	// StartDownload() find and stop it. A bare exec.Command call here (the
+	// old code) was invisible to both, so this scheduled sync could outlive
+	// the GUI as an orphan, or run concurrently with a manual sync against
+	// the same download folder.
 	go func() {
-		backend, err := ensureBundledBackend()
-		var cmd *exec.Cmd
-		if err != nil {
-			return // no backend available in dev mode; RunAutoSync() can be called manually
-		}
-		cmd = exec.Command(backend, "--auto-sync", "--config", cfgPath)
-		hideProcess(cmd)
-		out, _ := cmd.Output()
-		_ = out
-		wailsRuntime.EventsEmit(a.ctx, "auto_sync_complete", string(out))
+		result := a.RunAutoSync()
+		wailsRuntime.EventsEmit(a.ctx, "auto_sync_complete", result)
 	}()
 }
 
