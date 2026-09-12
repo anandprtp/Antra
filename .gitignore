@@ -156,10 +156,7 @@ live_proxies*.txt
 *.lnk.disabled
 
 # Internal ops docs — contain VPS IPs, SSH details and key labels
-HANDOFF_NEXT_SESSION.md
-MIGRATION_AX41.md
-QOBUZ_ISSUE_HANDOFF.md
-OPERATIONS.md
+
 CHANGELOG_v1.1.8.md
 CHANGELOG_v1.1.*.md
 ANNOUNCEMENT_*.md
