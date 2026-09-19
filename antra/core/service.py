@@ -2029,6 +2029,7 @@ class AntraService:
                 folder_structure=getattr(cfg, "folder_structure", "standard"),
                 album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
                 playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                playlist_storage_mode=getattr(cfg, "playlist_storage_mode", "playlist_folder"),
                 single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
                 single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
