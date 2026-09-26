@@ -39,6 +39,7 @@
     folder_structure: 'standard',
     album_folder_structure: 'standard',
     playlist_folder_structure: 'standard',
+    playlist_storage_mode: 'playlist_folder',
     single_track_structure: 'album_numbered',
     filename_format: 'default',
     spotify_sp_dc: '',
@@ -1037,6 +1038,9 @@
       }
       if (!config.playlist_folder_structure) {
         config.playlist_folder_structure = config.folder_structure || 'standard';
+      }
+      if (!config.playlist_storage_mode) {
+        config.playlist_storage_mode = 'playlist_folder';
       }
       if (!config.single_track_structure) {
         config.single_track_structure = 'album_numbered';
@@ -4944,6 +4948,27 @@
           {:else}
             <p class="tpl-preview">No album folder &mdash; tracks are saved directly in your library folder. Good for loose singles.</p>
           {/if}
+        </div>
+      </div>
+
+      <!-- Playlist Storage -->
+      <div class="field" style="border-top: 1px solid rgba(255,255,255,0.05); padding-top: 16px;">
+        <p style="font-size: 13px; font-weight: 600; margin: 0 0 8px;">Playlist Storage</p>
+        <div style="display: flex; flex-direction: column; gap: 10px;">
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="playlist_folder" bind:group={config.playlist_storage_mode} style="margin-top: 2px;" />
+            <div>
+              Playlist folder
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Save playlist tracks in a folder named after the playlist.</p>
+            </div>
+          </label>
+          <label style="display: flex; align-items: flex-start; gap: 8px; font-weight: normal; cursor: pointer;">
+            <input type="radio" value="library" bind:group={config.playlist_storage_mode} style="margin-top: 2px;" />
+            <div>
+              Library structure
+              <p style="font-size: 11px; color: #555; margin: 4px 0 0;">Use the configured folder structure and filename format for each track.</p>
+            </div>
+          </label>
         </div>
       </div>
 
