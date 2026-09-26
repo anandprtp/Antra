@@ -14,7 +14,7 @@
   <a href="https://github.com/anandprtp/Antra/releases"><img src="https://img.shields.io/github/v/release/anandprtp/Antra?color=0ea5e9&label=latest&style=flat-square&labelColor=0d1117"/></a>
   <img src="https://img.shields.io/badge/Windows%20·%20macOS%20·%20Linux-supported-0ea5e9?style=flat-square&labelColor=0d1117"/>
   <a href="https://t.me/antraaverse"><img src="https://img.shields.io/badge/Community-Telegram-26A5E4?style=flat-square&labelColor=0d1117&logo=telegram&logoColor=white"/></a>
-  <a href="https://discord.com/invite/UcY5cqMuE"><img src="https://img.shields.io/badge/Community-Discord-5865F2?style=flat-square&labelColor=0d1117&logo=discord&logoColor=white"/></a>
+  <a href="https://discord.com/invite/gAJ3QymUta"><img src="https://img.shields.io/badge/Community-Discord-5865F2?style=flat-square&labelColor=0d1117&logo=discord&logoColor=white"/></a>
 </p>
 
 <p align="center">
