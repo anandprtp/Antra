@@ -1069,7 +1069,29 @@ func parseLibraryOutput(out []byte, eventType string) string {
 // RunAutoSync triggers an immediate auto-sync of all tracked playlists.
 // Streams newline-delimited JSON events on stdout (same format as StartDownload).
 // Returns empty string on success or an error string.
+//
+// Shares the App's single-active-command bookkeeping (a.mu / a.activeCmd /
+// a.cancelDownload) with StartDownload. Previously this function spawned its
+// own process without registering it, so:
+//   - shutdown() had no reference to it and left it running as an orphan
+//     after the GUI closed;
+//   - StartDownload() had no reference to it either, so a manual sync and
+//     an auto-sync could run concurrently against the same download folder,
+//     each treating the other's in-progress files as duplicates to skip or
+//     trash.
+// Registering here closes both gaps: any previous active command (manual
+// or auto-sync) is stopped before this one starts, and this one can in turn
+// be stopped by a later StartDownload call or by shutdown().
 func (a *App) RunAutoSync() string {
+	if cancel, cmd := a.detachActiveDownload(); cancel != nil || cmd != nil {
+		if cancel != nil {
+			cancel()
+		}
+		if err := killCommandTree(cmd); err != nil {
+			wailsRuntime.LogWarningf(a.ctx, "Failed to stop previous library engine before auto-sync: %v", err)
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
@@ -1095,6 +1117,8 @@ func (a *App) RunAutoSync() string {
 	if startErr := cmd.Start(); startErr != nil {
 		return `error:` + startErr.Error()
 	}
+	a.attachActiveDownload(cancel, cmd)
+	defer a.clearActiveDownload(cmd)
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 16*1024*1024), 16*1024*1024)
