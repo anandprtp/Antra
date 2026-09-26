@@ -214,7 +214,13 @@ class AppleLibraryClient:
             pages += 1
 
     def _get_json(self, path_or_url: str, params: Optional[dict] = None) -> dict:
-        url = path_or_url if path_or_url.startswith("http") else f"{_LIBRARY_API_BASE}{path_or_url}"
+        if path_or_url.startswith("http"):
+            url = path_or_url
+        elif path_or_url.startswith("/v1/"):
+            url = f"https://api.music.apple.com{path_or_url}"
+        else:
+            url = f"{_LIBRARY_API_BASE}{path_or_url}"
+
         resp = self._session.get(url, params=params, timeout=20)
         if resp.status_code == 401:
             raise RuntimeError("Apple Music session expired. Reconnect your account in Settings.")
