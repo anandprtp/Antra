@@ -50,6 +50,7 @@ class LibraryOrganizer:
         folder_structure: str = "standard",
         album_folder_structure: str = "",
         playlist_folder_structure: str = "",
+        playlist_storage_mode: str = "playlist_folder",
         single_track_structure: str = "album_numbered",
         filename_format: str = "default",
         single_track_filename_template: str = "",
@@ -71,6 +72,7 @@ class LibraryOrganizer:
         self.folder_structure = legacy_structure
         self.album_folder_structure = album_folder_structure or legacy_structure
         self.playlist_folder_structure = playlist_folder_structure or legacy_structure
+        self.playlist_storage_mode = playlist_storage_mode or "playlist_folder"
         self.single_track_structure = single_track_structure or "album_numbered"
         self.filename_format = filename_format
         self.filename_preferences = migrate_legacy_templates(
@@ -101,7 +103,7 @@ class LibraryOrganizer:
 
     def get_output_path(self, track: TrackMetadata) -> str:
         """Return the target output path WITHOUT extension."""
-        if track.playlist_name:
+        if track.playlist_name and self.playlist_storage_mode != "library":
             playlist_dir = self._safe(track.playlist_name)
             track_number = track.playlist_position or track.track_number
             filename = self._format_filename(track, track_number, disc_number=1)

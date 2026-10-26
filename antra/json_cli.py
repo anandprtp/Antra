@@ -2817,6 +2817,7 @@ def main():
             os.environ["FOLDER_STRUCTURE"] = settings.get("folder_structure") or "standard"
             os.environ["ALBUM_FOLDER_STRUCTURE"] = settings.get("album_folder_structure") or settings.get("folder_structure") or "standard"
             os.environ["PLAYLIST_FOLDER_STRUCTURE"] = settings.get("playlist_folder_structure") or settings.get("folder_structure") or "standard"
+            os.environ["PLAYLIST_STORAGE_MODE"] = settings.get("playlist_storage_mode") or "playlist_folder"
             os.environ["SINGLE_TRACK_STRUCTURE"] = settings.get("single_track_structure") or "album_numbered"
             os.environ["FILENAME_FORMAT"] = settings.get("filename_format") or "default"
             os.environ["SINGLE_TRACK_FILENAME_TEMPLATE"] = settings.get("single_track_filename_template") or ""
@@ -2975,6 +2976,7 @@ def main():
                 folder_structure=getattr(cfg, "folder_structure", "standard"),
                 album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
                 playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                playlist_storage_mode=getattr(cfg, "playlist_storage_mode", "playlist_folder"),
                 single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
                 single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
@@ -3027,6 +3029,7 @@ def main():
             folder_structure=getattr(cfg, "folder_structure", "standard"),
             album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
             playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            playlist_storage_mode=getattr(cfg, "playlist_storage_mode", "playlist_folder"),
             single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
             filename_format=getattr(cfg, "filename_format", "default"),
             single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),

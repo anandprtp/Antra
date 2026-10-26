@@ -195,6 +195,10 @@ class Config:
     #   "standard" — Playlists / Playlist Name / files
     #   "flat"     — <root> / Playlist Name / files
     playlist_folder_structure: str = "standard"
+    # Playlist storage mode:
+    #   "playlist_folder" — store tracks under the playlist name (default)
+    #   "library"         — use the configured library folder and filename templates
+    playlist_storage_mode: str = "playlist_folder"
 
     # Single-track layout:
     #   "album_numbered" — store under the album folder as 101 - Title (default)
@@ -360,6 +364,7 @@ def load_config() -> Config:
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
         album_folder_structure=os.getenv("ALBUM_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
         playlist_folder_structure=os.getenv("PLAYLIST_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
+        playlist_storage_mode=os.getenv("PLAYLIST_STORAGE_MODE", "playlist_folder"),
         single_track_structure=os.getenv("SINGLE_TRACK_STRUCTURE", "album_numbered"),
         filename_format=os.getenv("FILENAME_FORMAT", "default"),
         single_track_filename_template=os.getenv("SINGLE_TRACK_FILENAME_TEMPLATE", ""),

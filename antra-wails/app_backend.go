@@ -62,6 +62,7 @@ type Config struct {
 	FolderStructure             string `json:"folder_structure,omitempty"`
 	AlbumFolderStructure        string `json:"album_folder_structure,omitempty"`
 	PlaylistFolderStructure     string `json:"playlist_folder_structure,omitempty"`
+	PlaylistStorageMode         string `json:"playlist_storage_mode,omitempty"`
 	SingleTrackStructure        string `json:"single_track_structure,omitempty"`
 	FilenameFormat              string `json:"filename_format,omitempty"`
 	SingleTrackFilenameTemplate string `json:"single_track_filename_template,omitempty"`
@@ -175,6 +176,7 @@ func (a *App) GetConfig() Config {
 		cfg.FolderStructure = "standard"
 		cfg.AlbumFolderStructure = "standard"
 		cfg.PlaylistFolderStructure = "standard"
+		cfg.PlaylistStorageMode = "playlist_folder"
 		cfg.SingleTrackStructure = "album_numbered"
 		cfg.MultiDiscHandling = "prefix"
 		cfg.TrackNumberPadding = 2
@@ -240,6 +242,9 @@ func (a *App) GetConfig() Config {
 	if cfg.PlaylistFolderStructure == "" {
 		cfg.PlaylistFolderStructure = cfg.FolderStructure
 	}
+	if cfg.PlaylistStorageMode == "" {
+		cfg.PlaylistStorageMode = "playlist_folder"
+	}
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"
 	}
@@ -296,6 +301,9 @@ func (a *App) SaveConfig(cfg Config) error {
 	}
 	if cfg.PlaylistFolderStructure == "" {
 		cfg.PlaylistFolderStructure = cfg.FolderStructure
+	}
+	if cfg.PlaylistStorageMode == "" {
+		cfg.PlaylistStorageMode = "playlist_folder"
 	}
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"

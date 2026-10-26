@@ -36,6 +36,7 @@ export namespace main {
 	    folder_structure?: string;
 	    album_folder_structure?: string;
 	    playlist_folder_structure?: string;
+	    playlist_storage_mode?: string;
 	    single_track_structure?: string;
 	    filename_format?: string;
 	    single_track_filename_template?: string;
@@ -114,6 +115,7 @@ export namespace main {
 	        this.folder_structure = source["folder_structure"];
 	        this.album_folder_structure = source["album_folder_structure"];
 	        this.playlist_folder_structure = source["playlist_folder_structure"];
+	        this.playlist_storage_mode = source["playlist_storage_mode"];
 	        this.single_track_structure = source["single_track_structure"];
 	        this.filename_format = source["filename_format"];
 	        this.single_track_filename_template = source["single_track_filename_template"];
