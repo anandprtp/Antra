@@ -1685,6 +1685,10 @@ class DownloadEngine:
                         )
         finally:
             self._stop_prefetch()
+            try:
+                self.organizer.flush_state()
+            except Exception as e:
+                logger.warning(f"Could not flush library state: {e}")
 
         # Fill any slots that were cancelled or never completed
         final: list[DownloadResult] = []

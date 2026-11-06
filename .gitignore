@@ -163,3 +163,12 @@ OPERATIONS.md
 CHANGELOG_v1.1.8.md
 CHANGELOG_v1.1.*.md
 ANNOUNCEMENT_*.md
+# Local build / env
+.venv/
+.tools/
+AppDir/
+Antra-Linux.AppImage
+antra-wails/_pyinstaller_work/
+antra-wails/runtime/backend/AntraBackend
+antra-wails/runtime/backend/AntraBackend.exe
+antra-wails/build/bin/

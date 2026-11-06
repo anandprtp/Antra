@@ -128,13 +128,19 @@ Each template field shows a live preview as you type. Click any token chip to in
 
 ## Smart Deduplication
 
-Antra builds an identity index of your library using ISRCs, track IDs, and normalised title+artist keys. Before downloading, it checks if a track already exists, even if it was saved under a different artist folder name or album edition.
+Antra keeps an identity index of tracks it has written, keyed by ISRCs, track IDs, and normalised title+artist values, in `.antra_state.json` under your library root. Before downloading, it checks that index (and the expected output path) so the same track is skipped even if it already lives under a different artist folder or album edition.
+
+Files copied into the library outside Antra are not indexed automatically. Run a one-shot rebuild when you need those included:
+
+```bash
+antra --rebuild-library-index -o /path/to/Music
+```
 
 ### Library Mode Options
 
 | Mode | Behaviour |
 |---|---|
-| **Smart Dedup** (default) | Skip a track if the same ISRC exists anywhere in your library. Saves storage. |
+| **Smart Dedup** (default) | Skip a track if the same identity exists in `.antra_state.json` (or at the exact destination path). Saves storage; no full-library tag scan on every run. |
 | **Full Albums** | Skip only if the file already exists in the same destination folder. Lets you own the same track across multiple album contexts. |
 
 ---
