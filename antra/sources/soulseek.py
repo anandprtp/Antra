@@ -197,7 +197,7 @@ class SoulseekAdapter(BaseSourceAdapter):
                 f"{self._base_url}/api/v0/searches",
                 json=payload,
                 headers=headers,
-                timeout=10,
+                timeout=5,
             )
             # If a 409 still occurs (daemon text conflict), fallback to query deletion
             if resp.status_code == 409:
@@ -207,7 +207,7 @@ class SoulseekAdapter(BaseSourceAdapter):
                     f"{self._base_url}/api/v0/searches",
                     json=payload,
                     headers=headers,
-                    timeout=10,
+                    timeout=5,
                 )
             
             resp.raise_for_status()

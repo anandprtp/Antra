@@ -542,6 +542,11 @@ def main(argv=None):
     parser.add_argument("--dedupe-duplicate-albums", action="store_true", help="Move missing songs into the canonical album folder and delete redundant album folders")
     parser.add_argument("--find-duplicate-songs", action="store_true", help="Scan the library and report duplicate songs")
     parser.add_argument("--dedupe-duplicate-songs", action="store_true", help="Delete duplicate songs and keep one canonical copy")
+    parser.add_argument(
+        "--rebuild-library-index",
+        action="store_true",
+        help="One-shot tag scan of the output library into .antra_state.json for smart dedup",
+    )
     parser.add_argument("--find-cleanup-candidates", action="store_true", help="Scan the project for safe cache/temp/build files that can be deleted")
     parser.add_argument("--clean-project-junk", action="store_true", help="Delete safe cache/temp/build files from the project")
     parser.add_argument("--no-lyrics", action="store_true", help="Skip lyrics fetching")
@@ -573,6 +578,37 @@ def main(argv=None):
                 print_cleanup_report(cleanup_project_junk(repo_root))
             sys.exit(0)
         print_cleanup_report(cleanup_project_junk(repo_root))
+        sys.exit(0)
+
+    if args.rebuild_library_index:
+        from antra.utils.organizer import LibraryOrganizer
+
+        output_dir = args.output or cfg.output_dir
+        organizer = LibraryOrganizer(
+            output_dir,
+            full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
+            folder_structure=getattr(cfg, "folder_structure", "standard"),
+            album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
+            filename_format=getattr(cfg, "filename_format", "default"),
+            single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
+            album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
+            folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+            flat_library_root=getattr(cfg, "flat_library_root", False),
+            multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
+            track_number_padding=getattr(cfg, "track_number_padding", 2),
+            illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
+            whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
+            filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
+        )
+        report = organizer.rebuild_identity_index(persist=True)
+        print(
+            f"Rebuilt library index under {output_dir}: "
+            f"{report['files_scanned']} file(s) scanned, "
+            f"{report['keys_written']} new key(s), "
+            f"{report['index_size']} total key(s)."
+        )
         sys.exit(0)
 
     if args.find_duplicate_albums or args.dedupe_duplicate_albums or args.find_duplicate_songs or args.dedupe_duplicate_songs:
@@ -612,7 +648,10 @@ def main(argv=None):
     args.playlists = expanded_playlists
 
     if not args.playlists and not args.me:
-        parser.error("at least one Spotify URL/ID is required unless --inspect-file is used")
+        parser.error(
+            "at least one Spotify URL/ID is required unless a maintenance flag "
+            "(--inspect-file, --rebuild-library-index, dedupe/cleanup) is used"
+        )
 
     print("\n" + "═" * 60)
     print("  ANTRA \u2014 Library That Does It All, Automatically")

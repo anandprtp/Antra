@@ -3017,9 +3017,9 @@ def main():
 
     playlists_to_run = args.playlists
 
-    # Build the organizer once — it scans the entire library on init, which can
-    # be very slow on a NAS. Reusing one instance across all URLs in this batch
-    # means the scan happens exactly once per run, not once per URL.
+    # Build the organizer once per batch. Init loads .antra_state.json into the
+    # smart-dedup index (no full-library tag scan). Reusing one instance keeps
+    # in-memory index updates consistent across all URLs in this run.
     try:
         organizer = LibraryOrganizer(
             cfg.output_dir,

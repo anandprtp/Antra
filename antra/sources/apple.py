@@ -165,7 +165,7 @@ class _DirectAppleClient:
                 "User-Agent": "iTunes/12.13.0 (Windows; Microsoft Windows 11 x64) AppleWebKit/7614.5.9.1.9",
                 "Accept": "application/json",
             },
-            timeout=10,
+            timeout=5,
         )
         if not r.ok:
             return None
@@ -647,7 +647,7 @@ class AppleAdapter(BaseSourceAdapter):
                 "User-Agent": "iTunes/12.13.0 (Windows; Microsoft Windows 11 x64) AppleWebKit/7614.5.9.1.9",
                 "Accept": "application/json",
             },
-            timeout=10,
+            timeout=5,
         )
         if not r.ok:
             return None
@@ -762,7 +762,7 @@ class AppleAdapter(BaseSourceAdapter):
         if track.isrc and self._mirrors and not self._prefer_lossy_download:
             try:
                 mirror = self._get_working_mirror()
-                r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=10)
+                r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     proxy_track_id = str(data.get("track_id") or "")
@@ -803,7 +803,7 @@ class AppleAdapter(BaseSourceAdapter):
         if not apple_id and track.isrc:
             try:
                 mirror = self._get_working_mirror()
-                r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=10)
+                r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     apple_id = data.get("track_id")

@@ -145,7 +145,7 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
             try:
                 r = self._session.get(
                     f"{self._base}/api/search/isrc/{track.isrc}",
-                    timeout=10,
+                    timeout=5,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Qobuz mirror rate limited (429)")
@@ -218,7 +218,7 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
                 r = self._session.get(
                     f"{self._base}/api/search",
                     params={"title": query["title"], "artist": query["artist"], "limit": 5},
-                    timeout=10,
+                    timeout=5,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Qobuz mirror rate limited (429)")

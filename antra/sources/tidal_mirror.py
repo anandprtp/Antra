@@ -128,7 +128,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         if cache_key in self._album_id_cache:
             return
         try:
-            r = self._session.get(f"{self._base}/api/meta/track/{track_id}", timeout=10)
+            r = self._session.get(f"{self._base}/api/meta/track/{track_id}", timeout=5)
             if r.status_code != 200:
                 return
             data = r.json()
@@ -148,7 +148,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         tracks = self._album_track_cache.get(album_id)
         if tracks is None:
             try:
-                r = self._session.get(f"{self._base}/api/album/{album_id}", timeout=10)
+                r = self._session.get(f"{self._base}/api/album/{album_id}", timeout=5)
                 if r.status_code != 200:
                     return None
                 tracks = r.json().get("tracks") or []
@@ -331,7 +331,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 r = self._session.get(
                     f"{self._base}/search/",
                     params={"s": query},
-                    timeout=10,
+                    timeout=5,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Tidal mirror rate limited (429)")
@@ -378,7 +378,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         try:
             r = self._session.get(
                 f"{self._base}/api/search/isrc/{isrc}",
-                timeout=10,
+                timeout=5,
             )
             if r.status_code == 429:
                 raise RateLimitedError("Tidal mirror rate limited (429)")
@@ -404,7 +404,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             if result.duration_ms is None and track.duration_ms and result.stream_id:
                 try:
                     mr = self._session.get(
-                        f"{self._base}/api/meta/track/{result.stream_id}", timeout=10
+                        f"{self._base}/api/meta/track/{result.stream_id}", timeout=5
                     )
                     if mr.status_code == 200:
                         secs = (mr.json() or {}).get("duration")
@@ -470,7 +470,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         isrc = (track.isrc or "").strip()
         if not isrc:
             try:
-                r = self._session.get(f"{self._base}/api/meta/track/{tidal_id}", timeout=10)
+                r = self._session.get(f"{self._base}/api/meta/track/{tidal_id}", timeout=5)
                 if r.status_code == 200:
                     isrc = (r.json().get("isrc") or "").strip()
             except Exception as e:
@@ -942,7 +942,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             ffmpeg = get_ffmpeg_exe() or "ffmpeg"
             result = subprocess.run(
                 [ffmpeg, "-y", "-i", input_path, "-c", "copy", "-f", "flac", output_path],
-                capture_output=True, timeout=120,
+                capture_output=True, timeout=50,
                 env=get_clean_subprocess_env(), **_SUBPROCESS_FLAGS,
             )
             return result.returncode == 0

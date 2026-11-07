@@ -1602,9 +1602,14 @@ class DownloadEngine:
         self._prefetch_stop.set()
         pool, self._prefetch_pool = self._prefetch_pool, None
         if pool is not None:
-            # Do not block on in-flight resolves: a mirror search can sit on a
-            # long timeout, and the user cancelling must not wait for it.
-            pool.shutdown(wait=False)
+            # Cancel queued work and wait briefly so the next playlist does not
+            # inherit orphan resolve threads + urllib3 pools (second-run FD storm).
+            # cancel_futures drops pending jobs; in-flight searches still finish
+            # or hit their HTTP timeout, but they no longer pile up unbounded.
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
         with self._prefetch_lock:
             self._prefetched.clear()
 
@@ -1685,6 +1690,10 @@ class DownloadEngine:
                         )
         finally:
             self._stop_prefetch()
+            try:
+                self.organizer.flush_state()
+            except Exception as e:
+                logger.warning(f"Could not flush library state: {e}")
 
         # Fill any slots that were cancelled or never completed
         final: list[DownloadResult] = []

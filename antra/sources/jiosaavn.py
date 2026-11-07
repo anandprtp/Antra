@@ -121,7 +121,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
             resp = self._session.get(
                 f"{self._API_V2}/search/songs",
                 params={"query": query, "page": 1, "limit": 10},
-                timeout=10,
+                timeout=5,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -144,7 +144,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
                     "includeMetaTags": "1",
                     "query": query,
                 },
-                timeout=10,
+                timeout=5,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -370,7 +370,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
     def _get_song_via_community_api(self, song_id: str) -> Optional[dict]:
         resp = self._session.get(
             f"{self._API_V2}/songs/{song_id}",
-            timeout=10,
+            timeout=5,
         )
         resp.raise_for_status()
         data = resp.json().get("data")
@@ -390,7 +390,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
                 "_marker": "0",
                 "pids": song_id,
             },
-            timeout=10,
+            timeout=5,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -400,7 +400,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
         try:
             resp = self._session.get(
                 f"{self._API_V2}/songs/{song_id}",
-                timeout=10,
+                timeout=5,
             )
             resp.raise_for_status()
             data = resp.json()

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import unicodedata
 from pathlib import Path
 from typing import Optional
@@ -94,8 +95,11 @@ class LibraryOrganizer:
         self._state_path = self.root / STATE_FILE
         self._state = self._load_state()
         self._identity_index: dict[str, str] = {}
+        self._state_dirty = False
+        self._state_lock = threading.Lock()
         if not full_albums:
             self._build_identity_index()
+            self._warn_if_state_empty_but_audio_present()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -273,9 +277,55 @@ class LibraryOrganizer:
         self._mark_done(track, file_path)
 
     def mark_failed(self, track: TrackMetadata, reason: str):
-        for key in self._track_identity_keys(track):
-            self._state[f"{FAILED_PREFIX}{key}"] = reason
-        self._save_state()
+        with self._state_lock:
+            for key in self._track_identity_keys(track):
+                self._state[f"{FAILED_PREFIX}{key}"] = reason
+            self._state_dirty = True
+
+    def flush_state(self) -> None:
+        """Persist dirty state to `.antra_state.json` once."""
+        with self._state_lock:
+            if not self._state_dirty:
+                return
+            self._save_state_unlocked()
+            self._state_dirty = False
+
+    def rebuild_identity_index(self, *, persist: bool = True) -> dict:
+        """Full-library tag scan used only for explicit rebuilds.
+
+        Normal download startup does not call this. External drops and legacy
+        libraries without `.antra_state.json` entries require this one-shot pass.
+        """
+        files_scanned = 0
+        keys_written = 0
+        with self._state_lock:
+            for file_path in self.root.rglob("*"):
+                if file_path.name == STATE_FILE:
+                    continue
+                if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+                    continue
+                files_scanned += 1
+                try:
+                    identity_keys = self._extract_identity_keys_from_file(file_path)
+                except Exception as e:
+                    logger.debug(f"Library scan skipped {file_path}: {e}")
+                    continue
+                resolved = str(file_path.resolve())
+                for key in identity_keys:
+                    if key not in self._identity_index:
+                        keys_written += 1
+                    self._identity_index.setdefault(key, resolved)
+                    self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
+            if persist:
+                self._save_state_unlocked()
+                self._state_dirty = False
+            else:
+                self._state_dirty = True
+        return {
+            "files_scanned": files_scanned,
+            "keys_written": keys_written,
+            "index_size": len(self._identity_index),
+        }
 
     def ensure_playlist_copy(self, track: TrackMetadata, canonical_path: str) -> str:
         if not track.playlist_name or not canonical_path or not os.path.exists(canonical_path):
@@ -345,10 +395,11 @@ class LibraryOrganizer:
 
     def _mark_done(self, track: TrackMetadata, path: str):
         resolved = str(Path(path).resolve())
-        for key in self._track_identity_keys(track):
-            self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
-            self._identity_index[key] = resolved
-        self._save_state()
+        with self._state_lock:
+            for key in self._track_identity_keys(track):
+                self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
+                self._identity_index[key] = resolved
+            self._state_dirty = True
 
     def _track_identity_keys(self, track: TrackMetadata) -> list[str]:
         keys: list[str] = []
@@ -397,20 +448,37 @@ class LibraryOrganizer:
         return list(dict.fromkeys(keys))
 
     def _build_identity_index(self):
+        """Load identity keys from `.antra_state.json` only (no filesystem tag scan)."""
         for key, path in self._load_track_entries_from_state().items():
             if os.path.exists(path):
                 self._identity_index.setdefault(key, path)
 
-        for file_path in self.root.rglob("*"):
-            if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
-                continue
-            try:
-                identity_keys = self._extract_identity_keys_from_file(file_path)
-            except Exception as e:
-                logger.debug(f"Library scan skipped {file_path}: {e}")
-                continue
-            for key in identity_keys:
-                self._identity_index.setdefault(key, str(file_path.resolve()))
+    def _warn_if_state_empty_but_audio_present(self) -> None:
+        if self._identity_index:
+            return
+        if self._library_has_audio_file():
+            logger.warning(
+                "Smart dedup index is empty but audio files were found under %s. "
+                "Only tracks Antra has recorded will be skipped. "
+                "Run with --rebuild-library-index to index existing files once.",
+                self.root,
+            )
+
+    def _library_has_audio_file(self) -> bool:
+        """Cheap existence probe: stop at the first audio file, do not read tags."""
+        try:
+            for dirpath, dirnames, filenames in os.walk(self.root):
+                # Do not descend into hidden/cache dirs if present.
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for name in filenames:
+                    if name == STATE_FILE:
+                        continue
+                    suffix = Path(name).suffix.lower()
+                    if suffix in SUPPORTED_AUDIO_EXTENSIONS:
+                        return True
+        except OSError as e:
+            logger.debug(f"Could not probe library for audio files: {e}")
+        return False
 
     def _load_track_entries_from_state(self) -> dict[str, str]:
         entries: dict[str, str] = {}
@@ -448,6 +516,11 @@ class LibraryOrganizer:
         return {}
 
     def _save_state(self):
+        with self._state_lock:
+            self._save_state_unlocked()
+            self._state_dirty = False
+
+    def _save_state_unlocked(self):
         try:
             self._state_path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
         except Exception as e:
