@@ -1517,18 +1517,16 @@ func endpointEnvFrom(m endpointManifest) []string {
 }
 
 func (a *App) resolveBackendCommand(playlists []string) (string, []string, string, []string, error) {
-	// Determine concurrent-worker count: 2 for supporter keys, 1 for everyone else.
+	// Determine concurrent-worker count.
 	// v1.1.8 FEAT-7 — concurrency is the SAFE supporter speed lever. The mirrors'
 	// politeness delay is per streaming account, so N workers use N *different*
 	// accounts in parallel and each keeps its own spacing: throughput scales
 	// without raising the per-account request rate that risks bans. Raised 2 -> 4.
 	// Deliberately not higher: the Tidal pool has a documented thundering-herd
 	// history (v1.1.7), and 4 stays well inside it.
-	isSupporter, mirrorKey := a.supporterContext()
-	maxWorkers := "1"
-	if isSupporter {
-		maxWorkers = "4"
-	}
+	// Local fork: free-tier and supporter both use 4 workers.
+	_, mirrorKey := a.supporterContext()
+	maxWorkers := "4"
 	extraEnv := []string{"PYTHONUTF8=1", "ANTRA_MAX_WORKERS=" + maxWorkers}
 	if mirrorKey != "" {
 		extraEnv = append(extraEnv, "ANTRA_MIRROR_API_KEY="+mirrorKey)

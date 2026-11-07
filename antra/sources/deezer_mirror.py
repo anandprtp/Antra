@@ -142,7 +142,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
             try:
                 r = self._session.get(
                     f"{self._base}/api/search/isrc/{track.isrc}",
-                    timeout=10,
+                    timeout=5,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Deezer mirror rate limited (429)")
@@ -227,7 +227,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
             r = self._session.get(
                 f"{self._base}/api/search",
                 params={"title": search_title, "artist": track.primary_artist, "limit": 5},
-                timeout=10,
+                timeout=5,
             )
             if r.status_code == 429:
                 raise RateLimitedError("Deezer mirror rate limited (429)")
@@ -308,7 +308,7 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
 
         # Download encrypted stream through the VPS relay so the local machine
         # never has to resolve Deezer's CDN hostnames directly.
-        with self._session.get(relay_url, stream=True, timeout=120) as r:
+        with self._session.get(relay_url, stream=True, timeout=50) as r:
             if r.status_code == 429:
                 raise RateLimitedError("Deezer mirror rate limited (429)")
             if r.status_code == 503:

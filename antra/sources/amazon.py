@@ -777,7 +777,7 @@ class AmazonAdapter(BaseSourceAdapter):
             encoded = urllib.parse.quote(query)
             for base in storefronts:
                 try:
-                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=5)
                     if not resp.ok:
                         continue
                     text = resp.text
@@ -828,7 +828,7 @@ class AmazonAdapter(BaseSourceAdapter):
             resp = self._session.get(
                 _SONGLINK_API,
                 params={"url": spotify_album_url, "platform": "spotify", "type": "album"},
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code == 429:
                 logger.debug("[Amazon] song.link album lookup rate-limited for %s", spotify_album_id)
@@ -938,7 +938,7 @@ class AmazonAdapter(BaseSourceAdapter):
             encoded = urllib.parse.quote(query)
             for base in storefronts:
                 try:
-                    resp = self._session.get(f"{base}/search/{encoded}", timeout=12)
+                    resp = self._session.get(f"{base}/search/{encoded}", timeout=5)
                     if not resp.ok:
                         continue
                     text = resp.text
@@ -1757,7 +1757,7 @@ class AmazonAdapter(BaseSourceAdapter):
             result = subprocess.run(
                 [ffmpeg, "-v", "error", "-i", path, "-f", "null", "-"],
                 capture_output=True,
-                timeout=120,
+                timeout=50,
                 **_SUBPROCESS_FLAGS,
             )
             return result.returncode == 0
@@ -1807,7 +1807,7 @@ class AmazonAdapter(BaseSourceAdapter):
                     output_path,
                 ],
                 capture_output=True,
-                timeout=120,
+                timeout=50,
                 **_SUBPROCESS_FLAGS,
             )
             return result.returncode == 0

@@ -842,8 +842,10 @@ class SourceResolver:
         Waterfall search: try each adapter in priority order.
 
         In quality-aware (lossless) mode:
-          - Queries ALL lossless-capable adapters (never stops early on a lossless hit).
-          - After all adapters have been queried, picks the result with the highest
+          - Queries lossless-capable adapters in priority order.
+          - Early-exits when a candidate clears `_accepts_result_immediately`
+            (hi-res + identity gates, or 16-bit target met in lossless16 mode).
+          - Otherwise collects candidates and picks the best by
             bit_depth → sample_rate_hz → similarity_score.
           - In lossless-only mode (flac/lossless/alac), fails cleanly if no lossless
             result was found — never falls back to a lossy source.
@@ -1022,8 +1024,9 @@ class SourceResolver:
                 best_adapter = adapter
 
             # ── Quality-aware (lossless) mode ──────────────────────────────────
-            # Collect ALL lossless results from all adapters, then pick the best
-            # by bit_depth → sample_rate_hz at the end. Never stop early.
+            # Collect lossless results; early-exit when a candidate already clears
+            # the immediate-accept gates (hi-res + identity). Otherwise keep
+            # searching and pick the best by bit_depth → sample_rate at the end.
             # Exception: in lossless-16 mode, stop as soon as Deezer finds the
             # track — it always returns 16-bit FLAC and there's no need to also
             # query the 24-bit sources.
@@ -1076,7 +1079,17 @@ class SourceResolver:
                                 result.quality_label,
                             )
                             return result, adapter
-                    # Keep going — collect all lossless candidates, pick best after
+                        # Local fork: stop once a hi-res (or lossless16-target)
+                        # candidate already clears the immediate-accept gates.
+                        if self._accepts_result_immediately(result, adapter, track):
+                            logger.info(
+                                "[Resolver] Early-exit via %s: '%s' (%s)",
+                                adapter.name,
+                                result.title,
+                                result.quality_label,
+                            )
+                            return result, adapter
+                    # Keep going — collect remaining lossless candidates, pick best after
                     continue
 
                 # Lossy result in quality-aware mode — record as fallback but keep going

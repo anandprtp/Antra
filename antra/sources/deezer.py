@@ -205,7 +205,7 @@ class DeezerAdapter(BaseSourceAdapter):
         try:
             resp = self._session.get(
                 f"{_PUBLIC_API}/track/isrc:{track.isrc}",
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -239,7 +239,7 @@ class DeezerAdapter(BaseSourceAdapter):
             resp = self._session.get(
                 f"{_PUBLIC_API}/search",
                 params={"q": query, "limit": 10, "output": "json"},
-                timeout=10,
+                timeout=5,
             )
             resp.raise_for_status()
             items = resp.json().get("data", [])

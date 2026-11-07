@@ -2054,18 +2054,16 @@ class AntraService:
                 mirror_api_key=_resolve_mirror_api_key(cfg),
             )
 
-        # ANTRA_MAX_WORKERS is set to 4 by the Go desktop layer when a
-        # supporter/admin key is detected; defaults to 1 for regular users.
+        # ANTRA_MAX_WORKERS is set to 4 by the Go desktop layer (local fork).
+        # Default 4 when unset so CLI matches desktop concurrency.
         try:
-            _max_workers = max(1, int(os.environ.get("ANTRA_MAX_WORKERS", "1")))
+            _max_workers = max(1, int(os.environ.get("ANTRA_MAX_WORKERS", "4")))
         except ValueError:
-            _max_workers = 1
+            _max_workers = 4
 
-        # Resolve-ahead threads. Enabled only for multi-worker (supporter) runs:
-        # with a single worker this would double the concurrent requests the
-        # mirrors see from free users, and FEAT-7's constraint is that free-tier
-        # behaviour must not change. ANTRA_PREFETCH_RESOLVES overrides it, and 0
-        # is a clean kill switch back to fully inline resolution.
+        # Resolve-ahead threads. Enabled for multi-worker runs (default free
+        # tier is now 2). ANTRA_PREFETCH_RESOLVES overrides it, and 0 is a
+        # clean kill switch back to fully inline resolution.
         #
         # Sized to the worker count rather than a smaller fixed number. Measured:
         # 2 threads against 4 workers tops out at a 50% hit rate when a resolve

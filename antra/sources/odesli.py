@@ -230,7 +230,7 @@ class OdesliEnricher:
                     resp = self._session.get(
                         endpoint,
                         params={"k": query, "i": "digital-music-track"},
-                        timeout=10,
+                        timeout=5,
                     )
                     if not resp.ok:
                         logger.debug(f"[Amazon Search] {endpoint} HTTP {resp.status_code}")
@@ -441,7 +441,7 @@ class OdesliEnricher:
 
         page_url = f"https://songstats.com/{isrc}?ref=ISRCFinder"
         try:
-            resp = self._session.get(page_url, timeout=10)
+            resp = self._session.get(page_url, timeout=5)
             if not resp.ok:
                 logger.debug("[Songstats] HTTP %s for %s", resp.status_code, isrc)
                 return {}
