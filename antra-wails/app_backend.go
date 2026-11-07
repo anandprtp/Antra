@@ -481,6 +481,7 @@ func (a *App) startBackendProcess(
 
 	cmd := exec.CommandContext(ctx, command, args...)
 	hideProcess(cmd)
+	prepareBackendProcess(cmd)
 	cmd.Dir = workDir
 	cmd.Env = env
 
@@ -669,10 +670,7 @@ func killCommandTree(cmd *exec.Cmd) error {
 		return nil
 	}
 
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return err
-	}
-	return nil
+	return killUnixProcessTree(cmd)
 }
 
 func (a *App) runPythonCommand(args []string) (string, error) {

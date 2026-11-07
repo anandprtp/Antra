@@ -145,7 +145,9 @@ class HifiAdapter(BaseSourceAdapter):
                 logger.debug(f"[HiFi] Unreachable: {ep} — {e}")
             return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(candidate_pool), 1)) as ex:
+        # Cap fan-out: unbounded endpoint probes × download workers × prefetch
+        # can saturate host DNS/sockets (observed as machine-wide network lockups).
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(max(len(candidate_pool), 1), 4)) as ex:
             results = list(ex.map(_check, candidate_pool))
 
         live_community = [ep for ep in results if ep is not None]
@@ -245,7 +247,7 @@ class HifiAdapter(BaseSourceAdapter):
 
         best_match: Optional[dict] = None  # {"item": ..., "endpoint": ...}
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(available)) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(available), 4)) as ex:
             futures = {ex.submit(_fetch, ep): ep for ep in available}
             for future in concurrent.futures.as_completed(futures):
                 hit = future.result()
@@ -308,7 +310,7 @@ class HifiAdapter(BaseSourceAdapter):
         best_score = 0.0
         best_ep = endpoints[0]
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints)) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(endpoints), 4)) as ex:
             # Check availability, falling back to full list if everything is backed off
             available = [ep for ep in endpoints if not self._is_endpoint_backed_off(ep)]
             if not available:
