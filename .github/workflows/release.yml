@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache-dependency-path: antra-wails/go.sum
 
       - uses: actions/setup-node@v4
@@ -45,6 +45,9 @@ jobs:
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Vendor fpcalc (audio fingerprint verification)
+        run: python tools/fetch_fpcalc.py
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -135,7 +138,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache-dependency-path: antra-wails/go.sum
 
       - uses: actions/setup-node@v4
@@ -159,6 +162,9 @@ jobs:
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Vendor fpcalc (audio fingerprint verification)
+        run: python tools/fetch_fpcalc.py
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -249,6 +255,69 @@ jobs:
           name: Antra-Linux
           path: Antra-Linux.AppImage
 
+      # ---- Flatpak ----------------------------------------------------------
+      # Packaged from the binary built and smoke-tested above, so the bundle
+      # ships something that has been exercised rather than merely compiled.
+      # org.gnome.Platform provides WebKitGTK, which is the entire point: the
+      # AppImage needs the user to install webkit2gtk-4.1 by hand first, and on
+      # Fedora that is the most common first-run failure.
+      #
+      # Every Flatpak step is continue-on-error DELIBERATELY. A packaging
+      # failure must not cost the release its AppImage -- `release` needs
+      # build-linux to succeed. The steps still surface as failed in the UI, so
+      # the failure stays visible; it just is not fatal. If the .flatpak is
+      # missing, the release job simply does not attach one.
+      - name: Install Flatpak toolchain
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y flatpak flatpak-builder
+          pip install --quiet pyyaml
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          # Runtime version is pinned in the manifest. If this fails with
+          # "not found", the GNOME runtime has moved on -- bump the one number
+          # in packaging/flatpak/io.github.anandprtp.Antra.yml.
+          flatpak install --user -y flathub \
+            org.gnome.Platform//50 org.gnome.Sdk//50
+
+      - name: Stage Flatpak inputs
+        continue-on-error: true
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF#refs/tags/}"
+          if [ "$VERSION" = "$GITHUB_REF" ]; then VERSION="${{ github.event.inputs.tag }}"; fi
+          VERSION="${VERSION#v}"
+          if [ -z "$VERSION" ]; then VERSION="0.0.0"; fi
+          BIN=$(find antra-wails/build/bin -maxdepth 1 -type f -executable | head -1)
+          python3 packaging/flatpak/stage.py \
+            --bin "$BIN" \
+            --out flatpak-stage \
+            --version "$VERSION" \
+            --date "$(date -u +%Y-%m-%d)"
+          # Cross-checks the manifest, desktop file, metainfo and staged files
+          # against each other before spending minutes on flatpak-builder.
+          python3 packaging/flatpak/verify_stage.py flatpak-stage
+
+      - name: Build Flatpak bundle
+        continue-on-error: true
+        working-directory: flatpak-stage
+        run: |
+          set -eu
+          flatpak-builder --user --disable-rofiles-fuse --force-clean \
+            --repo=repo build-dir io.github.anandprtp.Antra.yml
+          flatpak build-bundle \
+            --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo \
+            repo ../Antra-Linux.flatpak io.github.anandprtp.Antra
+          ls -lh ../Antra-Linux.flatpak
+
+      - name: Upload Flatpak artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: Antra-Flatpak
+          path: Antra-Linux.flatpak
+          if-no-files-found: warn
+
   build-macos:
     name: Build macOS
     runs-on: macos-latest
@@ -263,7 +332,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache-dependency-path: antra-wails/go.sum
 
       - uses: actions/setup-node@v4
@@ -278,6 +347,9 @@ jobs:
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Vendor fpcalc (audio fingerprint verification)
+        run: python tools/fetch_fpcalc.py
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -357,7 +429,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.26'
           cache-dependency-path: antra-wails/go.sum
 
       - uses: actions/setup-node@v4
@@ -372,6 +444,9 @@ jobs:
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Vendor fpcalc (audio fingerprint verification)
+        run: python tools/fetch_fpcalc.py
 
       - name: Build Python Backend
         working-directory: antra-wails
@@ -464,12 +539,13 @@ jobs:
           body: |
             ## What's New
 
-            - **Animated Logo** — new circuit-board "A" logo with orbiting service icons (Spotify, Apple Music, Amazon, Tidal, Deezer, and more) on the welcome screen
-            - **Streamlined Setup** — the first-run screen now shows only the folder picker; everything else lives in dedicated panels
-            - **Folder Structure Panel** — new 📁 nav button opens Library Mode, Folder Structure, and Filename Format settings
-            - **Settings Focused** — ⚙️ settings trimmed to API key, failed-track retries, and sources
-            - **New Source Adapters** — Deezer, Tidal, and Qobuz mirror adapters; YouTube via yt-dlp
-            - **Core Engine Improvements** — resolver, organiser, tagger, and transcoder improvements across the board
+            - **Preview before you download** — paste a link and see the cover, tracklist and per-track checkboxes first; nothing is written until you press Download now
+            - **Search songs and albums**, not just artists
+            - **Sign in with your Antra account** from the browser — no shared key to paste
+            - **New theme engine and light mode**, with more languages and a redesigned settings surface
+            - **Library control** — per-tag toggles, text transforms, ReplayGain, sidecar files, a post-download command, and playlists that can file tracks by your folder template
+            - **Fixes** — playlist folders no longer double on every sync, Stop now really stops on macOS and Linux, "prefer explicit" works, wrong-mix/wrong-song matches are rejected, Deezer albums load every track, and failures are reported against the right song
+            - **Connection diagnostics** — a one-click check explains why the servers can't be reached
             - **Community** — join us on [Telegram](https://t.me/antraaverse) · support on [Patreon](https://patreon.com/AntraVerse)
 
             ## Downloads
@@ -482,14 +558,26 @@ jobs:
             ## Files
 
             - `Antra.exe`: Windows
-            - `Antra-Linux.AppImage`: Linux
+            - `Antra-Linux.AppImage`: Linux (any distro)
+            - `Antra-Linux.flatpak`: Linux (Flatpak - bundles WebKit, no dependencies to install)
             - `Antra-macOS.dmg`: macOS Apple Silicon
             - `Antra-macOS-Intel.dmg`: macOS Intel
 
             <details>
             <summary>Linux install</summary>
 
-            Download `Antra-Linux.AppImage`, then install the WebKit dependency for your distro:
+            **Flatpak (recommended - nothing else to install):**
+            ```bash
+            flatpak install --user ./Antra-Linux.flatpak
+            flatpak run io.github.anandprtp.Antra
+            ```
+            The Flatpak bundles WebKitGTK via `org.gnome.Platform`, so there is no
+            `webkit2gtk` package to install first. Flathub's GNOME runtime is pulled in
+            automatically on first install if you do not already have it.
+
+            ---
+
+            **AppImage:** download `Antra-Linux.AppImage`, then install the WebKit dependency for your distro:
 
             **Ubuntu/Debian:**
             ```
@@ -542,6 +630,7 @@ jobs:
           files: |
             dist/Antra-Windows/Antra.exe
             dist/Antra-Linux/Antra-Linux.AppImage
+            dist/Antra-Flatpak/Antra-Linux.flatpak
             dist/Antra-macOS/Antra-macOS.dmg
             dist/Antra-macOS-Intel/Antra-macOS-Intel.dmg
         env:

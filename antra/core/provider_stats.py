@@ -1,8 +1,8 @@
 """
 Persistent provider (adapter) reliability memory.
 
-SpotiFLAC keeps a bbolt-backed record of which download providers recently
-succeeded or failed and reorders them on the next request. Antra's resolver only
+A persistent record of which download providers recently succeeded or failed
+lets the next request reorder them. Antra's resolver previously only
 had in-memory cooldowns that reset on every app restart — a Tidal mirror that
 served preview clips all session would still be tried first after a relaunch.
 

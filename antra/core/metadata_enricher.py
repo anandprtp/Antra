@@ -7,7 +7,7 @@ Fills every available TrackMetadata field by consulting sources in priority orde
   2. Deezer free API (ISRC, track#, disc#, release date, 1000px artwork)
   3. iTunes Search API (genre, composer, track#, disc#, year, 3000px artwork)
   4. MusicBrainz (genre tags, ISWC, label — by ISRC or title+artist fallback)
-  5. Lyrics: LRCLIB → Paxsenix (synced + plain)
+  5. Lyrics: LRCLIB → lrc.red → LyricsPlus → Apple → boidu (synced + plain)
   6. Artwork upgrade to highest resolution available
 
 All API calls are fully wrapped in try/except — enrichment is strictly best-effort.
@@ -297,6 +297,16 @@ def _deezer_isrc_enrich(
             return
         diag["track_found"] = True
         diag["track_id"] = data.get("id")
+
+        # One ISRC sits on many releases (compilations) and Deezer hands back just
+        # one. Position, disc, date, genre, label and cover all describe THAT
+        # release, so take them only when it is our album (WEB-ART-1).
+        _hit_album = (data.get("album") or {}).get("title")
+        if _hit_album and not _album_titles_match(track.album, _hit_album):
+            diag["other_release"] = _hit_album
+            logger.debug("[MetaEnrich] Deezer ISRC hit is on another release (%r), ignored for %s",
+                         _hit_album, track.title)
+            return
 
         # Fill per-track fields from the ISRC response
         if needs_track_num and data.get("track_position"):
@@ -643,8 +653,27 @@ def _mb_text_search_genre(track: "TrackMetadata", out: dict[str, Any]) -> None:
         if resp.ok:
             data = resp.json()
             recordings = data.get("recordings") or []
-            if recordings:
-                tags = recordings[0].get("tags") or []
+            # A free-text search ranks by text score, so recordings[0] can be a
+            # cover or an unrelated song; its genres were written to the file
+            # unchecked. Take the best title+artist match, and none if none match.
+            from antra.utils.matching import score_similarity
+            best, best_score = None, 0.0
+            for cand in recordings:
+                if not isinstance(cand, dict):
+                    continue
+                credit = cand.get("artist-credit") or []
+                names = [
+                    (c.get("name") or (c.get("artist") or {}).get("name") or "")
+                    for c in credit if isinstance(c, dict)
+                ]
+                s = score_similarity(
+                    track.title, list(track.artists or []),
+                    cand.get("title") or "", ", ".join(n for n in names if n),
+                )
+                if s > best_score:
+                    best, best_score = cand, s
+            if best is not None and best_score >= 0.80:
+                tags = best.get("tags") or []
                 tags_sorted = sorted(tags, key=lambda t: t.get("count", 0), reverse=True)
                 genres = [t["name"].title() for t in tags_sorted[:3] if t.get("name")]
                 if genres:
@@ -741,20 +770,65 @@ def _upgrade_artwork(track: "TrackMetadata", out: dict[str, Any]) -> None:
         )
         if resp.status_code != 200:
             return
+        our_album = (getattr(track, "album", "") or "").strip()
+        scored_fallback = None
         for hit in resp.json().get("results") or []:
             if hit.get("wrapperType") != "track":
                 continue
+            art = hit.get("artworkUrl100") or ""
+            if not art:
+                continue
             hit_title = hit.get("trackName") or ""
             hit_artist = hit.get("artistName") or ""
-            if _score_similarity(search_title, track.artists, hit_title, hit_artist) < 0.60:
-                continue
-            art = hit.get("artworkUrl100") or ""
-            if art and _album_titles_match(track.album, hit.get("collectionName") or ""):
+            hit_album = hit.get("collectionName") or ""
+
+            # ALBUM FIRST. Cover art is an album property, so a hit whose album is
+            # ours is the answer regardless of how the artist string scores -
+            # score_similarity matches each of OUR artists against the result's
+            # COMBINED artist string, so a hit that correctly lists every
+            # collaborator can score BELOW a wrong hit with one coincidentally
+            # similar name. Measured live on "Type Shit" through THIS tree's
+            # score_similarity: the correct WE DON'T TRUST YOU hit scores 0.776
+            # and Migos' Culture III scores 0.785 - the right answer loses by
+            # 0.009. (The 0.500 recorded elsewhere is the WEB copy's number; its
+            # score_similarity lacks desktop's title-trust bypass and softer cap,
+            # so it caps that hit where desktop does not. Do not copy it here.)
+            #
+            # The ordering-independence this buys is what actually fixes desktop.
+            # Measured on live responses: for "Bohemian Rhapsody"/A Night at the
+            # Opera and "Dreams"/Rumours a non-matching compilation is hit [0],
+            # clears the 0.60 gate, and the old unconditional `break` stopped
+            # there - throwing away the matching release further down the list.
+            album_hit = bool(our_album and hit_album
+                             and _album_titles_match(our_album, hit_album))
+            if album_hit and _artist_plausible(track.artists, hit_artist):
                 url = _re.sub(r"\d+x\d+bb", "3000x3000bb", art)
                 track.artwork_url = url
                 out["artwork_url"] = url
-                logger.debug("[MetaEnrich] Art upgraded to iTunes 3000px: %s", title)
-            break
+                logger.debug("[MetaEnrich] Art upgraded to iTunes 3000px (album match): %s", title)
+                return
+
+            # Otherwise keep the old title+artist rule as a fallback, but REMEMBER it
+            # instead of breaking: the previous code took the first score-passing hit
+            # and stopped, so a wrong-album hit early in the list threw away a correct
+            # one further down.
+            #
+            # The same artist guard applies here. It is not redundant with the 0.60
+            # gate: this tree's score_similarity has a title-trust bypass, so a hit
+            # whose title matches ours exactly clears the gate even when the artist
+            # is a stranger -- measured, ('Greatest Hits', ['Various Artists']) vs
+            # ('Greatest Hits', 'Queen & David Bowie') scores 0.714. Embedding that
+            # cover is the exact failure this whole routine exists to prevent.
+            if scored_fallback is None and _album_titles_match(our_album, hit_album) \
+                    and _artist_plausible(track.artists, hit_artist) \
+                    and _score_similarity(search_title, track.artists, hit_title, hit_artist) >= 0.60:
+                scored_fallback = art
+
+        if scored_fallback:
+            url = _re.sub(r"\d+x\d+bb", "3000x3000bb", scored_fallback)
+            track.artwork_url = url
+            out["artwork_url"] = url
+            logger.debug("[MetaEnrich] Art upgraded to iTunes 3000px: %s", title)
     except Exception as e:
         logger.debug("[MetaEnrich] Art upgrade (iTunes) failed: %s", e)
 
@@ -764,6 +838,45 @@ def _upgrade_artwork(track: "TrackMetadata", out: dict[str, Any]) -> None:
 
 def _is_spotify_art(url: str) -> bool:
     return "i.scdn.co" in url if url else False
+
+
+def _artist_plausible(our_artists: Optional[list], candidate_artist: Optional[str]) -> bool:
+    """Is `candidate_artist` plausibly the same act as ours?
+
+    Album-first artwork selection deliberately drops the composite score gate,
+    because score_similarity matches each of OUR artists against the result's
+    COMBINED artist string and therefore under-scores correct multi-artist hits.
+    Dropping it entirely is unsafe for generically-titled releases though:
+    measured live, an album literally called "Greatest Hits" album-matches every
+    hit in the response, and the first was a different artist's compilation at
+    composite score 0.233. This is the narrow guard that keeps that out -- it
+    asks only "same act?", never "same recording?", so it cannot reintroduce the
+    multi-artist weakness the album-first rule exists to route around.
+
+    Unknown on either side returns True, matching _album_titles_match's
+    convention in this module: absent evidence is not contrary evidence.
+    """
+    try:
+        from antra.utils.matching import normalize, string_similarity
+    except Exception:
+        return True
+
+    cand = normalize(candidate_artist or "")
+    ours = [normalize(a or "") for a in (our_artists or [])]
+    ours = [a for a in ours if a]
+    if not cand or not ours:
+        return True
+
+    for a in ours:
+        # Whole-word containment in either direction. Word boundaries matter:
+        # a bare substring test lets a very short act name match almost anything.
+        if _re.search(r"\b" + _re.escape(a) + r"\b", cand):
+            return True
+        if _re.search(r"\b" + _re.escape(cand) + r"\b", a):
+            return True
+        if string_similarity(a, cand) >= 0.60:
+            return True
+    return False
 
 
 def _album_titles_match(current_album: Optional[str], candidate_album: Optional[str]) -> bool:

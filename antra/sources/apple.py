@@ -16,12 +16,22 @@ from mutagen import File as MutagenFile
 
 from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
+from antra.utils.cenc import decrypt_cenc_ctr_inplace
 from antra.sources.odesli import OdesliEnricher
 from antra.core.apple_fetcher import AppleFetcher
+from antra.utils.mirror_http import (
+    TlsFallbackSession, ensure_complete_transfer, has_http_status, humanize_network_error,
+)
 from antra.utils.matching import score_similarity
 
 logger = logging.getLogger(__name__)
 
+
+# iTunes/mirror text-search ceiling. Was 10s; measured 7.25s and 14.53s from a
+# HEALTHY mirror, so legitimate answers were being abandoned mid-rotation - the
+# same lesson already recorded for Qobuz: a client timeout under the server's
+# own budget aborts a valid rotation and looks like 'no match'.
+_APPLE_SEARCH_TIMEOUT = int(os.environ.get("ANTRA_APPLE_SEARCH_TIMEOUT", "30"))
 
 class _DirectAppleClient:
     """
@@ -165,7 +175,7 @@ class _DirectAppleClient:
                 "User-Agent": "iTunes/12.13.0 (Windows; Microsoft Windows 11 x64) AppleWebKit/7614.5.9.1.9",
                 "Accept": "application/json",
             },
-            timeout=10,
+            timeout=_APPLE_SEARCH_TIMEOUT,
         )
         if not r.ok:
             return None
@@ -178,8 +188,8 @@ class _DirectAppleClient:
         artist_lower = artist.lower()
 
         def _score(song: dict) -> int:
-            song_title = song.get("trackName", "").lower()
-            song_artist = song.get("artistName", "").lower()
+            song_title = (song.get("trackName") or "").lower()
+            song_artist = (song.get("artistName") or "").lower()
             score = 0
             if title_lower == song_title:
                 score += 3
@@ -521,6 +531,14 @@ class AppleAdapter(BaseSourceAdapter):
     # has wrapper (lossless) available.  Default True = skip in lossless mode
     # until we confirm the mirror can serve ALAC.
     always_lossy = True
+    # Read by SourceResolver._serves_native_lossy(). always_lossy answers
+    # "can this adapter ONLY do lossy", which _probe_wrapper_availability()
+    # flips to False whenever the FairPlay wrapper is reachable - so a HEALTHY
+    # Apple stopped counting as a native AAC source. This states the capability
+    # declaratively instead, and the probe must never mutate it. Scoped to the
+    # AAC family on purpose: preferring Apple for an MP3 request would mean an
+    # AAC->MP3 re-encode, which is the generation loss FEAT-2 exists to prevent.
+    native_lossy_formats = frozenset({"aac", "m4a"})
 
     def __init__(
         self,
@@ -533,13 +551,21 @@ class AppleAdapter(BaseSourceAdapter):
         storefront: str = "us",
         wvd_path: str = "",
     ):
-        self._session = requests.Session()
+        # Issue #72 - this was the one mirror adapter still on a plain
+        # requests.Session, so a TLS failure against apple.anandserver.cfd
+        # reached the user as a raw
+        # "SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER] ...'))" blob with
+        # no retry, while Tidal/Qobuz/Deezer/Amazon all retried over curl_cffi
+        # and said something readable. Same treatment, same class.
+        self._session = TlsFallbackSession("Apple")
         self._session.trust_env = False
         self._session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
         })
         self._preferred_output_format = (preferred_output_format or "source").lower()
-        self._prefer_lossy_download = self._preferred_output_format in {"aac", "mp3", "m4a"}
+        # Only AAC jobs take Apple's native AAC. For MP3, AAC would be a lossy -> lossy re-encode
+        # (FEAT-2 then left an .m4a in an MP3 job); the ALAC master is transcoded once instead.
+        self._prefer_lossy_download = self._preferred_output_format in {"aac", "m4a"}
         self._atmos_requested = self._preferred_output_format == "atmos-apple"
         self._require_lossless_download = self._preferred_output_format in {
             "flac", "lossless", "alac",
@@ -647,7 +673,7 @@ class AppleAdapter(BaseSourceAdapter):
                 "User-Agent": "iTunes/12.13.0 (Windows; Microsoft Windows 11 x64) AppleWebKit/7614.5.9.1.9",
                 "Accept": "application/json",
             },
-            timeout=10,
+            timeout=_APPLE_SEARCH_TIMEOUT,
         )
         if not r.ok:
             return None
@@ -759,7 +785,9 @@ class AppleAdapter(BaseSourceAdapter):
         # only tell us "lossless" vs "hi-res-lossless", while the proxy can
         # return the concrete bit depth / sample rate that the desktop UI should
         # show before the actual download begins.
+        isrc_mirror_tried = False  # the identical lookup below must not be sent twice
         if track.isrc and self._mirrors and not self._prefer_lossy_download:
+            isrc_mirror_tried = True
             try:
                 mirror = self._get_working_mirror()
                 r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=10)
@@ -770,7 +798,10 @@ class AppleAdapter(BaseSourceAdapter):
                         apple_id = proxy_track_id
                     if not apple_id or not proxy_track_id or proxy_track_id == str(apple_id):
                         bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
-                        isrc_match = True
+                        # Earned only by an actual id: an empty 200 must not leave
+                        # a later text-search hit flagged as an ISRC match.
+                        if apple_id:
+                            isrc_match = True
                         logger.info(
                             f"[Apple] Enriched {track.isrc} with proxy quality metadata "
                             f"for Apple Music ID {apple_id or proxy_track_id}"
@@ -800,7 +831,7 @@ class AppleAdapter(BaseSourceAdapter):
                 logger.warning(f"[Apple-Direct] ISRC search failed: {e}")
 
         # Try exact match using ISRC via API proxy
-        if not apple_id and track.isrc:
+        if not apple_id and track.isrc and not isrc_mirror_tried:
             try:
                 mirror = self._get_working_mirror()
                 r = self._api_get(f"{mirror}/api/search/isrc/{track.isrc}", timeout=10)
@@ -808,7 +839,8 @@ class AppleAdapter(BaseSourceAdapter):
                     data = r.json()
                     apple_id = data.get("track_id")
                     bit_depth, sample_rate = self._coerce_lossless_metadata(data, bit_depth, sample_rate)
-                    isrc_match = True
+                    if apple_id:
+                        isrc_match = True
                     logger.info(f"[Apple] Resolved {track.isrc} → Apple Music ID: {apple_id}")
                 else:
                     logger.warning(f"[Apple] ISRC mirror lookup HTTP {r.status_code} for {track.isrc}")
@@ -1049,6 +1081,8 @@ class AppleAdapter(BaseSourceAdapter):
                     params={"format": "atmos"} if _atmos else None,
                     timeout=300, stream=True,
                 )
+                if resp.status_code != 200:
+                    resp.close()   # stream=True: an unread body would otherwise hold the connection
                 if resp.status_code == 200:
                     # Atmos MUST be written to .mp4, never .m4a — ffmpeg's `ipod`
                     # muxer refuses EC-3/AC-4. Documented in OPERATIONS.md §6 and
@@ -1063,10 +1097,15 @@ class AppleAdapter(BaseSourceAdapter):
                     # MAX_PATH and break a download that would otherwise succeed.
                     _part_path = output_path + ".part"
                     try:
+                        _written = 0
                         with open(_part_path, "wb") as f:
                             for chunk in resp.iter_content(131072):
                                 if chunk:
+                                    _written += len(chunk)
                                     f.write(chunk)
+                        # The atomic rename only guards against an exception; a stream
+                        # that simply ends early would still be accepted without this.
+                        ensure_complete_transfer(resp, _written, "Apple")
                         os.replace(_part_path, final_path)
                     except BaseException:
                         try:
@@ -1074,6 +1113,8 @@ class AppleAdapter(BaseSourceAdapter):
                         except OSError:
                             pass
                         raise
+                    finally:
+                        resp.close()
 
                     # Update result metadata from response headers
                     codec       = resp.headers.get("X-Codec", "alac").lower()
@@ -1107,6 +1148,13 @@ class AppleAdapter(BaseSourceAdapter):
                         "[Apple] /api/stream/ returned 503 (wrapper unavailable) — "
                         "falling back to /api/track/ lossless path"
                     )
+                elif resp.status_code == 404 and _atmos:
+                    # /api/track/ has no Atmos rendition, so falling through would only
+                    # end in a bare "API error 404". Say what actually happened.
+                    raise RuntimeError(
+                        f"[Apple] No Dolby Atmos stream available for track {track_id} "
+                        "(track has no Atmos mix, or the Apple ID is not a catalog ID)"
+                    )
                 elif resp.status_code == 404:
                     # Wrapper doesn't have this track — /api/track/ may still serve it
                     logger.info(
@@ -1121,6 +1169,8 @@ class AppleAdapter(BaseSourceAdapter):
             except RateLimitedError:
                 raise
             except Exception as e:
+                if self._requires_atmos() and "No Dolby Atmos stream" in str(e):
+                    raise
                 logger.warning(
                     "[Apple] wrapper stream failed (%s) — falling back to /api/track/ path", e
                 )
@@ -1151,7 +1201,7 @@ class AppleAdapter(BaseSourceAdapter):
             except Exception as e:
                 err = str(e)
                 logger.warning(f"[Apple-Direct] Direct auth failed: {err}")
-                if "401" in err or "expired" in err.lower():
+                if has_http_status(err, 401) or "expired" in err.lower():
                     raise RuntimeError(
                         f"[Apple-Direct] Credentials expired — re-extract from music.apple.com: {err}"
                     )
@@ -1240,12 +1290,23 @@ class AppleAdapter(BaseSourceAdapter):
 
         if saw_rate_limit:
             raise RateLimitedError(last_error or "[Apple] Rate limited")
+        # Issue #72 - a network failure is reported in the user's own words
+        # rather than as "All mirrors failed. Last error: <SSL blob>", which
+        # reads like a server outage and is exactly the wrong conclusion.
+        # humanize_network_error returns its input unchanged for anything it
+        # does not recognise, so a genuine API error is untouched.
+        if last_error:
+            humanized = humanize_network_error(str(last_error), "Apple")
+            if humanized != str(last_error):
+                raise RuntimeError(humanized)
         raise RuntimeError(f"[Apple] All mirrors failed. Last error: {last_error}")
 
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
         if isinstance(error, RateLimitedError):
             return False
-        if "404" in str(error):
+        # Standalone "404" only: Apple track ids are 9-10 digits, so a substring test
+        # also matched any id containing 404 and suppressed the retry.
+        if has_http_status(str(error), 404):
             return False
         return True
 
@@ -1274,21 +1335,30 @@ class AppleAdapter(BaseSourceAdapter):
         # so fall back to Python segment-by-segment download + AES-CTR decryption
         # on any input-open failure, not just missing -decryption_key option.
         logger.debug("[Apple] Attempting download via ffmpeg -decryption_key...")
-        result = subprocess.run(
-            [
-                ffmpeg, "-y",
-                "-decryption_key", decryption_key_hex.strip(),
-                "-allowed_extensions", "ALL",
-                "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-                "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nAccept: */*\r\n",
-                "-i", variant_url,
-                "-c", "copy",
-                final_path,
-            ],
-            capture_output=True,
-            timeout=300,
-            **_SUBPROCESS_FLAGS,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg, "-y",
+                    "-decryption_key", decryption_key_hex.strip(),
+                    "-allowed_extensions", "ALL",
+                    "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+                    "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nAccept: */*\r\n",
+                    "-i", variant_url,
+                    "-c", "copy",
+                    final_path,
+                ],
+                capture_output=True,
+                timeout=300,
+                **_SUBPROCESS_FLAGS,
+            )
+        except subprocess.TimeoutExpired:
+            # A slow CDN link used to surface as a raw TimeoutExpired and leave the
+            # half-written file under the real name.
+            try:
+                os.remove(final_path)
+            except OSError:
+                pass
+            raise RuntimeError("[Apple] ffmpeg timed out after 300s downloading the stream") from None
 
         if result.returncode == 0:
             self._validate_downloaded_file(final_path, expected_codec=expected_codec)
@@ -1328,7 +1398,9 @@ class AppleAdapter(BaseSourceAdapter):
         resp = self._api_get(m3u8_url, timeout=15)
         resp.raise_for_status()
         content = resp.text
-        base = m3u8_url.rsplit("/", 1)[0] + "/"
+        # urljoin against the playlist URL itself: slicing at the last "/" broke when a
+        # query string contained one, and urljoin also drops the query like a browser.
+        base = m3u8_url
 
         # Parse M3U8 — collect init info and segment URLs with optional BYTERANGE
         init_url: Optional[str] = None
@@ -1376,28 +1448,36 @@ class AppleAdapter(BaseSourceAdapter):
                 logger.debug(f"[Apple] BYTERANGE playlist — downloading full MP4 from {mp4_url}")
                 r = self._session.get(mp4_url, timeout=300)
                 r.raise_for_status()
+                ensure_complete_transfer(r, len(r.content), "Apple")
                 with open(enc_path, "wb") as f:
                     f.write(r.content)
             else:
                 # Standard HLS: download init + individual segments and concatenate.
                 logger.debug(f"[Apple] Downloading {len(seg_entries)} segments + init via Python...")
+
+                def _get_part(url, byterange, timeout):
+                    hdr = {}
+                    if byterange:
+                        ln, off = byterange
+                        hdr["Range"] = f"bytes={off}-{off+ln-1}"
+                    r = self._session.get(url, headers=hdr, timeout=timeout)
+                    r.raise_for_status()
+                    data = r.content
+                    # A server that ignores Range answers 200 with the WHOLE file; writing
+                    # that once per segment produced a corrupt, enormous stream.
+                    if byterange and len(data) != byterange[0]:
+                        raise RuntimeError(
+                            f"[Apple] Range request returned {len(data)} bytes, expected "
+                            f"{byterange[0]} (the server ignored the Range header)"
+                        )
+                    ensure_complete_transfer(r, len(data), "Apple")
+                    return data
+
                 with open(enc_path, "wb") as f:
                     if init_url:
-                        hdr = {}
-                        if init_byterange:
-                            ln, off = init_byterange
-                            hdr["Range"] = f"bytes={off}-{off+ln-1}"
-                        r = self._session.get(init_url, headers=hdr, timeout=30)
-                        r.raise_for_status()
-                        f.write(r.content)
+                        f.write(_get_part(init_url, init_byterange, 30))
                     for seg_url, byterange in seg_entries:
-                        hdr = {}
-                        if byterange:
-                            ln, off = byterange
-                            hdr["Range"] = f"bytes={off}-{off+ln-1}"
-                        r = self._session.get(seg_url, headers=hdr, timeout=60)
-                        r.raise_for_status()
-                        f.write(r.content)
+                        f.write(_get_part(seg_url, byterange, 60))
 
             err = self._decrypt_cenc_python(enc_path, final_path, key_hex)
             if err:
@@ -1410,17 +1490,78 @@ class AppleAdapter(BaseSourceAdapter):
         return final_path
 
     @staticmethod
+    def _iter_sample_entries(raw):
+        """Yield (offset, size, fourcc) for each entry in the first stsd box."""
+        i = raw.find(b"stsd")
+        if i < 0:
+            return
+        try:
+            n = struct.unpack_from(">I", bytes(raw), i + 8)[0]
+        except Exception:
+            return
+        off = i + 12
+        # stsd never legitimately carries many entries; bound it so a malformed
+        # box cannot walk us off into mdat.
+        for _ in range(min(n, 8)):
+            if off + 8 > len(raw):
+                return
+            try:
+                esz = struct.unpack_from(">I", bytes(raw), off)[0]
+            except Exception:
+                return
+            if esz < 8 or off + esz > len(raw):
+                return
+            yield off, esz, bytes(raw[off + 4:off + 8])
+            off += esz
+
+    @staticmethod
+    def _cenc_scheme_of(raw):
+        """Encryption scheme from sinf/schm, e.g. b'cenc' (CTR) or b'cbcs' (CBC).
+
+        Returns None when no schm box is present.
+        """
+        for off, esz, _fourcc in AppleAdapter._iter_sample_entries(raw):
+            body = bytes(raw[off:off + esz])
+            k = body.find(b"schm")
+            if k >= 0 and k + 12 <= len(body):
+                return body[k + 8:k + 12]
+        return None
+
+    @staticmethod
+    def _retype_sample_entries(raw) -> int:
+        """Point each encrypted sample entry at its real codec and disarm sinf.
+
+        The original codec is recorded in sinf/frma. Renaming sinf -> free keeps
+        every parent box size intact (no offset arithmetic) while making players
+        skip the now-meaningless protection box; leaving it in place makes ffmpeg
+        refuse the file with "schm boxes are only supported in first sample
+        descriptor" once more than one entry is present.
+        """
+        patched = 0
+        for off, esz, fourcc in AppleAdapter._iter_sample_entries(raw):
+            if fourcc not in (b"enca", b"encv"):
+                continue
+            body = bytes(raw[off:off + esz])
+            k = body.find(b"frma")
+            orig_fmt = body[k + 4:k + 8] if k >= 0 else b""
+            if orig_fmt not in (b"alac", b"mp4a"):
+                # Historical default: Apple served AAC for every flavor.
+                orig_fmt = b"mp4a"
+            raw[off + 4:off + 8] = orig_fmt
+            si = body.find(b"sinf")
+            if si >= 0:
+                raw[off + si:off + si + 4] = b"free"
+            patched += 1
+        return patched
+
+    @staticmethod
     def _decrypt_cenc_python(input_path: str, output_path: str, key_hex: str) -> Optional[str]:
         """
         Pure-Python AES-CTR CENC decryption for CMAF/fMP4 streams.
-        Handles fragmented MP4 as produced by Apple Music HLS.
-        Returns None on success, or an error string on failure.
+        Handles fragmented MP4 as produced by Apple Music HLS. The parser is shared
+        with the Amazon adapter (antra/utils/cenc.py).
+        Returns None on success, or an error string; never raises on a malformed stream.
         """
-        try:
-            from Cryptodome.Cipher import AES
-        except ImportError:
-            return "Cryptodome not available — run: pip install pycryptodomex"
-
         try:
             key = bytes.fromhex(key_hex.strip())
         except Exception as e:
@@ -1428,93 +1569,11 @@ class AppleAdapter(BaseSourceAdapter):
         if len(key) not in (16, 24, 32):
             return f"Key must be 16/24/32 bytes, got {len(key)}"
 
-        def read_box(d, pos):
-            if pos + 8 > len(d):
-                return None
-            sz = struct.unpack_from(">I", d, pos)[0]
-            bt = d[pos + 4:pos + 8].decode("latin-1", errors="replace")
-            if sz == 1:
-                if pos + 16 > len(d):
-                    return None
-                sz = struct.unpack_from(">Q", d, pos + 8)[0]
-                return sz, bt, 16
-            if sz < 8:
-                return None
-            return sz, bt, 8
-
-        def find_first(d, name):
-            pos = 0
-            while pos < len(d):
-                r = read_box(d, pos)
-                if r is None:
-                    break
-                sz, bt, hs = r
-                if bt == name:
-                    return d[pos + hs:pos + sz]
-                pos += sz
-            return None
-
-        def parse_senc(d):
-            if len(d) < 8:
-                return 8, []
-            flags = struct.unpack_from(">I", d, 0)[0] & 0xFFFFFF
-            iv_size = 8
-            off = 4
-            if flags & 1:
-                if off + 20 > len(d):
-                    return 8, []
-                iv_size = d[off + 3]
-                off += 20
-            cnt = struct.unpack_from(">I", d, off)[0]
-            off += 4
-            result = []
-            for _ in range(cnt):
-                if off + iv_size > len(d):
-                    break
-                iv = bytes(d[off:off + iv_size])
-                off += iv_size
-                subs = None
-                if flags & 2:
-                    if off + 2 > len(d):
-                        break
-                    sc = struct.unpack_from(">H", d, off)[0]
-                    off += 2
-                    subs = []
-                    for _ in range(sc):
-                        if off + 6 > len(d):
-                            break
-                        subs.append((struct.unpack_from(">H", d, off)[0],
-                                     struct.unpack_from(">I", d, off + 2)[0]))
-                        off += 6
-                result.append((iv, subs))
-            return iv_size, result
-
-        def parse_trun(d):
-            if len(d) < 8:
-                return None, []
-            flags = struct.unpack_from(">I", d, 0)[0] & 0xFFFFFF
-            cnt = struct.unpack_from(">I", d, 4)[0]
-            off = 8
-            doff = None
-            if flags & 0x001:
-                doff = struct.unpack_from(">i", d, off)[0]
-                off += 4
-            if flags & 0x004:
-                off += 4
-            sizes = []
-            for _ in range(cnt):
-                sz = 0
-                if flags & 0x100:
-                    off += 4
-                if flags & 0x200:
-                    sz = struct.unpack_from(">I", d, off)[0]
-                    off += 4
-                if flags & 0x400:
-                    off += 4
-                if flags & 0x800:
-                    off += 4
-                sizes.append(sz)
-            return doff, sizes
+        # NOTE: this routine is AES-CTR only. Apple's lossless (highResLossless)
+        # HLS uses the 'cbcs' scheme -- AES-CBC with pattern encryption -- and
+        # decrypting it with CTR yields audio that parses but is pure noise.
+        # Refuse it loudly rather than writing a corrupt file.
+        _UNSUPPORTED_SCHEMES = {b"cbcs", b"cbc1", b"cens"}
 
         try:
             with open(input_path, "rb") as f:
@@ -1522,65 +1581,26 @@ class AppleAdapter(BaseSourceAdapter):
         except Exception as e:
             return f"Cannot read encrypted file: {e}"
 
-        pos, n, changed = 0, len(raw), 0
-        while pos < n:
-            r = read_box(raw, pos)
-            if r is None:
-                break
-            moof_sz, bt, moof_hs = r
-            if bt != "moof":
-                pos += moof_sz
-                continue
-            moof_start = pos
-            moof_end = pos + moof_sz
-            traf = find_first(raw[pos + moof_hs:moof_end], "traf")
-            if traf is None:
-                pos = moof_end
-                continue
-            senc_raw = find_first(traf, "senc")
-            trun_raw = find_first(traf, "trun")
-            if senc_raw is None or trun_raw is None:
-                pos = moof_end
-                continue
-            _, samples = parse_senc(senc_raw)
-            doff, sizes = parse_trun(trun_raw)
-            mr = read_box(raw, moof_end)
-            if mr is None or mr[1] != "mdat":
-                pos = moof_end
-                continue
-            mdat_sz, _, mdat_hs = mr
-            sample_pos = (moof_start + doff) if doff is not None else (moof_end + mdat_hs)
-            for idx, (iv, subs) in enumerate(samples):
-                s_sz = sizes[idx] if idx < len(sizes) else 0
-                if s_sz == 0:
-                    continue
-                iv16 = iv.ljust(16, b"\x00")
-                cipher = AES.new(key, AES.MODE_CTR, initial_value=iv16, nonce=b"")
-                if subs:
-                    cur = sample_pos
-                    for clear, enc in subs:
-                        cur += clear
-                        if enc > 0:
-                            raw[cur:cur + enc] = cipher.decrypt(bytes(raw[cur:cur + enc]))
-                        cur += enc
-                else:
-                    raw[sample_pos:sample_pos + s_sz] = cipher.decrypt(
-                        bytes(raw[sample_pos:sample_pos + s_sz])
-                    )
-                sample_pos += s_sz
-                changed += 1
-            pos = moof_end + mdat_sz
+        scheme = AppleAdapter._cenc_scheme_of(raw)
+        if scheme in _UNSUPPORTED_SCHEMES:
+            # Decrypting cbcs with a CTR cipher yields a file that parses fine and
+            # sounds like noise, so this must fail rather than fall through.
+            return (
+                "Apple lossless stream uses "
+                f"{scheme.decode('latin-1')} encryption, which this fallback path "
+                "cannot decrypt (it is AES-CTR only). The wrapper is the supported "
+                "path for Apple lossless - it was unavailable for this request."
+            )
 
-        if not changed:
-            return "No CENC samples found — file may not be fragmented MP4 or is not CENC-encrypted"
+        err = decrypt_cenc_ctr_inplace(raw, key)
+        if err:
+            return err
 
-        # Patch enca → mp4a in the stsd box so the container reports the correct codec.
-        # After CENC decryption the sample data is plain AAC, but the stsd still says
-        # 'enca' (encrypted audio). Replace the first occurrence of b'enca' with b'mp4a'
-        # so players and mutagen can identify the codec correctly.
-        enca_idx = raw.find(b"enca")
-        if enca_idx >= 0:
-            raw[enca_idx:enca_idx + 4] = b"mp4a"
+        # Point every encrypted sample entry at the codec recorded in its own
+        # sinf/frma box. The previous code hardcoded b'mp4a' on the FIRST entry
+        # only, which mislabelled genuine ALAC as AAC (ffmpeg then ran the AAC
+        # decoder over ALAC data) and left any second entry as 'enca'.
+        AppleAdapter._retype_sample_entries(raw)
 
         try:
             with open(output_path, "wb") as f:
@@ -1589,7 +1609,6 @@ class AppleAdapter(BaseSourceAdapter):
             return f"Cannot write decrypted file: {e}"
 
         return None
-
     @staticmethod
     def _rewrite_hls_playlist(
         m3u8_content: str,

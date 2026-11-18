@@ -47,6 +47,9 @@ class TidalMirrorAdapter(BaseSourceAdapter):
     """
 
     name = "tidal_mirror"
+    # Read by SourceResolver._serves_native_lossy(). Measured 2026-08-26:
+    # Tidal audioquality=HIGH is AAC-LC 320023 bps, vs Apple's 264898.
+    native_lossy_formats = frozenset({"aac", "m4a"})
     priority = 1  # Highest — 24-bit HiRes FLAC
 
     def __init__(self, mirror_url: str, api_key: str = "", preferred_output_format: str = "source"):
@@ -79,6 +82,35 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             return False
         return self._preferred_output_format in {"lossless-16", "alac-16"}
 
+    def _requires_aac(self) -> bool:
+        """Caller asked for AAC, so Tidal's HIGH tier is the goal, not a failure."""
+        return self._preferred_output_format in {"aac", "m4a"}
+
+    def _quality_fields(self, bit_depth=None, sample_rate=None) -> dict:
+        """SearchResult quality fields, honest about AAC mode.
+
+        The mirror reports bitDepth=16 for AAC because that is what tidalapi's
+        stream object returns, but bit depth is meaningless for a lossy codec.
+        Passing is_lossless=True / bit_depth=16 through would let the resolver
+        rank Tidal AAC as 16-bit LOSSLESS - the exact failure the two stream
+        guards below exist to prevent.
+        """
+        if self._requires_aac():
+            return {
+                "audio_format": AudioFormat.AAC,
+                "quality_kbps": 320,
+                "is_lossless": False,
+                "bit_depth": None,
+                "sample_rate_hz": sample_rate,
+            }
+        return {
+            "audio_format": AudioFormat.FLAC,
+            "quality_kbps": None,
+            "is_lossless": True,
+            "bit_depth": bit_depth,
+            "sample_rate_hz": sample_rate,
+        }
+
     def _requires_atmos(self) -> bool:
         return self._preferred_output_format == "atmos-tidal"
 
@@ -94,8 +126,14 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             return {"format": "atmos"}
         if self._requires_strict_24bit():
             return {"strict_24": "1"}
-        if self._requires_16bit():
+        # MP3 output only needs a 16-bit master: asking for the default (24-bit) tier
+        # downloads a file ~2x larger just to throw the extra bits away in the encode.
+        if self._requires_16bit() or self._preferred_output_format == "mp3":
             return {"prefer_16": "1"}
+        if self._requires_aac():
+            # Same early-return chain as strict_24 / prefer_16, so the three
+            # are mutually exclusive by construction.
+            return {"prefer_aac": "1"}
         if getattr(_quality_fallback_tls, "current_fallback", False):
             return {"require_lossless": "1"}
         return None
@@ -128,7 +166,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         if cache_key in self._album_id_cache:
             return
         try:
-            r = self._session.get(f"{self._base}/api/meta/track/{track_id}", timeout=10)
+            r = self._session.get(f"{self._base}/api/meta/track/{track_id}", timeout=20)
             if r.status_code != 200:
                 return
             data = r.json()
@@ -148,7 +186,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         tracks = self._album_track_cache.get(album_id)
         if tracks is None:
             try:
-                r = self._session.get(f"{self._base}/api/album/{album_id}", timeout=10)
+                r = self._session.get(f"{self._base}/api/album/{album_id}", timeout=20)
                 if r.status_code != 200:
                     return None
                 tracks = r.json().get("tracks") or []
@@ -192,11 +230,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             artists=best_item.get("artists") or [],
             album=track.album,
             duration_ms=best_item.get("duration_ms"),
-            audio_format=AudioFormat.FLAC,
-            quality_kbps=None,
-            is_lossless=True,
-            bit_depth=None,
-            sample_rate_hz=None,
+            **self._quality_fields(),
             download_url=None,
             stream_id=str(best_item["track_id"]),
             similarity_score=min(best_score, 0.99),
@@ -245,11 +279,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 artists=track.artists,
                 album=track.album,
                 duration_ms=track.duration_ms,
-                audio_format=AudioFormat.FLAC,
-                quality_kbps=None,
-                is_lossless=True,
-                bit_depth=None,
-                sample_rate_hz=None,
+                **self._quality_fields(),
                 download_url=None,
                 stream_id=track.tidal_track_id,
                 similarity_score=1.0,
@@ -305,11 +335,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                         artists=track.artists,
                         album=track.album,
                         duration_ms=track.duration_ms,
-                        audio_format=AudioFormat.FLAC,
-                        quality_kbps=None,
-                        is_lossless=True,
-                        bit_depth=None,
-                        sample_rate_hz=None,
+                        **self._quality_fields(),
                         download_url=None,
                         stream_id=str(tidal_id),
                         similarity_score=0.90,
@@ -348,22 +374,29 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 continue
 
             for item in items:
-                artist = (item.get("artist") or {}).get("name", "")
-                score = score_similarity(
-                    query_title=track.title,
-                    query_artists=track.artists,
-                    result_title=item.get("title", ""),
-                    result_artist=artist,
-                )
-                dur = item.get("duration")
-                if dur and track.duration_seconds:
-                    if self._has_severe_duration_mismatch(track.duration_ms, int(dur * 1000)):
-                        continue
-                    if not duration_close(track.duration_seconds, dur, tolerance=5):
-                        score *= 0.8
-                if score > best_score:
-                    best_score = score
-                    best = self._item_to_result(item, score)
+                # One malformed catalogue item (missing id, non-numeric duration) must skip
+                # that item, not abort the search for the track.
+                try:
+                    artist = (item.get("artist") or {}).get("name", "")
+                    score = score_similarity(
+                        query_title=track.title,
+                        query_artists=track.artists,
+                        result_title=item.get("title", ""),
+                        result_artist=artist,
+                    )
+                    dur = item.get("duration")
+                    if dur and track.duration_seconds:
+                        if self._has_severe_duration_mismatch(track.duration_ms, int(dur * 1000)):
+                            continue
+                        if not duration_close(track.duration_seconds, dur, tolerance=5):
+                            score *= 0.8
+                    if score > best_score:
+                        candidate = self._item_to_result(item, score)
+                        best_score = score
+                        best = candidate
+                except (AttributeError, KeyError, TypeError, ValueError) as e:
+                    logger.debug("[TidalMirror] Skipping malformed search item: %s", e)
+                    continue
 
         if best and best_score >= MIN_SIMILARITY:
             return best
@@ -378,7 +411,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         try:
             r = self._session.get(
                 f"{self._base}/api/search/isrc/{isrc}",
-                timeout=10,
+                timeout=35,
             )
             if r.status_code == 429:
                 raise RateLimitedError("Tidal mirror rate limited (429)")
@@ -404,7 +437,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             if result.duration_ms is None and track.duration_ms and result.stream_id:
                 try:
                     mr = self._session.get(
-                        f"{self._base}/api/meta/track/{result.stream_id}", timeout=10
+                        f"{self._base}/api/meta/track/{result.stream_id}", timeout=20
                     )
                     if mr.status_code == 200:
                         secs = (mr.json() or {}).get("duration")
@@ -470,7 +503,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         isrc = (track.isrc or "").strip()
         if not isrc:
             try:
-                r = self._session.get(f"{self._base}/api/meta/track/{tidal_id}", timeout=10)
+                r = self._session.get(f"{self._base}/api/meta/track/{tidal_id}", timeout=20)
                 if r.status_code == 200:
                     isrc = (r.json().get("isrc") or "").strip()
             except Exception as e:
@@ -510,11 +543,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             artists=[data.get("artist", "")],
             album=data.get("album", ""),
             duration_ms=data.get("duration_ms"),
-            audio_format=AudioFormat.FLAC,
-            quality_kbps=None,
-            is_lossless=True,
-            bit_depth=bit_depth,
-            sample_rate_hz=sample_rate,
+            **self._quality_fields(bit_depth, sample_rate),
             download_url=None,
             stream_id=str(data["track_id"]),
             similarity_score=1.0 if isrc_match else 0.85,
@@ -548,11 +577,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
             artists=[artist] if artist else [],
             album=(item.get("album") or {}).get("title"),
             duration_ms=int(item["duration"] * 1000) if item.get("duration") else None,
-            audio_format=AudioFormat.FLAC,
-            quality_kbps=None,
-            is_lossless=True,
-            bit_depth=bit_depth,
-            sample_rate_hz=sample_rate,
+            **self._quality_fields(bit_depth, sample_rate),
             download_url=None,
             stream_id=str(item["id"]),
             similarity_score=score,
@@ -620,14 +645,19 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 # should_retry_download() retries the SAME known track_id so the server
                 # picks a different proven-lossless session. This matches Antra-Web,
                 # which is exactly why the website succeeds where desktop currently fails.
-                if stream_quality == "HIGH":
+                # In AAC mode HIGH is the goal, so this guard is skipped -
+                # and ONLY then.
+                if stream_quality == "HIGH" and not self._requires_aac():
                     r.close()
                     raise RuntimeError(
                         f"[TidalMirror] Track {track_id} returned HIGH (lossy AAC) — retrying"
                     )
                 # Reject AAC-in-disguise (codec mp4a/aac despite a LOSSLESS label) so we
                 # don't remux a fake-lossless AAC master into a FLAC container.
-                if "mp4a" in stream_codec or ("aac" in stream_codec and "flac" not in stream_codec):
+                if (not self._requires_aac()) and (
+                    "mp4a" in stream_codec
+                    or ("aac" in stream_codec and "flac" not in stream_codec)
+                ):
                     r.close()
                     raise RuntimeError(
                         f"[TidalMirror] Track {track_id} codec is AAC despite LOSSLESS label — "
@@ -681,7 +711,10 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 # Tidal wraps FLAC in an M4A container (ISO Base Media / ftyp)
                 # even when the codec header says "flac". Detect by magic bytes
                 # and remux to a real FLAC file regardless of the reported extension.
-                if self._is_m4a_by_magic(final_path):
+                # AAC is legitimately in an M4A container, so this is true for
+                # it; remuxing would manufacture the fake-lossless file the
+                # guard above exists to reject.
+                if self._is_m4a_by_magic(final_path) and not self._requires_aac():
                     import tempfile, shutil
                     tmp = final_path + ".tmp.m4a"
                     shutil.move(final_path, tmp)
@@ -700,7 +733,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                             except OSError:
                                 pass
                         raise
-                elif ext == ".m4a":
+                elif ext == ".m4a" and not self._requires_aac():
                     flac_path = output_path + ".flac"
                     if self._remux_m4a_to_flac(final_path, flac_path):
                         os.remove(final_path)
@@ -771,7 +804,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                     if chunk:
                         f.write(chunk)
         # Remux M4A→FLAC if needed (Tidal wraps FLAC in M4A container)
-        if ext == ".m4a":
+        if ext == ".m4a" and not self._requires_aac():
             flac_path = output_base + ".flac"
             if self._remux_m4a_to_flac(final_path, flac_path):
                 os.remove(final_path)
@@ -813,7 +846,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                     for seg in segs:
                         with open(seg, "rb") as f:
                             out.write(f.read())
-            if ext == ".m4a":
+            if ext == ".m4a" and not self._requires_aac():
                 flac_path = output_base + ".flac"
                 if self._remux_m4a_to_flac(final_path, flac_path):
                     os.remove(final_path)

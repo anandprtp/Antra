@@ -18,6 +18,12 @@ class EngineEventType(Enum):
     TRACK_DOWNLOAD_ATTEMPT = "track_download_attempt"
     TRACK_COMPLETED = "track_completed"
     TRACK_FAILED = "track_failed"
+    # Job-level advisory shown to the user; carries `message` only.
+    NOTICE = "notice"
+    # issue #75 — files left in a playlist folder that the playlist no longer
+    # contains. Advisory: nothing has been deleted when this fires unless
+    # playlist_prune_orphans is "auto", which the `pruned` flag states.
+    PLAYLIST_ORPHANS = "playlist_orphans"
 
 
 @dataclass
@@ -32,3 +38,8 @@ class EngineEvent:
     attempt: Optional[int] = None
     file_path: Optional[str] = None
     error: Optional[str] = None
+    # TRACK_COMPLETED only: "unsupported" | "failed" when the tags were not written.
+    tags_problem: Optional[str] = None
+    # issue #75 — PLAYLIST_ORPHANS payload.
+    paths: Optional[list[str]] = None
+    pruned: bool = False

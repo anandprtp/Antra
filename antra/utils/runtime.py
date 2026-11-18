@@ -66,6 +66,35 @@ def get_ffprobe_exe() -> Optional[str]:
     return None
 
 
+def get_fpcalc_exe() -> Optional[str]:
+    """Return the absolute path to the Chromaprint `fpcalc` binary, or None.
+
+    Order: explicit ANTRA_FPCALC override, system PATH, then the copy bundled
+    into the PyInstaller backend under `chromaprint/`.  Returning None is a
+    normal outcome -- callers must degrade to skipping the check, never fail a
+    download because the binary is missing.
+    """
+    override = os.environ.get("ANTRA_FPCALC", "").strip()
+    if override and Path(override).is_file():
+        # Absolute: a relative path (or one with forward slashes) is not
+        # resolvable by CreateProcess on Windows.
+        return str(Path(override).resolve())
+    system = shutil.which("fpcalc")
+    if system:
+        return system
+    name = "fpcalc.exe" if os.name == "nt" else "fpcalc"
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        exe = Path(meipass) / "chromaprint" / name
+        if exe.is_file():
+            return str(exe)
+    # Running from source: use the copy vendored for the desktop build.
+    vendored = Path(__file__).resolve().parents[2] / "antra-wails" / "third_party" / "chromaprint" / name
+    if vendored.is_file():
+        return str(vendored.resolve())
+    return None
+
+
 def _is_ephemeral(path: str) -> bool:
     """True when `path` lives inside PyInstaller's _MEIPASS extraction dir.
 

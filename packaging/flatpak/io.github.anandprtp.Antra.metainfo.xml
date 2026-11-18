@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The <release> version and date below are REWRITTEN BY CI from the git tag
+  before the bundle is built (see the "Stage Flatpak inputs" step in
+  .github/workflows/release.yml, which also fails the build if the substitution
+  did not happen). Treat the values committed here as a placeholder that keeps
+  the file valid XML for local builds - never as the shipped version.
+-->
+<component type="desktop-application">
+  <id>io.github.anandprtp.Antra</id>
+
+  <name>Antra</name>
+  <summary>Download lossless music from your streaming library</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <!--
+    Elastic-2.0 is a valid SPDX identifier but is NOT OSI-approved, so AppStream
+    and Flathub both treat Antra as proprietary. This is the single biggest
+    obstacle to a Flathub listing - see packaging/flatpak/README.md.
+  -->
+  <project_license>Elastic-2.0</project_license>
+
+  <developer id="io.github.anandprtp">
+    <name>AntraVerse</name>
+  </developer>
+
+  <launchable type="desktop-id">io.github.anandprtp.Antra.desktop</launchable>
+
+  <description>
+    <p>
+      Antra resolves a Spotify, Apple Music, Tidal, Qobuz, Deezer or Amazon Music
+      link and downloads the best available copy of each track from a prioritised
+      chain of sources, then tags and files it into a library your music player
+      already understands.
+    </p>
+    <ul>
+      <li>Paste an album, playlist, artist or track link and download the whole thing</li>
+      <li>Prefers lossless: FLAC and ALAC up to 24-bit, falling back only when asked to</li>
+      <li>Writes full tags, embedded cover art and synced lyrics</li>
+      <li>Configurable folder structure and filename templates</li>
+      <li>Skips what you already have instead of downloading it twice</li>
+      <li>Built-in audio analyzer with an interactive spectrogram</li>
+      <li>Twelve themes, light and dark, plus theming generated from the cover art</li>
+    </ul>
+  </description>
+
+  <url type="homepage">https://github.com/anandprtp/Antra</url>
+  <url type="bugtracker">https://github.com/anandprtp/Antra/issues</url>
+  <url type="donation">https://patreon.com/AntraVerse</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Downloading an album</caption>
+      <image>https://raw.githubusercontent.com/anandprtp/Antra/main/assets/screenshots/ss_1_v117.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Library and settings</caption>
+      <image>https://raw.githubusercontent.com/anandprtp/Antra/main/assets/screenshots/ss_2_v117.png</image>
+    </screenshot>
+  </screenshots>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.0.0-dev" date="2026-09-09"/>
+  </releases>
+</component>

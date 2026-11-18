@@ -14,9 +14,31 @@ export function CheckSourceHealth(arg1:string):Promise<string>;
 
 export function ClearHistory():Promise<void>;
 
+export function ClearQueue():Promise<void>;
+
 export function ConfirmAmazonLogin():Promise<void>;
 
+export function CustomThemeSeed(arg1:string,arg2:string):Promise<string>;
+
+export function CustomThemeTable():Promise<string>;
+
+export function DeletePlaylistOrphans(arg1:string):Promise<main.DeletePlaylistOrphansResult>;
+
+export function DiagnoseNetwork():Promise<string>;
+
+export function EnqueueDownload(arg1:Array<string>,arg2:string):Promise<main.QueueEnqueueResult>;
+
+export function EnqueueImport(arg1:string,arg2:string,arg3:number):Promise<main.QueueEnqueueResult>;
+
+export function EnqueuePreviewSelection(arg1:string,arg2:Array<number>,arg3:string):Promise<main.QueueEnqueueResult>;
+
+export function ExportPlaylist(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function ExtractArtworkSeed(arg1:string):Promise<string>;
+
 export function GetAlbumAvailability(arg1:string):Promise<string>;
+
+export function GetAppVersion():Promise<string>;
 
 export function GetAppleMusicLibrary():Promise<string>;
 
@@ -38,6 +60,8 @@ export function GetHistory():Promise<Array<main.HistoryItem>>;
 
 export function GetKeyInfo():Promise<main.KeyInfoResult>;
 
+export function GetQueue():Promise<main.QueueSnapshot>;
+
 export function GetSlskdWebUIInfo():Promise<string>;
 
 export function GetSpotifyLibrary():Promise<string>;
@@ -58,13 +82,27 @@ export function PickAnalyzerFiles():Promise<Array<string>>;
 
 export function PickDirectory():Promise<string>;
 
+export function PickPlaylistFile():Promise<string>;
+
 export function PollDeviceLogin(arg1:string):Promise<main.DeviceTokenResult>;
 
+export function PreviewAlbum(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function PreviewRelease(arg1:string):Promise<string>;
+
+export function PreviewTrack(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function RemoveQueueItem(arg1:string):Promise<void>;
+
 export function RenewDeviceTokenIfNeeded():Promise<main.DeviceRenewResult>;
+
+export function ResumeQueue():Promise<boolean>;
 
 export function RetryTrackDownload(arg1:string):Promise<void>;
 
 export function RunAutoSync():Promise<string>;
+
+export function SaveActivityLog(arg1:string,arg2:number):Promise<string>;
 
 export function SaveConfig(arg1:main.Config):Promise<void>;
 
@@ -73,6 +111,10 @@ export function SaveCoverArt(arg1:string,arg2:string):Promise<string>;
 export function ScanFolder(arg1:string):Promise<Array<string>>;
 
 export function SearchArtists(arg1:string,arg2:string):Promise<string>;
+
+export function SearchCatalog(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function SetQueueItemTitle(arg1:string,arg2:string):Promise<void>;
 
 export function SetSpotifyCookie(arg1:string):Promise<string>;
 
@@ -87,6 +129,10 @@ export function StartAppleBrowserLogin():Promise<void>;
 export function StartDeviceLogin():Promise<main.DeviceCodeResult>;
 
 export function StartDownload(arg1:Array<string>):Promise<void>;
+
+export function StartImportDownload(arg1:string):Promise<void>;
+
+export function StartNextQueued():Promise<boolean>;
 
 export function StartTidalOAuthLogin():Promise<void>;
 

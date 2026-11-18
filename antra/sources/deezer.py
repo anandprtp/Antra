@@ -29,7 +29,7 @@ import requests
 
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 from antra.sources.base import BaseSourceAdapter
-from antra.utils.matching import score_similarity, duration_close
+from antra.utils.matching import score_similarity, duration_close, has_severe_duration_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +234,7 @@ class DeezerAdapter(BaseSourceAdapter):
         return None
 
     def _search_by_text(self, track: TrackMetadata) -> Optional[SearchResult]:
-        query = f"{track.title} {track.primary_artist}"
+        query = f"{track.title} {track.artists[0] if track.artists else ''}".strip()
         try:
             resp = self._session.get(
                 f"{_PUBLIC_API}/search",
@@ -251,7 +251,11 @@ class DeezerAdapter(BaseSourceAdapter):
         best_score = 0.0
 
         for item in items:
-            artist_name = item.get("artist", {}).get("name", "")
+            artist_name = (item.get("artist") or {}).get("name", "")
+            dur_s = item.get("duration")
+            # a wildly different length is a different recording: reject, don't discount
+            if dur_s and has_severe_duration_mismatch(track.duration_ms, dur_s * 1000):
+                continue
             score = score_similarity(
                 query_title=track.title,
                 query_artists=track.artists,

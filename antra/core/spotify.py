@@ -12,12 +12,14 @@ from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth, SpotifyPKCE
 
 from antra.core.models import TrackMetadata, SpotifyLibrary, SpotifyPlaylistSummary
 
+from antra.core.spotify_partner import post_persisted_payload
+
 logger = logging.getLogger(__name__)
 
 # ── Spotify web-player TOTP credentials ──────────────────────────────────────
 # Spotify's web player uses TOTP to obtain anonymous access tokens via
 # open.spotify.com/api/token — no login or OAuth required.
-# Secret and version extracted from the SpotiFLAC project (MIT licence).
+# Secret and version are the ones Spotify's own web player ships.
 _SP_TOTP_SECRET = (
     "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4D"
     "QOJUGQYTAMRRGA2TCMJSHE3TCMBY"
@@ -27,6 +29,61 @@ _SP_TOTP_VERSION = 61
 # Persisted GraphQL query hashes for api-partner.spotify.com/pathfinder/v2/query
 _GQL_ALBUM_HASH   = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
 _GQL_TRACK_HASH   = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+
+# Spotify states the explicit flag in four different shapes depending on which
+# endpoint answered, and every one of them used to be dropped on the floor —
+# which is why the "prefer explicit versions" setting did nothing (issue #61).
+# The resolver's explicit handling is all gated on `track.is_explicit is True`,
+# so a None here silently disables it rather than failing loudly.
+#
+# Returning None when the payload does not state it is deliberate: unknown is
+# neutral to the resolver, and guessing "clean" would be worse than silence.
+_EXPLICIT_LABELS = {"EXPLICIT"}
+
+
+def _parse_explicit(payload: dict) -> Optional[bool]:
+    """Read Spotify's explicit flag out of whichever payload shape we got.
+
+    Handles, in order:
+      • Web API (spotipy)          -> ``explicit``: bool
+      • embed __NEXT_DATA__        -> ``isExplicit``: bool
+      • partner GraphQL            -> ``contentRating.label``: "EXPLICIT" | "NONE"
+      • embed content ratings      -> ``contentRatings.labels``: ["EXPLICIT", ...]
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("explicit", "isExplicit"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+
+    rating = payload.get("contentRating")
+    if isinstance(rating, dict):
+        label = rating.get("label")
+        if isinstance(label, str) and label:
+            return label.upper() in _EXPLICIT_LABELS
+
+    ratings = payload.get("contentRatings")
+    if isinstance(ratings, dict):
+        labels = ratings.get("labels")
+        # Only trust a non-empty list: an empty one is ambiguous, and None
+        # (unknown) is the safe answer because the resolver treats it as neutral.
+        if isinstance(labels, list) and labels:
+            return any(str(item).upper() in _EXPLICIT_LABELS for item in labels)
+
+    return None
+
+
+def _explicit_from_itunes(item: dict) -> Optional[bool]:
+    """iTunes spells it ``trackExplicitness``: explicit / cleaned / notExplicit."""
+    if not isinstance(item, dict):
+        return None
+    value = item.get("trackExplicitness")
+    if not isinstance(value, str) or not value:
+        return None
+    return value.strip().lower() == "explicit"
+
 
 _DISCOGRAPHY_CLEAN_RE = re.compile(
     r"\b(clean|edited|radio edit|censored)\b",
@@ -73,6 +130,16 @@ def _detect_type(url_or_id: str) -> str:
             return t
     # Bare ID — assume playlist for backwards compatibility
     return "playlist"
+
+
+def _year_from_release_date(value) -> Optional[int]:
+    """`1975-10-31`, `1975-10` or `1975` -> 1975. None when unusable."""
+    if not value:
+        return None
+    try:
+        return int(str(value)[:4])
+    except ValueError:
+        return None
 
 
 class SpotifyClient:
@@ -610,7 +677,8 @@ class SpotifyClient:
                 ),
             }
             
-            while True:
+            prev_first_uri = None  # guards a server that ignores `offset`
+            for _page in range(500):
                 payload = {
                     "variables": {
                         "uri": f"spotify:playlist:{playlist_id}",
@@ -627,24 +695,34 @@ class SpotifyClient:
                     }
                 }
                 
-                resp = requests.post(
-                    "https://api-partner.spotify.com/pathfinder/v2/query",
-                    headers=headers,
-                    json=payload,
-                    timeout=15,
+                resp = post_persisted_payload(
+                    requests.post, "https://api-partner.spotify.com/pathfinder/v2/query", payload,
+                    headers=headers, timeout=15,
                 )
                 
                 if not resp.ok:
                     logger.debug(f"[Spotify] Partner GraphQL API returned {resp.status_code} at offset {offset}")
                     break
                     
-                data = resp.json()
-                playlist_data = data.get("data", {}).get("playlistV2", {})
+                data = resp.json() or {}
+                # `{"data": null, "errors": [...]}` is how GraphQL reports a failure
+                playlist_data = (data.get("data") or {}).get("playlistV2") or {}
 
                 # Extract playlist name/artwork from GraphQL on first page (TOTP path skips embed)
                 if not tracks:
                     if playlist_title == "Unknown Playlist":
                         playlist_title = playlist_data.get("name") or "Unknown Playlist"
+                    # The owner is what the preview header is supposed to show —
+                    # "Anand", not the first track's artists. Only the embed
+                    # scrape above ever set it, and that branch runs solely when
+                    # TOTP FAILS, i.e. almost never. On the normal (TOTP) path it
+                    # stayed None and _playlist_artists_string fell through to
+                    # tracks[0].artists, which is the reported bug.
+                    if not playlist_owner:
+                        _owner = (playlist_data.get("ownerV2") or {}).get("data") or {}
+                        playlist_owner = _owner.get("name") or _owner.get("username") or None
+                    if not playlist_desc:
+                        playlist_desc = playlist_data.get("description") or None
                     if playlist_artwork is None:
                         _img_sources = (
                             (playlist_data.get("images") or {}).get("items", [{}])[0:1]
@@ -652,42 +730,63 @@ class SpotifyClient:
                         if _img_sources:
                             _srcs = (_img_sources[0] or {}).get("sources") or []
                             if _srcs:
-                                playlist_artwork = _srcs[-1].get("url")  # largest image last
+                                # Pick by WIDTH, not position. The old code took
+                                # _srcs[-1] "largest image last" — measured, a
+                                # mosaic cover is ordered 640/300/60, so that
+                                # picked the 60px thumbnail and the preview
+                                # rendered a blurry cover.
+                                playlist_artwork = max(
+                                    _srcs,
+                                    key=lambda s: (s or {}).get("width") or 0,
+                                ).get("url")
 
-                content = playlist_data.get("content", {})
-                items = content.get("items", [])
+                content = playlist_data.get("content") or {}
+                items = content.get("items") or []
 
                 if not items:
                     break
-                    
+                first_uri = (((items[0] or {}).get("itemV2") or {}).get("data") or {}).get("uri")
+                if first_uri and first_uri == prev_first_uri:
+                    break  # same page twice: the server is ignoring `offset`
+                prev_first_uri = first_uri
+
+                # Any field may be null for one removed/unavailable entry; that
+                # must cost that entry, not the whole playlist (the outer except
+                # used to turn one AttributeError into an empty result).
                 for item in items:
-                    v2_data = item.get("itemV2", {}).get("data", {})
+                    v2_data = ((item or {}).get("itemV2") or {}).get("data") or {}
                     if not v2_data:
                         continue
                         
-                    uri = v2_data.get("uri", "")
+                    uri = v2_data.get("uri") or ""
                     if not uri.startswith("spotify:track:"):
                         continue
                         
                     tid = uri.split(":")[-1]
                     title = v2_data.get("name") or "Unknown Track"
-                    artists = [a.get("profile", {}).get("name") for a in v2_data.get("artists", {}).get("items", []) if a.get("profile", {}).get("name")]
+                    artists = [
+                        n for n in (
+                            ((a or {}).get("profile") or {}).get("name")
+                            for a in ((v2_data.get("artists") or {}).get("items") or [])
+                        ) if n
+                    ]
                     if not artists: artists = ["Unknown Artist"]
 
-                    album_of_track = v2_data.get("albumOfTrack", {})
+                    album_of_track = v2_data.get("albumOfTrack") or {}
                     album = album_of_track.get("name") or "Unknown Album"
                     # Extract album_id from its URI so batch_enrich_album_data can fill artwork/genres
-                    album_uri = album_of_track.get("uri", "")
+                    album_uri = album_of_track.get("uri") or ""
                     album_id = album_uri.split(":")[-1] if album_uri.startswith("spotify:album:") else None
                     # Extract artwork from album coverArt images
-                    cover_sources = album_of_track.get("coverArt", {}).get("sources", [])
-                    artwork_url = cover_sources[0].get("url") if cover_sources else None
-                    duration_ms = v2_data.get("trackDuration", {}).get("totalMilliseconds")
+                    cover_sources = (album_of_track.get("coverArt") or {}).get("sources") or []
+                    artwork_url = (cover_sources[0] or {}).get("url") if cover_sources else None
+                    duration_ms = (v2_data.get("trackDuration") or {}).get("totalMilliseconds")
                     release_date = album_of_track.get("date", {}).get("isoString", "") if isinstance(album_of_track.get("date"), dict) else ""
                     release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
 
                     track_meta = TrackMetadata(
                         title=title,
+                        is_explicit=_parse_explicit(v2_data),
                         artists=artists,
                         album=album,
                         album_id=album_id,
@@ -706,7 +805,7 @@ class SpotifyClient:
                     )
                     tracks.append(track_meta)
                     
-                total_count = content.get("totalCount", 0)
+                total_count = content.get("totalCount") or 0
 
                 if page_callback:
                     try:
@@ -714,10 +813,14 @@ class SpotifyClient:
                     except Exception:
                         pass
 
-                if len(items) < limit or offset + len(items) >= total_count:
+                # Advance by what was RECEIVED, not by what was asked for: a
+                # server that returns fewer than `limit` (or clamps the page)
+                # used to end the playlist early, and any later page would have
+                # skipped entries. With no totalCount, continue until a page
+                # comes back empty.
+                offset += len(items)
+                if total_count and offset >= total_count:
                     break
-
-                offset += limit
                 time.sleep(0.15)
                 
             logger.info(f"Total tracks in public playlist fallback: {len(tracks)}")
@@ -944,11 +1047,9 @@ class SpotifyClient:
                     }
                 }
                 
-                resp = requests.post(
-                    "https://api-partner.spotify.com/pathfinder/v2/query",
-                    headers=headers,
-                    json=payload,
-                    timeout=15,
+                resp = post_persisted_payload(
+                    requests.post, "https://api-partner.spotify.com/pathfinder/v2/query", payload,
+                    headers=headers, timeout=15,
                 )
 
                 if resp.status_code == 401:
@@ -1167,6 +1268,7 @@ class SpotifyClient:
                 artists = [a["name"] for a in t.get("artists", [])]
                 tracks.append(TrackMetadata(
                     title=t["name"],
+                    is_explicit=_parse_explicit(t),
                     artists=artists,
                     album=album_name,
                     album_artists=album_artist_names,
@@ -1271,10 +1373,12 @@ class SpotifyClient:
         if self.sp:
             try:
                 raw = self.sp.search(q=query, type="artist", limit=limit, market=self._market)
-                artists = raw.get("artists", {}).get("items", [])
+                artists = (raw.get("artists") or {}).get("items") or []
                 for a in artists:
+                    if not isinstance(a, dict):
+                        continue  # the Web API search may return null entries
                     name = a.get("name", "")
-                    images = a.get("images", [])
+                    images = a.get("images") or []
                     artwork = images[0]["url"] if images else None
                     artist_id = a.get("id", "")
                     score = string_similarity(normalize(query), normalize(name))
@@ -1282,8 +1386,8 @@ class SpotifyClient:
                         "artist_id": artist_id,
                         "name": name,
                         "artwork_url": artwork,
-                        "genres": a.get("genres", []),
-                        "followers": a.get("followers", {}).get("total"),
+                        "genres": a.get("genres") or [],
+                        "followers": (a.get("followers") or {}).get("total"),
                         "match_score": round(score, 3),
                         "profile_url": f"https://open.spotify.com/artist/{artist_id}",
                         "source": "spotify",
@@ -1305,10 +1409,12 @@ class SpotifyClient:
                     timeout=10,
                 )
                 resp.raise_for_status()
-                artists = resp.json().get("artists", {}).get("items", [])
+                artists = (resp.json().get("artists") or {}).get("items") or []
                 for a in artists:
+                    if not isinstance(a, dict):
+                        continue  # the Web API search may return null entries
                     name = a.get("name", "")
-                    images = a.get("images", [])
+                    images = a.get("images") or []
                     artwork = images[0]["url"] if images else None
                     artist_id = a.get("id", "")
                     score = string_similarity(normalize(query), normalize(name))
@@ -1316,8 +1422,8 @@ class SpotifyClient:
                         "artist_id": artist_id,
                         "name": name,
                         "artwork_url": artwork,
-                        "genres": a.get("genres", []),
-                        "followers": a.get("followers", {}).get("total"),
+                        "genres": a.get("genres") or [],
+                        "followers": (a.get("followers") or {}).get("total"),
                         "match_score": round(score, 3),
                         "profile_url": f"https://open.spotify.com/artist/{artist_id}",
                         "source": "spotify",
@@ -1331,6 +1437,108 @@ class SpotifyClient:
         # Spotify paths exhausted — fall back to iTunes Search API (no auth required)
         logger.debug("[Spotify] Anonymous artist search failed — falling back to iTunes")
         return self._search_artists_itunes(query, limit)
+
+    def search_songs(self, query: str, limit: int = 25) -> list[dict]:
+        """Song search via the public Web API. [] when Spotify is unreachable.
+
+        Falling back to iTunes here would hand Apple rows back under a Spotify
+        label; the decision about what to do when Spotify is unavailable belongs
+        to AntraService.search_catalog, which says so in the UI.
+        """
+        return self._search_catalog_public(query, "track", limit)
+
+    def search_albums(self, query: str, limit: int = 25) -> list[dict]:
+        """Album search via the public Web API. [] when Spotify is unreachable."""
+        return self._search_catalog_public(query, "album", limit)
+
+    def _search_catalog_public(self, query: str, sp_type: str, limit: int) -> list[dict]:
+        query = (query or "").strip()
+        if not query:
+            return []
+        limit = max(1, min(int(limit or 25), 50))   # the Web API caps `limit` at 50
+
+        payload = None
+        if self.sp:
+            try:
+                payload = self.sp.search(q=query, type=sp_type, limit=limit, market=self._market)
+            except Exception as e:
+                logger.debug(f"[Spotify] {sp_type} search failed: {e}")
+        if payload is None:
+            token = self._get_anonymous_access_token()
+            if not token:
+                return []
+            try:
+                resp = requests.get(
+                    "https://api.spotify.com/v1/search",
+                    headers={"Authorization": f"Bearer {token}"},
+                    params={
+                        "q": query,
+                        "type": sp_type,
+                        "limit": limit,
+                        "market": self._market or "US",
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+            except Exception as e:
+                logger.debug(f"[Spotify] Anonymous {sp_type} search failed: {e}")
+                return []
+
+        items = ((payload or {}).get(f"{sp_type}s") or {}).get("items") or []
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            row = self._track_search_row(it) if sp_type == "track" else self._album_search_row(it)
+            if row:
+                out.append(row)
+        return out
+
+    @staticmethod
+    def _spotify_images(images: list) -> Optional[str]:
+        return images[0]["url"] if images else None
+
+    def _track_search_row(self, t: dict) -> Optional[dict]:
+        name = t.get("name") or ""
+        track_id = t.get("id") or ""
+        if not name or not track_id:
+            return None
+        album = t.get("album") or {}
+        return {
+            "kind": "song",
+            "id": track_id,
+            "title": name,
+            "artists": ", ".join(a.get("name", "") for a in (t.get("artists") or []) if a.get("name")),
+            "album": album.get("name") or "",
+            "artwork_url": self._spotify_images(album.get("images") or []),
+            "duration_ms": t.get("duration_ms") or 0,
+            "is_explicit": bool(t.get("explicit")),
+            "year": _year_from_release_date(album.get("release_date")),
+            "match_score": 0.0,   # scored by the caller, which knows the query
+            "url": f"https://open.spotify.com/track/{track_id}",
+            "source": "spotify",
+        }
+
+    def _album_search_row(self, a: dict) -> Optional[dict]:
+        name = a.get("name") or ""
+        album_id = a.get("id") or ""
+        if not name or not album_id:
+            return None
+        return {
+            "kind": "album",
+            "id": album_id,
+            "title": name,
+            "artists": ", ".join(x.get("name", "") for x in (a.get("artists") or []) if x.get("name")),
+            "album": "",
+            "artwork_url": self._spotify_images(a.get("images") or []),
+            "track_count": a.get("total_tracks") or 0,
+            "is_explicit": False,   # the album object carries no explicit flag
+            "year": _year_from_release_date(a.get("release_date")),
+            "match_score": 0.0,
+            "url": f"https://open.spotify.com/album/{album_id}",
+            "source": "spotify",
+        }
 
     def _search_artists_itunes(self, query: str, limit: int = 8) -> list[dict]:
         """Artist search via public iTunes Search API — no credentials required."""
@@ -1393,6 +1601,7 @@ class SpotifyClient:
                 
             return TrackMetadata(
                 title=track_name,
+                is_explicit=_explicit_from_itunes(item),
                 artists=[artist_name],
                 album=album_name,
                 release_year=release_year,
@@ -1450,6 +1659,7 @@ class SpotifyClient:
                 tracks.append(
                     TrackMetadata(
                         title=title,
+                        is_explicit=_parse_explicit(item),
                         artists=artists,
                         album=album_name,
                         release_year=release_year,
@@ -1505,8 +1715,9 @@ class SpotifyClient:
         offset = 0
         limit = 300
         album_meta: dict = {}
+        prev_first_uri = None  # guards a server that ignores `offset`
 
-        while True:
+        for _page in range(200):
             payload = {
                 "variables": {
                     "uri": f"spotify:album:{album_id}",
@@ -1523,57 +1734,61 @@ class SpotifyClient:
                 },
             }
             try:
-                resp = requests.post(
-                    "https://api-partner.spotify.com/pathfinder/v2/query",
-                    headers=headers,
-                    json=payload,
-                    timeout=20,
+                resp = post_persisted_payload(
+                    requests.post, "https://api-partner.spotify.com/pathfinder/v2/query", payload,
+                    headers=headers, timeout=20,
                 )
                 if not resp.ok:
                     logger.debug(
                         f"[Spotify] Partner album API {resp.status_code} for {album_id}: {resp.text[:200]}"
                     )
                     break
-                data = resp.json()
+                data = resp.json() or {}
             except Exception as e:
                 logger.debug(f"[Spotify] Partner album API error: {e}")
                 break
 
-            album_union = data.get("data", {}).get("albumUnion", {})
+            # `{"data": null, "errors": [...]}` is how GraphQL reports a failure,
+            # and any field below may be null for an album with missing data.
+            album_union = (data.get("data") or {}).get("albumUnion") or {}
             if not album_meta:
                 # Capture album-level fields on first page
-                artists_items = (
-                    album_union.get("artists", {}).get("items", [])
-                )
+                artists_items = (album_union.get("artists") or {}).get("items") or []
+                _date = album_union.get("date") or {}
                 album_meta = {
-                    "name": album_union.get("name", ""),
+                    "name": album_union.get("name") or "",
                     "artists": [
-                        a.get("profile", {}).get("name", "")
+                        ((a.get("profile") or {}).get("name") or "")
                         for a in artists_items
                         if isinstance(a, dict)
                     ],
-                    "release_date": (
-                        album_union.get("date", {}).get("isoString", "")
-                        or album_union.get("date", {}).get("year", "")
-                    ),
+                    "release_date": str(_date.get("isoString") or _date.get("year") or ""),
                     "artwork_url": self._pick_best_cover(
-                        album_union.get("coverArt", {}).get("sources", [])
+                        (album_union.get("coverArt") or {}).get("sources") or []
                     ),
-                    "total_tracks": album_union.get("tracksV2", {}).get("totalCount"),
+                    "total_tracks": (album_union.get("tracksV2") or {}).get("totalCount"),
                 }
                 # Strip time portion from ISO date
                 if album_meta["release_date"] and "T" in album_meta["release_date"]:
                     album_meta["release_date"] = album_meta["release_date"].split("T")[0]
 
-            tracks_v2 = album_union.get("tracksV2", {})
-            items = tracks_v2.get("items", [])
+            tracks_v2 = album_union.get("tracksV2") or {}
+            items = tracks_v2.get("items") or []
             if not items:
                 break
+            first_item = items[0] if isinstance(items[0], dict) else {}
+            first_track = first_item.get("track") if isinstance(first_item.get("track"), dict) else first_item
+            first_uri = first_track.get("uri")
+            if first_uri and first_uri == prev_first_uri:
+                break  # same page twice: the server is ignoring `offset`
+            prev_first_uri = first_uri
             all_items.extend(items)
-            total = tracks_v2.get("totalCount", 0)
-            if len(all_items) >= total or len(items) < limit:
+            total = tracks_v2.get("totalCount") or 0
+            # Advance by what was RECEIVED, not what was asked for: a server that
+            # clamps the page below `limit` used to end the album early.
+            offset += len(items)
+            if total and offset >= total:
                 break
-            offset += limit
 
         if not all_items:
             return []
@@ -1584,14 +1799,14 @@ class SpotifyClient:
         release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
         artwork_url = album_meta.get("artwork_url")
         total_tracks = album_meta.get("total_tracks") or len(all_items)
+        all_items = [i for i in all_items if isinstance(i, dict)]
         track_playability = [
             bool(
-                (item.get("track") if isinstance(item.get("track"), dict) else item)
-                .get("playability", {})
+                ((item.get("track") if isinstance(item.get("track"), dict) else item)
+                 .get("playability") or {})
                 .get("playable")
             )
             for item in all_items
-            if isinstance((item.get("track") if isinstance(item.get("track"), dict) else item), dict)
         ]
         if track_playability and not any(track_playability):
             title = album_name or album_id
@@ -1615,17 +1830,19 @@ class SpotifyClient:
             if not track or not track.get("name"):
                 continue
             try:
-                track_uri = track.get("uri", "")
+                track_uri = track.get("uri") or ""
                 spotify_id = track_uri.split(":")[-1] if ":" in track_uri else track.get("id")
-                artist_items = track.get("artists", {}).get("items", [])
+                artist_items = (track.get("artists") or {}).get("items") or []
                 artists = [
-                    a.get("profile", {}).get("name", "")
+                    ((a.get("profile") or {}).get("name") or "")
                     for a in artist_items
                     if isinstance(a, dict)
                 ]
-                duration_ms = track.get("duration", {}).get("totalMilliseconds")
+                artists = [a for a in artists if a]  # a blank name must not mask the album-artist fallback
+                duration_ms = (track.get("duration") or {}).get("totalMilliseconds")
                 result.append(TrackMetadata(
                     title=track.get("name", ""),
+                    is_explicit=_parse_explicit(track),
                     artists=artists or album_artists,
                     album=album_name,
                     album_artists=album_artists,
@@ -1930,6 +2147,7 @@ class SpotifyClient:
                 tracks.append(
                     TrackMetadata(
                         title=title,
+                        is_explicit=_parse_explicit(item),
                         artists=artists,
                         album="Unknown Album", # Top tracks usually don't have album contexts in embed payload
                         track_number=index,
@@ -1988,41 +2206,20 @@ class SpotifyClient:
         return self.enrich_public_track_metadata(track)
 
     def _batch_fetch_isrcs_anonymous(self, tracks: list[TrackMetadata]) -> None:
-        """Fetch ISRCs for tracks that are missing them using an anonymous Spotify token.
+        """Fetch ISRCs for tracks that are missing them, without credentials.
 
-        Uses the public /tracks endpoint (no credentials required) in batches of 50.
-        Mutates tracks in-place. Safe to call even when no Spotify credentials are set.
+        Delegates to ISRCEnricher, which uses spclient's per-track metadata
+        route. This used to batch against api.spotify.com/v1/tracks, which 429s
+        for the web-player client id and silently filled nothing. Mutates tracks
+        in-place. Safe to call even when no Spotify credentials are set.
         """
-        needing = [(i, t) for i, t in enumerate(tracks) if not t.isrc and t.spotify_id]
-        if not needing:
+        if not any(t.spotify_id and not t.isrc for t in tracks):
             return
-        token = self._get_anonymous_access_token()
-        if not token:
-            return
-        import requests as _requests
-        spotify_ids = [t.spotify_id for _, t in needing]
-        isrc_map: dict[str, str] = {}
-        for start in range(0, len(spotify_ids), 50):
-            chunk = spotify_ids[start:start + 50]
-            try:
-                resp = _requests.get(
-                    "https://api.spotify.com/v1/tracks",
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"ids": ",".join(chunk), "market": self._market or "US"},
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                for t in (resp.json().get("tracks") or []):
-                    if t and t.get("id"):
-                        isrc = t.get("external_ids", {}).get("isrc")
-                        if isrc:
-                            isrc_map[t["id"]] = isrc
-            except Exception as e:
-                logger.debug(f"[Spotify] Anonymous ISRC batch fetch failed: {e}")
-        for i, track in needing:
-            isrc = isrc_map.get(track.spotify_id or "")
-            if isrc:
-                tracks[i].isrc = isrc
+        try:
+            from antra.core.isrc_enricher import ISRCEnricher
+            ISRCEnricher(market=self._market or "US").enrich_tracks(tracks)
+        except Exception as e:
+            logger.debug(f"[Spotify] Anonymous ISRC fetch failed: {e}")
 
     def batch_enrich_album_data(self, tracks: list[TrackMetadata]) -> list[TrackMetadata]:
         """Enrich album data for a list of tracks using batched /albums API calls.
@@ -2325,6 +2522,13 @@ class SpotifyClient:
             track.track_number = fallback.track_number
         if not track.disc_number and fallback.disc_number:
             track.disc_number = fallback.disc_number
+        # v2.0.0 ADV-1 (issue #43) — explicitness is deliberately NOT merged
+        # here, though `fallback` carries it. This is a FUZZY TEXT match, and
+        # measured 2026-09-26 the top iTunes hit for "Drake God's Plan" is the
+        # `cleaned` master while the track being downloaded is the explicit
+        # one. Merging it would have written "clean" onto explicit audio —
+        # a confidently wrong tag, which is worse than the absent one it
+        # replaces. The advisory comes from the adapter that served the file.
         return track
 
     @staticmethod

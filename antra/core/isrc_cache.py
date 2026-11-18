@@ -1,23 +1,23 @@
 """
-Persistent Spotify track ID → ISRC cache (v1.1.8 FEAT-6, ported from SpotiFLAC).
+Persistent Spotify track ID → ISRC cache (v1.1.8 FEAT-6).
 
-SpotiFLAC keeps a bbolt-backed `trackID → ISRC` cache so a track resolved once is
-never looked up again. Antra had no persistent ISRC cache at all: every run
+A persistent `trackID → ISRC` store means a track resolved once is never looked
+up again. Antra had no persistent ISRC cache at all: every run
 re-resolved the same ISRCs from scratch, which costs API calls and is a genuine
 rate-limit exposure — v1.1.3 BUG-12 was exactly this, ISRC enrichment tripping
 Spotify's 429 and bailing with 0/12 tracks enriched.
 
-Deliberately adapted rather than copied:
+Design decisions:
 
-  * **SQLite, not bbolt.** `provider_stats.py` already establishes the pattern in
-    this codebase (SQLite in the platformdirs user-data dir, every operation
-    degrading to a no-op on failure). Adding a second embedded-KV dependency for
-    one small table would not be worth it.
+  * **SQLite, not a second embedded key-value store.** `provider_stats.py`
+    already establishes the pattern in this codebase (SQLite in the platformdirs
+    user-data dir, every operation degrading to a no-op on failure). Adding a
+    new dependency for one small table would not be worth it.
   * **Resolution source is stored.** ISRC accuracy became a correctness concern in
     v1.1.8 BUG-1, where adapters were fabricating confidence. Recording *how* an
     ISRC was resolved means a future session can invalidate one source's entries
     without discarding the whole cache.
-  * **Entries expire.** SpotiFLAC's cache is permanent. A wrong ISRC — from a
+  * **Entries expire.** A permanent cache would be simpler. A wrong ISRC — from a
     mis-tagged release or a source that later corrects itself — would be cached
     forever and would keep producing the same wrong match on every run, which is
     precisely the failure mode BUG-1 was about. A TTL bounds that damage.
@@ -116,8 +116,13 @@ class ISRCCache:
             return None
         return isrc
 
-    def get_many(self, track_ids: list[str]) -> dict[str, str]:
-        """Bulk lookup — one query for a whole playlist rather than N."""
+    def get_many(self, track_ids: list[str], include_negative: bool = False) -> dict[str, str]:
+        """Bulk lookup — one query for a whole playlist rather than N.
+
+        Fresh cached negatives ("Spotify has no ISRC") are returned as "" only
+        when include_negative is set; they used to be dropped unconditionally,
+        which made the negative cache write-only.
+        """
         ids = [t.strip() for t in (track_ids or []) if t and t.strip()]
         if not ids:
             return {}
@@ -136,7 +141,7 @@ class ISRCCache:
         for tid, isrc, updated in rows:
             isrc = isrc or ""
             ttl = ISRC_TTL_SECONDS if isrc else NEGATIVE_TTL_SECONDS
-            if now - int(updated or 0) <= ttl and isrc:
+            if now - int(updated or 0) <= ttl and (isrc or include_negative):
                 out[tid] = isrc
         return out
 

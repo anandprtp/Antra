@@ -89,6 +89,19 @@ for _pkg in ("antra", "antra_shared"):
             continue
         datas.append((str(_src), str(_src.parent.relative_to(ROOT))))
 
+# ── Chromaprint fpcalc (audio fingerprint verification) ─────────────────────
+# Optional: when the platform binary has been vendored it ships at
+# _MEIPASS/chromaprint/fpcalc[.exe], which antra.utils.runtime.get_fpcalc_exe
+# looks for. When it is absent the build still succeeds and the verification
+# check degrades to 'skipped' rather than failing downloads.
+_fpcalc_name = 'fpcalc.exe' if sys.platform == 'win32' else 'fpcalc'
+_fpcalc = ROOT / 'antra-wails' / 'third_party' / 'chromaprint' / _fpcalc_name
+if _fpcalc.is_file():
+    datas.append((str(_fpcalc), 'chromaprint'))
+    print(f'[spec] bundling fpcalc from {_fpcalc}')
+else:
+    print(f'[spec] fpcalc not vendored at {_fpcalc} - audio verification will be unavailable')
+
 # Explicitly exclude playwright's driver directory (node.exe + JS bundle = ~97 MB).
 # We replaced the playwright session API with raw websockets CDP calls, so node.exe
 # is never executed. The playwright Python package itself is still imported only for

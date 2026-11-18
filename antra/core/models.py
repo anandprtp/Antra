@@ -32,6 +32,13 @@ class TrackMetadata:
     source_service: Optional[str] = None
     source_rule: Optional[str] = None
     request_kind: Optional[str] = None  # "track" | "album" | "playlist"
+    # issue #74 - the row this track owns in the desktop UI. Stamped once, when
+    # the tracklist is first fetched, and carried through every later
+    # transformation. The app used to correlate progress events with rows by
+    # track_index, which is a position in a list the engine reorders
+    # (_stamp_disc_totals), so a failure was reported against the wrong song.
+    # An id survives reordering, filtering and deduplication; a position does not.
+    row_id: Optional[str] = None
     playlist_name: Optional[str] = None
     playlist_owner: Optional[str] = None
     playlist_description: Optional[str] = None
@@ -44,6 +51,11 @@ class TrackMetadata:
     total_discs: Optional[int] = None
     duration_ms: Optional[int] = None
     isrc: Optional[str] = None
+    # True when `isrc` was INFERRED from a text search rather than read from
+    # the source catalogue (BUG-MIX-1). A guessed ISRC is a guess about which
+    # RECORDING this is, so the resolver must keep applying its recording-class
+    # checks to it instead of treating an ISRC hit as proof of identity.
+    isrc_guessed: bool = False
     spotify_id: Optional[str] = None
     album_id: Optional[str] = None
     spotify_url: Optional[str] = None
@@ -51,6 +63,7 @@ class TrackMetadata:
     apple_music_id: Optional[str] = None  # Apple Music catalog track ID, set when input is an Apple Music URL
     deezer_track_id: Optional[str] = None  # Track ID when sourced from a Deezer URL
     tidal_track_id: Optional[str] = None  # Tidal track ID when sourced from a Tidal URL
+    qobuz_track_id: Optional[str] = None  # Qobuz track ID when sourced from a Qobuz URL
     upc: Optional[str] = None
     iswc: Optional[str] = None
     audio_traits: list[str] = field(default_factory=list)
@@ -125,6 +138,10 @@ class DownloadResult:
     audio_format: Optional[AudioFormat] = None
     error_message: Optional[str] = None
     attempt_count: int = 1
+    # Set on a COMPLETED track whose tags were not written: "unsupported" (the
+    # container cannot hold tags, file intact) or "failed" (the tag writer raised).
+    # The audio is kept either way; this exists so the UI and summary can say so.
+    tags_problem: Optional[str] = None
 
 
 @dataclass

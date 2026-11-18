@@ -78,6 +78,32 @@ def is_deezer_url(url: str) -> bool:
     return host.endswith("deezer.com") or host in {"deezer.page.link", "link.deezer.com"}
 
 
+# Only blame region-scoping when the mirror actually said the item was not in
+# any account's catalog. A transport failure (proxy / DNS / timeout) is not a
+# region problem, and saying so sends the reader hunting for a catalogue issue
+# that does not exist -- which is exactly what a ProxyError did on album
+# t0fti6cxhyanc. Shared by the 404 branches and the generic handler so the two
+# cannot disagree about what a failure means.
+_QOBUZ_TRANSPORT_MARKERS = (
+    "proxyerror", "unable to connect to proxy", "tunnel connection failed",
+    "failed to establish a new connection", "max retries exceeded",
+    "read timed out", "connection aborted", "connectionerror",
+)
+
+
+def _qobuz_failure_hint(detail: str) -> str:
+    low = (detail or "").lower()
+    if any(m in low for m in _QOBUZ_TRANSPORT_MARKERS):
+        return ("The Qobuz mirror could not reach Qobuz (network/proxy failure), "
+                "so this is not a problem with the link. Retry in a moment.")
+    if "not available in this qobuz catalog" in low or "region" in low:
+        return ("Qobuz ids are region-scoped, so an id copied from one storefront's "
+                "URL may not exist in another region's catalog \u2014 try the same "
+                "release from a different Qobuz storefront, or paste a Spotify/Apple "
+                "link instead.")
+    return "Try again, or paste a Spotify/Apple link for the same release."
+
+
 class ExternalMusicFetcher:
     """Resolve TIDAL, Qobuz, and Deezer URLs to normalized track metadata."""
 
@@ -123,7 +149,8 @@ class ExternalMusicFetcher:
             album_title = data.get("title") or ""
             album_artist = (data.get("artist") or {}).get("name") or ""
             artwork = self._best_deezer_cover(data)
-            tracks = ((data.get("tracks") or {}).get("data") or [])
+            embedded = ((data.get("tracks") or {}).get("data") or [])
+            tracks = self._deezer_album_tracks(item_id, embedded)
             total_tracks = int(data.get("nb_tracks") or len(tracks) or 0) or None
             tracks = [
                 self._deezer_track(
@@ -134,6 +161,7 @@ class ExternalMusicFetcher:
                     release_date=data.get("release_date") or None,
                     total_tracks=total_tracks,
                     position=index,
+                    album_id=str(item_id),
                 )
                 for index, item in enumerate(tracks, 1)
             ]
@@ -146,6 +174,11 @@ class ExternalMusicFetcher:
             playlist_description = data.get("description") or ""
             playlist_artwork = self._best_deezer_cover(data)
             tracks = ((data.get("tracks") or {}).get("data") or [])
+            try:
+                _declared = int(data.get("nb_tracks") or 0) or None
+            except (TypeError, ValueError):
+                _declared = None
+            tracks = self._deezer_playlist_tracks(item_id, tracks, _declared)
             tracks = [
                 self._deezer_track(
                     item,
@@ -160,6 +193,70 @@ class ExternalMusicFetcher:
             self._stamp_request_kind(tracks, "playlist")
             return tracks
         raise ValueError(f"Unsupported Deezer URL type: {kind}")
+
+    # Deezer embeds only the FIRST 25 tracks in /album/{id} and -- unlike the
+    # playlist endpoint, which embeds the whole thing -- does not even set
+    # tracks.next, so nothing signals that the list was cut. Measured 2026-09-25
+    # on album 53105092: nb_tracks=57, tracks.data=25, tracks.next=None.
+    # The dedicated /album/{id}/tracks endpoint paginates properly AND is the
+    # only one carrying isrc / track_position / disk_number (the embedded track
+    # objects carry none of the three), so it is used for every album, not just
+    # long ones.
+    _DEEZER_PAGE_LIMIT = 100
+    _DEEZER_MAX_PAGES = 60
+
+    def _deezer_walk_tracks(self, kind: str, item_id: str) -> list[dict[str, Any]]:
+        """Walk `/{kind}/{id}/tracks` page by page; never raises."""
+        collected: list[dict[str, Any]] = []
+        index = 0
+        try:
+            for _ in range(self._DEEZER_MAX_PAGES):
+                page = self._deezer_get(
+                    f"{kind}/{item_id}/tracks"
+                    f"?limit={self._DEEZER_PAGE_LIMIT}&index={index}"
+                )
+                batch = page.get("data") or []
+                if not batch:
+                    break
+                collected.extend(batch)
+                index += len(batch)
+                if not page.get("next"):
+                    break
+        except Exception as exc:  # network / API hiccup -- never lose the release
+            logger.warning(
+                "Deezer %s %s track pagination failed after %d track(s): %s",
+                kind,
+                item_id,
+                len(collected),
+                exc,
+            )
+        return collected
+
+    def _deezer_album_tracks(
+        self, album_id: str, embedded: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        collected = self._deezer_walk_tracks("album", album_id)
+        # A partial walk still beats the truncated embedded list, but a walk that
+        # returned LESS than the embedded list means it failed on the first page.
+        if len(collected) >= len(embedded):
+            return collected
+        return embedded
+
+    def _deezer_playlist_tracks(
+        self, playlist_id: str, embedded: list[dict[str, Any]], total: Optional[int]
+    ) -> list[dict[str, Any]]:
+        """A playlist embeds at most 400 tracks and, like an album, sets no
+        `tracks.next`. Measured 2026-10-26: playlists of 3085 and 2731 tracks
+        embedded 400 each with next=None; /playlist/{id}/tracks walked all 3085
+        in 31 pages with an ISRC on every track. Only walk when the playlist is
+        known to be longer than what was embedded, so the common case costs
+        nothing extra."""
+        if not total or len(embedded) >= total:
+            return embedded
+        collected = self._deezer_walk_tracks("playlist", playlist_id)
+        if len(collected) >= len(embedded):
+            return collected
+        return embedded
 
     def _deezer_get(self, path: str) -> dict[str, Any]:
         resp = self._session.get(f"{_DEEZER_API}/{path}", timeout=20)
@@ -231,6 +328,7 @@ class ExternalMusicFetcher:
         artwork_url: Optional[str] = None,
         release_date: Optional[str] = None,
         total_tracks: Optional[int] = None,
+        album_id: Optional[str] = None,
         playlist_name: Optional[str] = None,
         playlist_owner: Optional[str] = None,
         playlist_description: Optional[str] = None,
@@ -258,7 +356,9 @@ class ExternalMusicFetcher:
             duration_ms=(int(item["duration"]) * 1000) if item.get("duration") else None,
             isrc=item.get("isrc") or None,
             deezer_track_id=str(item.get("id")) if item.get("id") else None,
-            album_id=str(album.get("id")) if album.get("id") else None,
+            # /album/{id}/tracks items carry no nested album object, so the
+            # caller passes the id it already resolved from the URL.
+            album_id=str(album.get("id")) if album.get("id") else album_id,
             spotify_url=None,
             is_explicit=bool(item.get("explicit_lyrics")) if "explicit_lyrics" in item else None,
         )
@@ -337,15 +437,24 @@ class ExternalMusicFetcher:
         return self._fetch_qobuz_via_mirror(kind, item_id)
 
     # Must stay ABOVE the mirror's own rotation budget (QOBUZ_ROTATION_BUDGET_S,
-    # 25s). Qobuz album ids are region-scoped, so the mirror walks its account
+    # deployed at 40s). Qobuz album ids are region-scoped, so the mirror walks its account
     # pool until a region that holds the id answers — measured worst case 28s.
     # At the previous 20s this client aborted first and surfaced a bare
     # "Read timed out" instead of the mirror's own explanatory error.
-    _QOBUZ_MIRROR_TIMEOUT = 45
+    # Must stay comfortably ABOVE the mirror's QOBUZ_ROTATION_BUDGET_S
+    # (deployed at 40s; measured worst case 40.8s for an id no account
+    # holds). 45 left ~4s of headroom, and the proxy-rotation fix makes
+    # the mirror walk deeper before giving up -- too close. A client
+    # timeout below the server's budget aborts a legitimate rotation and
+    # shows a bare 'Read timed out' instead of the real reason.
+    _QOBUZ_MIRROR_TIMEOUT = 60
 
     def _fetch_qobuz_via_mirror(self, kind: str, item_id: str) -> list[TrackMetadata]:
         """Fetch Qobuz metadata via the VPS mirror — no local credentials required."""
         from antra.core.endpoint_manifest import load_endpoint_manifest
+        # Reuse the adapter's reader rather than a second copy -- a duplicated
+        # helper is how the mirror maps drifted three times in this project.
+        from antra.sources.qobuz_mirror import _mirror_detail
 
         manifest = load_endpoint_manifest()
         # cfg first: QOBUZ_MIRROR_URL is exported by the Go layer alongside
@@ -373,7 +482,11 @@ class ExternalMusicFetcher:
                     headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
-                    raise RuntimeError(f"Album {item_id} not found on Qobuz")
+                    _d = _mirror_detail(r)
+                    raise RuntimeError(
+                        (_d or f"Album {item_id} not found on Qobuz")
+                        + " " + _qobuz_failure_hint(_d)
+                    )
                 r.raise_for_status()
                 data = r.json()
             elif kind == "track":
@@ -382,7 +495,11 @@ class ExternalMusicFetcher:
                     headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
-                    raise RuntimeError(f"Track {item_id} not found on Qobuz")
+                    _d = _mirror_detail(r)
+                    raise RuntimeError(
+                        (_d or f"Track {item_id} not found on Qobuz")
+                        + " " + _qobuz_failure_hint(_d)
+                    )
                 r.raise_for_status()
                 tracks = [self._qobuz_track(r.json())]
                 self._stamp_request_kind(tracks, "track")
@@ -393,7 +510,11 @@ class ExternalMusicFetcher:
                     headers=headers, timeout=self._QOBUZ_MIRROR_TIMEOUT,
                 )
                 if r.status_code == 404:
-                    raise RuntimeError(f"Playlist {item_id} not found on Qobuz")
+                    _d = _mirror_detail(r)
+                    raise RuntimeError(
+                        (_d or f"Playlist {item_id} not found on Qobuz")
+                        + " " + _qobuz_failure_hint(_d)
+                    )
                 r.raise_for_status()
                 data = r.json()
                 playlist_name = data.get("title", "")
@@ -419,11 +540,10 @@ class ExternalMusicFetcher:
         except RuntimeError:
             raise
         except Exception as e:
+            _detail = str(e)
             raise RuntimeError(
-                f"Could not fetch Qobuz metadata via mirror for {kind}/{item_id}: {e}. "
-                "Qobuz ids are region-scoped, so an id copied from one storefront's "
-                "URL may not exist in another region's catalog — try the same release "
-                "from a different Qobuz storefront, or use a Spotify/Apple link instead."
+                f"Could not fetch Qobuz metadata via mirror for {kind}/{item_id}: "
+                f"{_detail}. {_qobuz_failure_hint(_detail)}"
             ) from e
 
         album_title = data.get("title", "")
@@ -434,20 +554,18 @@ class ExternalMusicFetcher:
         release_year = data.get("release_year") or (
             int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
         )
-        total_tracks = data.get("total_tracks") or len(data.get("tracks", []))
+        total_tracks = data.get("total_tracks") or len(data.get("tracks") or [])
 
         result = []
         for t in data.get("tracks") or []:
-            rd = release_date
-            ry = release_year
             result.append(TrackMetadata(
                 title=t.get("title") or "",
                 artists=t.get("artists") or [],
                 album=album_title,
                 album_artists=album_artists,
                 artwork_url=artwork_url,
-                release_date=rd or None,
-                release_year=ry,
+                release_date=release_date or None,
+                release_year=release_year,
                 track_number=t.get("track_number"),
                 disc_number=t.get("disc_number"),
                 total_tracks=total_tracks,
@@ -455,6 +573,7 @@ class ExternalMusicFetcher:
                 isrc=t.get("isrc") or None,
                 album_id=t.get("album_id") or item_id,
                 is_explicit=t.get("explicit"),
+                qobuz_track_id=str(t["track_id"]) if t.get("track_id") else None,
             ))
         self._stamp_request_kind(result, "album")
         return result
@@ -539,6 +658,12 @@ class ExternalMusicFetcher:
             album_id=str(album.get("id")) if album.get("id") else None,
             upc=album.get("upc") or None,
             is_explicit=item.get("parental_warning") if isinstance(item.get("parental_warning"), bool) else None,
+            # The mirror's album payload spells it track_id; Qobuz's own
+            # track/get spells it id. Both reach here.
+            qobuz_track_id=(
+                str(item.get("track_id") or item.get("id"))
+                if (item.get("track_id") or item.get("id")) else None
+            ),
         )
 
     @staticmethod
@@ -651,7 +776,7 @@ class ExternalMusicFetcher:
                 artwork_url = data.get("artwork_url")
                 release_date = data.get("release_date") or ""
                 release_year = int(release_date[:4]) if release_date and release_date[:4].isdigit() else None
-                total_tracks = data.get("total_tracks") or len(data.get("tracks", []))
+                total_tracks = data.get("total_tracks") or len(data.get("tracks") or [])
 
                 result = []
                 for t in data.get("tracks") or []:
@@ -1007,7 +1132,12 @@ class ExternalMusicFetcher:
             if cover:
                 artwork_url = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/1280x1280.jpg"
 
-        raw_id = data.get("id")
+        # The mirror's /api/meta/track and playlist payloads key the id as
+        # "track_id" (tidal_server._track_metadata_dict); "id" is the tidalapi
+        # shape. Reading only "id" left tidal_track_id null for every pasted
+        # Tidal track/playlist URL, silently disabling BUG-44's known-id path.
+        # Same precedence the album branch above already uses.
+        raw_id = data.get("track_id") or data.get("id")
         tidal_track_id = str(raw_id) if raw_id else None
         return TrackMetadata(
             title=data.get("title") or "",

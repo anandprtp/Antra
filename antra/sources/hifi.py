@@ -4,7 +4,7 @@ HiFi adapter — free FLAC via community-run hifi-api instances.
 These are public endpoints running the open-source hifi-api project
 (github.com/binimum/hifi-api), which wraps Tidal's streaming API.
 No account required. Requests are sent in parallel; first valid
-response wins (same strategy as SpotiFLAC).
+response wins.
 
 Audio quality: up to Hi-Res FLAC 24-bit/192kHz depending on instance.
 Falls back to 16-bit FLAC if hi-res is unavailable for a track.
@@ -228,9 +228,15 @@ class HifiAdapter(BaseSourceAdapter):
                     return None
                 if r.status_code == 200:
                     data = r.json()
-                    items = data.get("data", {}).get("items", [])
+                    items = (data.get("data") or {}).get("items") or []
                     for item in items:
-                        if item.get("isrc", "").upper() == track.isrc.upper():
+                        if (item.get("isrc") or "").upper() == track.isrc.upper():
+                            # One ISRC can cover two mixes (BUG-MIX-1 cause 3), so an
+                            # ISRC hit of clearly the wrong length is not our recording.
+                            dur = item.get("duration")
+                            if (dur and track.duration_seconds
+                                    and not duration_close(track.duration_seconds, dur, tolerance=30)):
+                                continue
                             return {"item": item, "endpoint": ep}
                 else:
                     logger.debug(f"[HiFi] ISRC search {ep} returned {r.status_code}")
@@ -297,7 +303,7 @@ class HifiAdapter(BaseSourceAdapter):
                     self._mark_endpoint_429(ep)
                     return None
                 if r.status_code == 200:
-                    return r.json().get("data", {}).get("items", [])
+                    return (r.json().get("data") or {}).get("items") or []
                 else:
                     logger.debug(f"[HiFi] Text search {ep} returned {r.status_code}")
             except Exception as e:
@@ -322,22 +328,31 @@ class HifiAdapter(BaseSourceAdapter):
                 if not items:
                     continue
                 for item in items:
-                    artist_name = item.get("artist", {}).get("name", "")
+                    if not isinstance(item, dict):
+                        continue
+                    artist_name = (item.get("artist") or {}).get("name") or ""
                     score = score_similarity(
                         query_title=track.title,
                         query_artists=track.artists,
-                        result_title=item.get("title", ""),
+                        result_title=item.get("title") or "",
                         result_artist=artist_name,
                     )
                     duration = item.get("duration")
                     if duration and track.duration_seconds:
+                        # Gate, not just a discount: with MIN_SIMILARITY this low a x0.8
+                        # penalty let a different-length version win (cf. JioSaavn).
+                        if not duration_close(track.duration_seconds, duration, tolerance=20):
+                            continue
                         if not duration_close(track.duration_seconds, duration, tolerance=10):
                             score *= 0.8
 
                     if score > best_score:
+                        candidate = self._item_to_result(item, ep, score=score)
+                        if candidate is None:
+                            continue   # unparseable item must not raise the bar for valid ones
                         best_score = score
                         best_ep = ep
-                        best_result = self._item_to_result(item, ep, score=score)
+                        best_result = candidate
 
         if best_result and best_score >= MIN_SIMILARITY:
             logger.debug(f"[HiFi] Best match score={best_score:.2f}: {best_result.title}")
@@ -362,7 +377,8 @@ class HifiAdapter(BaseSourceAdapter):
         score: float = 0.0,
     ) -> Optional[SearchResult]:
         try:
-            artist = item.get("artist", {}).get("name", "")
+            artist = (item.get("artist") or {}).get("name") or ""
+            album_obj = item.get("album") or {}
             duration = item.get("duration")
             bit_depth = self._infer_bit_depth(item)
             # Store both the track ID and the endpoint so download() knows where to go
@@ -386,14 +402,14 @@ class HifiAdapter(BaseSourceAdapter):
                     source_meta["disc_number"] = int(dn)
                 except (TypeError, ValueError):
                     pass
-            art = item.get("album", {}).get("imageCoverUrl") or item.get("album", {}).get("cover")
+            art = album_obj.get("imageCoverUrl") or album_obj.get("cover")
             if art:
                 source_meta["artwork_url"] = art
             return SearchResult(
                 source=self.name,
-                title=item.get("title", ""),
+                title=item.get("title") or "",
                 artists=[artist],
-                album=item.get("album", {}).get("title"),
+                album=album_obj.get("title"),
                 duration_ms=int(duration * 1000) if duration else None,
                 audio_format=AudioFormat.FLAC,
                 quality_kbps=None,

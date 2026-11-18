@@ -25,6 +25,8 @@ from antra.core.config import Config
 from antra.core.external_music_fetcher import ExternalMusicFetcher
 from antra.core.spotify import SpotifyClient, _GQL_ALBUM_HASH
 
+from antra.core.spotify_partner import post_persisted_payload
+
 logger = logging.getLogger(__name__)
 
 _SPOTIFY_ALBUM_RE = re.compile(
@@ -200,11 +202,9 @@ def _spotify_partner_album(headers: dict[str, str], album_id: str, market: str =
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
-            resp = requests.post(
-                "https://api-partner.spotify.com/pathfinder/v2/query",
-                headers=headers,
-                json=payload,
-                timeout=8,
+            resp = post_persisted_payload(
+                requests.post, "https://api-partner.spotify.com/pathfinder/v2/query", payload,
+                headers=headers, timeout=8,
             )
             if resp.status_code == 429 and attempt < 2:
                 retry_after = resp.headers.get("Retry-After", "").strip()

@@ -15,7 +15,7 @@ import requests
 
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 from antra.sources.base import BaseSourceAdapter
-from antra.utils.matching import score_similarity, duration_close
+from antra.utils.matching import score_similarity, duration_close, has_severe_duration_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,7 @@ class QobuzAdapter(BaseSourceAdapter):
         resp = self._session.post(
             f"{self.BASE_URL}/user/login",
             params={"email": self.email, "password": self.password, "app_id": self.app_id},
+            timeout=30,
         )
         if resp.status_code in (401, 400) and not self._creds_refreshed:
             # App ID is likely stale — refresh and retry once
@@ -133,6 +134,7 @@ class QobuzAdapter(BaseSourceAdapter):
                 resp = self._session.post(
                     f"{self.BASE_URL}/user/login",
                     params={"email": self.email, "password": self.password, "app_id": self.app_id},
+                    timeout=30,
                 )
         resp.raise_for_status()
         data = resp.json()
@@ -142,6 +144,7 @@ class QobuzAdapter(BaseSourceAdapter):
 
     def _api_get(self, endpoint: str, **kwargs):
         """Wrapper for GET requests that automatically catches stale credentials."""
+        kwargs.setdefault("timeout", 30)   # this session has no default timeout
         resp = self._session.get(f"{self.BASE_URL}/{endpoint}", **kwargs)
         if resp.status_code in (401, 400) and not self._creds_refreshed:
             logger.debug(f"[Qobuz] API returned {resp.status_code} — credentials may be stale, refreshing…")
@@ -174,7 +177,7 @@ class QobuzAdapter(BaseSourceAdapter):
             )
             items = (resp.json().get("tracks") or {}).get("items", [])
             for item in items:
-                if item.get("isrc", "").upper() == (track.isrc or "").upper():
+                if (item.get("isrc") or "").upper() == (track.isrc or "").upper():
                     result = self._item_to_result(item, track, isrc_match=True)
                     if result is None:
                         continue
@@ -201,7 +204,9 @@ class QobuzAdapter(BaseSourceAdapter):
         return None
 
     def _search_by_text(self, track: TrackMetadata) -> Optional[SearchResult]:
-        query = f"{track.title} {track.primary_artist}"
+        # artists[0], not .primary_artist: that property answers "Unknown Artist"
+        # for an empty list, which would be searched for literally.
+        query = f"{track.title} {track.artists[0] if track.artists else ''}".strip()
         try:
             resp = self._api_get(
                 "track/search",
@@ -219,6 +224,10 @@ class QobuzAdapter(BaseSourceAdapter):
             performer = (item.get("performer") or {}).get("name", "")
             title = item.get("title", "")
             duration = item.get("duration")
+            # A wildly different length is a different recording, whatever the
+            # title says: reject it outright instead of discounting its score.
+            if duration and has_severe_duration_mismatch(track.duration_ms, duration * 1000):
+                continue
 
             score = score_similarity(
                 query_title=track.title,
@@ -232,10 +241,12 @@ class QobuzAdapter(BaseSourceAdapter):
                     score *= 0.8
 
             if score > best_score:
+                candidate = self._item_to_result(item, track)
+                if candidate is None:
+                    continue  # an item that cannot be built must not block a valid, lower-scoring one
                 best_score = score
-                best = self._item_to_result(item, track)
-                if best:
-                    best.similarity_score = score
+                best = candidate
+                best.similarity_score = score
 
         if best and best_score >= MIN_SIMILARITY:
             logger.debug(f"[Qobuz] Match score={best_score:.2f}: {best.title}")

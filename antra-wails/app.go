@@ -22,12 +22,24 @@ type App struct {
 	cancelDownload context.CancelFunc
 	activeCmd      *exec.Cmd
 	isStopping     bool
+	shuttingDown   bool           // SF-1: a kill during shutdown must not dequeue the job
+	queue          *downloadQueue // SF-1: persisted download queue, see download_queue.go
+	queueOnce      sync.Once
+	// PV-1: resolved-but-not-downloaded releases, see release_preview.go. The
+	// webview holds only the opaque ids; the temp-file paths stay here.
+	releasePreviewStore *releasePreviewStore
+	releasePreviewOnce  sync.Once
+	// issue #75: leftover playlist files the user may choose to delete, see
+	// playlist_orphans.go. Same rule — the webview holds only the opaque id.
+	playlistOrphanStore *playlistOrphanStore
+	playlistOrphanOnce  sync.Once
 	ffmpegExe      string // absolute path to bundled ffmpeg (empty = use PATH)
 	ffprobeExe     string // absolute path to bundled ffprobe (empty = use PATH)
 	ffmpegOnce     sync.Once
 	mediaServer    *http.Server
 	mediaBaseURL   string
 	mediaToken     string
+	writeGrants    []string // folders the user picked via PickDirectory; WriteFile is confined to these
 }
 
 // NewApp creates a new App application struct
@@ -185,9 +197,21 @@ func (a *App) cacheFfmpegPaths() {
 // shutdown is called when the application is closing.
 // Clean up any running backend processes so we don't leave orphans.
 func (a *App) shutdown(ctx context.Context) {
+	// SF-1 — set BEFORE the kill. The process-exit goroutine otherwise reads the
+	// kill as a failed job and removes it, which is exactly the job that has to
+	// come back as "interrupted" on the next launch.
+	a.mu.Lock()
+	a.shuttingDown = true
+	a.mu.Unlock()
+
 	_, cmd := a.detachActiveDownload()
 	if cmd != nil {
 		_ = killCommandTree(cmd)
+	}
+
+	// PV-1 - a preview that was never downloaded still has a temp cache file.
+	if a.releasePreviewStore != nil {
+		a.releasePreviewStore.clear()
 	}
 
 	a.mu.Lock()
@@ -221,6 +245,13 @@ func (a *App) shutdown(ctx context.Context) {
 		if !killed {
 			_ = exec.Command("pkill", "-f", "slskd").Run()
 		}
+
+		// Same safety net as the Windows branch above: catch a backend
+		// orphaned by an earlier crash, or by a build that predates the
+		// process-group kill. -x matches the exact process name, so it also
+		// covers the engine the PyInstaller bootloader forked under that
+		// same name, and it cannot match pkill's own command line.
+		_ = exec.Command("pkill", "-x", "AntraBackend").Run()
 	}
 }
 

@@ -172,7 +172,8 @@ class SlskdBootstrapManager:
             return None
 
         self._bin_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = self._bin_dir / str(name)
+        # basename only: `name` comes from API JSON and endswith(suffix) lets "../x/win-x64.zip" through
+        zip_path = self._bin_dir / Path(str(name)).name
         try:
             with requests.get(url, stream=True, timeout=30) as resp:
                 resp.raise_for_status()

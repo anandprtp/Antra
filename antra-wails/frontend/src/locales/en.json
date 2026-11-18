@@ -1,0 +1,1287 @@
+{
+  "account": {
+    "amazon_connected": "Amazon Music connected.",
+    "amazon_ended": "Amazon Music login ended unexpectedly.",
+    "amazon_failed": "Amazon Music login failed.",
+    "amazon_opening": "Opening Amazon Music login…",
+    "amazon_reading": "Reading your browser session…",
+    "amazon_session_expired": "Session likely expired — re-login recommended.",
+    "amazon_sign_in_then_click": "Sign in to Amazon Music in your browser, then click 'I'm Signed In' below.",
+    "amazon_wvd_required": "A Widevine device path is still required for downloads.",
+    "apple_connected": "Apple Music connected!",
+    "apple_ended": "Apple Music login ended unexpectedly.",
+    "apple_failed": "Apple Music login failed.",
+    "apple_opening": "Opening Apple Music login…",
+    "code_expired": "The code expired. Please try again.",
+    "expires_in_hm": "Expires in ~{h}h {m}m (est.)",
+    "expires_in_m": "Expires in ~{m}m (est.)",
+    "login_failed": "Login failed.",
+    "login_successful": "Login successful!",
+    "session_ended": "Your session has ended. Please sign in again.",
+    "spdc_connected": "Spotify account connected!",
+    "spdc_failed": "Failed to capture sp_dc.",
+    "spdc_no_session": "Login ended without capturing a session. Try again.",
+    "spdc_opening": "Opening browser…",
+    "tidal_connecting": "Connecting to TIDAL…",
+    "tidal_invalid_session_json": "Invalid session JSON: {error}",
+    "tidal_oauth_ended": "OAuth process ended unexpectedly.",
+    "tidal_oauth_failed": "OAuth login failed.",
+    "tidal_open_link": "Open the link below in your browser and log in to TIDAL:",
+    "tidal_session_valid": "TIDAL session is valid."
+  },
+  "analyzer": {
+    "add_files": "+ Add Files",
+    "audio_quality_analyzer": "🔬 Audio Quality Analyzer",
+    "audio_stats": "📊 Audio Stats",
+    "badge": {
+      "fake_lossless": "Fake Lossless",
+      "high_quality": "High Quality",
+      "hires_lossless": "Hi-Res Lossless",
+      "lossless": "Lossless",
+      "lossless_low_br": "Lossless (Low BR)",
+      "lossless_pcm": "Lossless (PCM)",
+      "lossless_unverified": "Lossless (unverified)",
+      "low_quality": "Low Quality",
+      "standard": "Standard",
+      "suspect_low_bitrate": "Suspect (Low Bitrate)",
+      "suspect_low_cutoff": "Suspect (low cutoff)"
+    },
+    "browse_files": "Browse Files",
+    "clear_all": "Clear All",
+    "confidence": "Confidence",
+    "consistent_with_lossless": "Consistent with lossless",
+    "content_to": "Content to",
+    "drag_to_pan_wheel_to_zoom_hover_to_read": "drag to pan · wheel to zoom · hover to read",
+    "drop_audio_files_or_a_folder_here": "Drop audio files or a folder here",
+    "export_all": "Export All",
+    "export_png": "Export PNG",
+    "exported_pngs_one": "Exported {count} PNG to {dir}",
+    "exported_pngs_other": "Exported {count} PNGs to {dir}",
+    "exporting_n": "Exporting {i}/{total}…",
+    "fft_failed": "Could not run FFT analysis: {error}",
+    "frequency_axis": "frequency ↑ 0 – {max} kHz",
+    "greyscale": "Greyscale",
+    "level_above": "Level above",
+    "lossy": "Lossy",
+    "lossy_from": "Lossy — {source}",
+    "magma": "Magma",
+    "n_analyzed": "{done} / {total} analyzed",
+    "nyquist": "Nyquist",
+    "png_failed": "PNG export failed",
+    "png_saved": "saved {name}",
+    "remove": "Remove",
+    "remove_all_files": "Remove all files",
+    "reset": "Reset",
+    "rolloff": "{db} dB/kHz",
+    "rolloff_at": "{db} dB/kHz at {khz} kHz",
+    "row": {
+      "album": "Album",
+      "artist": "Artist",
+      "bit_depth": "Bit Depth",
+      "bit_rate": "Bit Rate",
+      "channels": "Channels",
+      "codec": "Codec",
+      "cutoff": "Freq. Cutoff",
+      "duration": "Duration",
+      "file_size": "File Size",
+      "loudness": "Loudness",
+      "lra": "LRA",
+      "peak": "Peak",
+      "rms": "RMS",
+      "sample_rate": "Sample Rate",
+      "title": "Title",
+      "true_peak": "True Peak"
+    },
+    "spectral_analysis": "🔬 Spectral Analysis",
+    "spectrogram": "spectrogram",
+    "spectrogram_alt": "spectrogram for {name}",
+    "steepest_roll_off": "Steepest roll-off",
+    "supports_flac_mp3_m4a_aac_alac_wav_aiff": "Supports .flac .mp3 .m4a .aac .alac .wav .aiff .ogg",
+    "verdict": "Verdict",
+    "view_gallery": "▤ Gallery",
+    "view_single": "⊡ Single",
+    "viridis": "Viridis"
+  },
+  "app": {
+    "16_bit": "16-bit",
+    "24_bit": "24-bit",
+    "alac16_tooltip": "ALAC 16-bit — standard lossless",
+    "alac24_tooltip": "ALAC 24-bit Hi-Res — Apple Hi-Res Lossless",
+    "album_availability_studio": "Album Availability Studio",
+    "antra": "Antra",
+    "antra_now_downloads_through_your_own": "Antra now downloads through your own Antra account. It takes about 20 seconds — your password is never entered into this app, the browser handles it. Already a supporter? Pasting your supporter key works too.",
+    "artist": "Artist",
+    "artist_name": "Artist name...",
+    "atmos_locked_label": "🔒 Atmos",
+    "atmos_locked_tooltip": "Dolby Atmos is a supporter feature. Add a valid supporter key in Settings to unlock it.",
+    "atmos_note": "The Atmos mix is sourced from Tidal, Apple Music or Amazon Music — whichever service you paste a link from. Tracks with no Atmos mix will fail rather than silently download in stereo.",
+    "atmos_requires_key": "Dolby Atmos requires a supporter key. Add yours in Settings → Supporter Key.",
+    "atmos_tooltip": "Dolby Atmos — spatial mix from Tidal, Apple Music or Amazon Music, chosen by the link you paste",
+    "audio_analyzer": "Audio Analyzer",
+    "autosync_off_tooltip": "Enable auto-sync",
+    "autosync_on_tooltip": "Auto-sync on — click to disable",
+    "click_refresh_to_load_your_apple_music": "Click Refresh to load your Apple Music library.",
+    "click_refresh_to_load_your_library": "Click Refresh to load your library.",
+    "command_palette_ctrl_k": "Command palette (Ctrl+K)",
+    "connect_your_apple_music_account_in": "Connect your Apple Music account in Settings to see your library here.",
+    "connect_your_spotify_account_in_settings": "Connect your Spotify account in Settings to see your library here.",
+    "ctrl": "Ctrl",
+    "download_queue": "Download queue",
+    "downloaded_music": "Downloaded Music",
+    "export_this_tracklist_to_a_file": "Export this tracklist to a file",
+    "flac16_tooltip": "FLAC 16-bit — Deezer first, other mirrors as fallback",
+    "flac24_tooltip": "FLAC 24-bit Hi-Res — Tidal / Qobuz preferred",
+    "followed_artists": "Followed Artists",
+    "import_a_playlist_file_csv_m3u_xspf_jspf": "Import a playlist file (CSV, M3U, XSPF, JSPF, JSON) — e.g. an Exportify export",
+    "interrupted": "interrupted",
+    "join_our_discord_community": "Join our Discord community",
+    "join_our_telegram_community": "Join our Telegram community",
+    "library_folder_settings": "Library & Folder Settings",
+    "library_history": "Library History",
+    "liked_songs": "Liked Songs",
+    "load_library": "Load Library",
+    "loading_your_apple_music_library": "Loading your Apple Music library…",
+    "loading_your_spotify_library": "Loading your Spotify library…",
+    "log_in_with_antra": "Log in with Antra",
+    "lossless": "LOSSLESS",
+    "music_library_engine": "MUSIC LIBRARY ENGINE",
+    "my_library": "🎵 My Library",
+    "n_songs_one": "{count} song",
+    "n_songs_other": "{count} songs",
+    "open_settings": "Open Settings",
+    "paste_one_or_more_spotify_apple_music": "Paste one or more Spotify / Apple Music / SoundCloud / Amazon Music URLs (one per line or comma-separated)...",
+    "paste_url_hint": "Paste a URL above and press Add to Library",
+    "queue_interrupted_one": "{count} download interrupted last time",
+    "queue_interrupted_other": "{count} downloads interrupted last time",
+    "queue_paused": "Queue paused · {count} waiting",
+    "queue_up_next": "Up next · {count}",
+    "refresh_library": "Refresh library",
+    "refreshing": "Refreshing…",
+    "remove_from_queue": "Remove from queue",
+    "remove_item_aria": "Remove {title} from the queue",
+    "resume": "Resume",
+    "retry": "Retry",
+    "saved_albums": "Saved Albums",
+    "saved_songs": "Saved Songs",
+    "search": "🔍 Search",
+    "settings": "Settings",
+    "sign_in_to_start_downloading": "Sign in to start downloading",
+    "spotify": "Spotify",
+    "stop": "Stop",
+    "support_antra_on_patreon": "Support Antra on Patreon",
+    "themes": "Themes",
+    "tooltip_download_after_current": "Download after the current job finishes",
+    "tooltip_import_file": "Import file",
+    "tooltip_next_album": "Next album",
+    "tooltip_preview_30s": "Preview 30 seconds",
+    "tooltip_resume_after_current": "Continues after the current download",
+    "tooltip_stop_preview": "Stop preview",
+    "url": "🔗 URL",
+    "which_catalogue_to_search": "Which catalogue to search",
+    "your_mixes": "Your Mixes",
+    "your_music": "Your Music",
+    "your_playlists": "Your Playlists"
+  },
+  "artist": {
+    "n_followers": "{count} followers",
+    "no_artists_found": "No artists found.",
+    "percent_match": "{percent}% match",
+    "results_for": "Artist Results — \"{query}\"",
+    "searching": "Searching..."
+  },
+  "availability": {
+    "album_availability_studio": "🌍 Album Availability Studio",
+    "close": "✕ Close",
+    "country_by_country_availability": "country-by-country availability.",
+    "https_open_spotify_com_album_or_deezer": "https://open.spotify.com/album/... or deezer.com/album/...",
+    "inspect_album": "🔍 Inspect Album",
+    "inspecting": "⏳ Inspecting…",
+    "label_value": "Label: {label}",
+    "paste_a_single_spotify_or_deezer_album": "Paste a single Spotify or Deezer album link to inspect label, UPC, country coverage, and a live market view.",
+    "paste_a_spotify_or_deezer_album_url": "Paste a Spotify or Deezer album URL above to see",
+    "probing_markets_in_parallel_this_takes": "Probing markets in parallel… this takes up to 30 seconds for Spotify.",
+    "upc_value": "UPC: {upc}"
+  },
+  "common": {
+    "activity_log": "Activity Log",
+    "apple_music": "Apple Music",
+    "browse": "Browse",
+    "close": "Close",
+    "discover": "🌟 Discover",
+    "dismiss": "Dismiss",
+    "hr_min": "{h} hr {m} min",
+    "jump_to_bottom": "Jump to bottom",
+    "music_library_folder": "Music Library Folder",
+    "n_tracks_one": "{count} track",
+    "n_tracks_other": "{count} tracks",
+    "n_tracks_short_one": "{count} track",
+    "n_tracks_short_other": "{count} tracks",
+    "png": "PNG",
+    "support_on_patreon": "Support on Patreon",
+    "waiting_for_approval": "Waiting for approval…"
+  },
+  "diagnostic": {
+    "antra_hosts": "Antra servers",
+    "controls": "Other sites (for comparison)",
+    "copied": "Copied",
+    "copy": "Copy report",
+    "nothing_yet": "No results yet.",
+    "run": "Diagnose connection",
+    "run_again": "Run again",
+    "running": "Testing each server...",
+    "stage_dns": "name not found",
+    "stage_not_tls": "answered, but not with HTTPS",
+    "stage_ok": "reachable ({status})",
+    "stage_tcp": "refused the connection",
+    "stage_tls": "secure connection failed",
+    "title": "Connection diagnostic"
+  },
+  "discography": {
+    "all": "All",
+    "deselect_all": "Deselect All",
+    "download_n_releases_one": "Download {count} Release",
+    "download_n_releases_other": "Download {count} Releases",
+    "eps_and_compilations": "EPs & Compilations",
+    "fetching_discography": "Fetching discography...",
+    "n_selected": "{count} selected",
+    "none": "None",
+    "queue_title_artist_one": "{artist} — {count} release",
+    "queue_title_artist_other": "{artist} — {count} releases",
+    "queue_title_one": "{count} release",
+    "queue_title_other": "{count} releases",
+    "select_all": "Select All",
+    "select_releases_to_download": "Select releases to download"
+  },
+  "discover": {
+    "australia_au": "Australia (AU)",
+    "back_to_main": "Back to main",
+    "brazil_br": "Brazil (BR)",
+    "canada_ca": "Canada (CA)",
+    "china_cn": "China (CN)",
+    "egypt_eg": "Egypt (EG)",
+    "france_fr": "France (FR)",
+    "germany_de": "Germany (DE)",
+    "hong_kong_hk": "Hong Kong (HK)",
+    "india_in": "India (IN)",
+    "indonesia_id": "Indonesia (ID)",
+    "italy_it": "Italy (IT)",
+    "japan_jp": "Japan (JP)",
+    "loading_charts": "LOADING CHARTS...",
+    "malaysia_my": "Malaysia (MY)",
+    "mexico_mx": "Mexico (MX)",
+    "netherlands_nl": "Netherlands (NL)",
+    "new_zealand_nz": "New Zealand (NZ)",
+    "nigeria_ng": "Nigeria (NG)",
+    "no_items_found_for_this_selection": "No items found for this selection.",
+    "norway_no": "Norway (NO)",
+    "pakistan_pk": "Pakistan (PK)",
+    "philippines_ph": "Philippines (PH)",
+    "playlist": "Playlist",
+    "poland_pl": "Poland (PL)",
+    "preview_30_seconds": "Preview 30 seconds",
+    "recommended_playlists": "Recommended Playlists",
+    "refresh": "↻ Refresh",
+    "russia_ru": "Russia (RU)",
+    "saudi_arabia_sa": "Saudi Arabia (SA)",
+    "singapore_sg": "Singapore (SG)",
+    "source_spotify": "Spotify",
+    "source_spotify_connect": "Spotify (connect account)",
+    "south_africa_za": "South Africa (ZA)",
+    "south_korea_kr": "South Korea (KR)",
+    "spain_es": "Spain (ES)",
+    "sweden_se": "Sweden (SE)",
+    "taiwan_tw": "Taiwan (TW)",
+    "thailand_th": "Thailand (TH)",
+    "top_albums": "Top Albums",
+    "top_charts_all_genres": "Top Charts (All Genres)",
+    "turkey_tr": "Turkey (TR)",
+    "uae_ae": "UAE (AE)",
+    "united_kingdom_gb": "United Kingdom (GB)",
+    "united_states_us": "United States (US)",
+    "where_discover_content_comes_from": "Where Discover content comes from"
+  },
+  "failed": {
+    "dismiss_all": "× Dismiss All",
+    "dismiss_all_failed_tracks_from_this_view": "Dismiss all failed tracks from this view",
+    "retry_all": "↻ Retry All",
+    "retry_all_failed_tracks_one_by_one": "Retry all failed tracks one by one",
+    "retry_this_track": "Retry this track",
+    "retrying_progress": "Retrying {done} / {total}…",
+    "title": "✗ Failed ({count})",
+    "tooltip_expand": "Expand failed tracks",
+    "tooltip_minimize": "Minimize failed tracks"
+  },
+  "folder": {
+    "05_track_only_no_disc": "05 (track only, no disc)",
+    "101_201_disc_as_leading_digit": "101 / 201 (disc as leading digit)",
+    "2_05_disc_dash_track": "2-05 (disc-dash-track)",
+    "artist_casing": "Artist casing",
+    "cd1_cd2_subfolders": "CD1 / CD2 subfolders",
+    "click_a_token_to_insert_it_at_the_cursor": "Click a token to insert it at the cursor in the focused template field above.",
+    "default_skip_if_already_in_library": "(Default — skip if already in library anywhere)",
+    "default_writes_flac_and_m4a_a_real_multi": "Default writes FLAC and M4A a real multi-value artist field, which is what most scanners prefer. Pick a separator only if yours needs one flat string.",
+    "each_album_complete_allows_cross_album": "(Each album complete — allows cross-album duplicates)",
+    "every_album_folder_is_always_complete_a": "Every album folder is always complete. A track on both a studio album and a compilation will exist in both folders.",
+    "featured_artists": "Featured artists",
+    "filenames": "Filenames",
+    "folder_directory_structure": "Folder / directory structure",
+    "folder_structure": "Folder Structure",
+    "folder_structure_2": "📁 Folder Structure",
+    "formatting_sanitization": "Formatting & Sanitization",
+    "full_albums": "Full Albums",
+    "illegal_character_replacement": "Illegal character replacement",
+    "keep_various_artists_as_the_album_artist": "Keep “Various Artists” as the album artist",
+    "leave_empty_to_save_straight_into_the": "Leave empty to save straight into the library folder",
+    "library_mode": "Library Mode",
+    "move_takes_every_guest_out_of_the_artist": "“Move” takes every guest out of the artist tag and puts them in the title instead, so a collaboration files under one artist folder.",
+    "multi_disc_folder_help": "Multi-disc albums get a CD1/, CD2/ folder inside the album folder, with plain track numbers. Single-disc albums are unchanged.",
+    "multi_disc_handling": "Multi-disc handling",
+    "multiple_artists_joined_by": "Multiple artists joined by",
+    "navidrome_jellyfin_compatible_point_this": "Navidrome / Jellyfin compatible — point this at your media server's music directory.",
+    "no_album_folder_tracks_are_saved": "No album folder — tracks are saved directly in your library folder. Good for loose singles.",
+    "on_by_default_turn_it_off_to_file_each": "On by default. Turn it off to file each track of a compilation under its own artist instead of one Various Artists folder.",
+    "only_that_phrase_live_remix_instrumental": "Only that phrase. Live, Remix, Instrumental and the rest are kept — they tell two different recordings apart.",
+    "padding_digits": "Padding digits",
+    "playlist_prune_orphans": "Leftover files",
+    "playlist_prune_orphans_ask": "Tell me about them (recommended)",
+    "playlist_prune_orphans_ask_help": "After a playlist finishes, files in its folder that the playlist no longer contains are listed so you can remove them in one click. Nothing is deleted on its own.",
+    "playlist_prune_orphans_auto": "Delete them automatically",
+    "playlist_prune_orphans_auto_help": "Files in the playlist folder that the playlist no longer contains are deleted as soon as the playlist finishes. There is no confirmation and no undo.",
+    "playlist_prune_orphans_off": "Leave them alone",
+    "playlist_prune_orphans_off_help": "Files are never removed, even when the playlist no longer contains them.",
+    "playlist_renumber": "Renumber files when positions change",
+    "playlist_renumber_help": "Spotify's Liked Songs adds new songs at the top, which shifts every position. With this on, the files are renamed to match; with it off they keep the numbers they were first given.",
+    "playlist_storage_library": "Library structure — same as an album download",
+    "playlist_storage_library_help": "Playlist tracks are filed by the folder structure and filename format above, exactly like an album download. The playlist itself is still written as an .m3u pointing into your library.",
+    "playlist_storage_mode": "Playlist storage",
+    "playlist_storage_playlist_folder": "Playlist folder — <root>/Playlist Name/",
+    "playlist_storage_playlist_folder_help": "Playlist tracks are saved in a folder named after the playlist. The folder structure above is not applied to them.",
+    "prefix_2_05_dash_format": "Prefix (2-05 dash format)",
+    "preserve_spaces": "Preserve spaces",
+    "preview_value": "Preview: {value}",
+    "remove_repeated_artists": "Remove repeated artists",
+    "replace_with": "Replace with -",
+    "replace_with_2": "Replace with _",
+    "restore_folder_defaults": "↺ Restore folder defaults",
+    "save_preferences": "Save Preferences",
+    "saves_storage_if_a_track_was_downloaded": "Saves storage. If a track was downloaded as part of a Best Of, it won't be re-downloaded for the studio album.",
+    "services_routinely_list_the_main_artist": "Services routinely list the main artist twice. On by default; only affects tracks that actually repeat one.",
+    "single_track_filename": "Single track filename",
+    "smart_dedup": "Smart Dedup",
+    "strip_album_version": "Strip “(Album Version)”",
+    "text_transforms": "Text Transforms",
+    "text_transforms_help": "Applied to the tags written into each file and to filenames, so the two always agree. Matching is never affected — Antra still searches every service using the original title and artists, so changing anything here cannot make it download the wrong song.",
+    "title_casing": "Title casing",
+    "token_empty": "Empty when the source does not provide it",
+    "token_example": "e.g. {value}",
+    "token_help": "A token the source does not provide renders empty, and the brackets/dashes around it collapse. {today} is fixed for the whole run; {position} is the position within a playlist, not the album track number.",
+    "track_filename_inside_album_folder": "Track filename inside album folder",
+    "variables": "Variables",
+    "when_the_file_already_exists": "When the file already exists",
+    "whitespace_handling": "Whitespace handling"
+  },
+  "history": {
+    "clear_history": "Clear History",
+    "confirm_clear": "Are you sure you want to clear your library build history?",
+    "library_build_history": "🕒 Library Build History",
+    "n_failed": "· {count} failed",
+    "no_history_found": "No history found.",
+    "re_queue": "↩ Re-queue",
+    "re_queue_this_url": "Re-queue this URL"
+  },
+  "importer": {
+    "add_n_to_library": "Add {count} to Library",
+    "and_n_more": "…and {count} more",
+    "import_playlist_file": "Import playlist file",
+    "isrc": "ISRC",
+    "n_rows_skipped_one": "{count} row skipped",
+    "n_rows_skipped_other": "{count} rows skipped",
+    "n_skipped": "· {count} skipped",
+    "n_with_isrc": "· {count} with ISRC",
+    "no_downloadable_tracks_were_found_in": "No downloadable tracks were found in this file.",
+    "nothing_is_looked_up_now_each_row_is": "Nothing is looked up now — each row is matched when it downloads.",
+    "playlist_name": "Playlist name",
+    "skipped_row": "Row {row}: {reason}",
+    "truncated_warning": "This file has more than {max} tracks; only the first {max} will be imported."
+  },
+  "loading": {
+    "initializing_library_engine": "Initializing library engine...",
+    "optimized_for_navidrome_jellyfin": "Optimized for Navidrome & Jellyfin"
+  },
+  "log": {
+    "drag_to_resize_u00b7_arrow_keys_to_nudge": "Drag to resize \\u00b7 arrow keys to nudge \\u00b7 double-click to reset",
+    "hide_log": "Hide Log",
+    "n_lines_one": "{count} line",
+    "n_lines_other": "{count} lines",
+    "resize_the_activity_log_panel": "Resize the activity log panel",
+    "save_log_tooltip": "Save log",
+    "save_this_log_to_a_txt_file_credentials": "Save this log to a .txt file (credentials are removed)"
+  },
+  "mirrors": {
+    "operational": "{up} of {total} mirrors operational — click for the full status page",
+    "operational_avg": "{up} of {total} mirrors operational · avg {ms} ms — click for the full status page",
+    "status": "Status",
+    "unreachable": "Could not reach the status page — this does not mean the mirrors are down. Click to open it."
+  },
+  "opts": {
+    "casing": {
+      "lower": "lower case",
+      "nothing": "Leave as the service has it",
+      "sentence": "Sentence case",
+      "start": "Title Case",
+      "upper": "UPPER CASE"
+    },
+    "conflict": {
+      "append_counter": {
+        "label": "Keep both",
+        "note": "Downloads a second copy as “Title (2)”. Every run adds another copy, so use this deliberately."
+      },
+      "overwrite": {
+        "label": "Re-download and replace it",
+        "note": "Downloads the track again and replaces the file. If the new download fails, the original is put back."
+      },
+      "skip": {
+        "label": "Skip it (default)",
+        "note": "Never re-download a track that is already in your library."
+      },
+      "tag_only": {
+        "label": "Re-tag it, don’t re-download",
+        "note": "Refreshes the tags, cover and lyrics of the file already at this download’s path. Nothing is re-downloaded; a copy filed under a different album is skipped, not re-tagged. Tags you have switched off are not removed."
+      }
+    },
+    "datefmt": {
+      "dmy": "Day first",
+      "iso": "ISO — the default",
+      "mdy": "Month first",
+      "year": "Year only"
+    },
+    "export": {
+      "csv": "Exportify layout - re-imports into Antra",
+      "json": "Full metadata for scripting",
+      "m3u8": "Playlist file for music players",
+      "txt": "Plain readable list",
+      "xspf": "Open playlist standard"
+    },
+    "featured": {
+      "move": "Move guests into the title, keep one artist",
+      "nothing": "Leave it alone",
+      "remove": "Remove the credit from the title"
+    },
+    "format": {
+      "aac": "~320kbps AAC — uses JioSaavn directly",
+      "alac": "Apple Lossless .m4a — iPhone / Apple Music compatible",
+      "auto": "Best available — lossless preferred, MP3 fallback",
+      "lossless": "FLAC lossless — highest quality from any source",
+      "mp3": "~320kbps MP3 — uses JioSaavn / NetEase directly"
+    },
+    "postcmd": {
+      "batch": "Once, after the whole album or playlist",
+      "track": "After every track"
+    },
+    "separator": {
+      "comma": "Comma  —  A, B",
+      "default": "Default (real multi-value field)",
+      "semicolon": "Semicolon  —  A; B",
+      "slash": "Slash  —  A/B"
+    },
+    "tokengroup": {
+      "ids_other": "IDs & other",
+      "playlist": "Playlist",
+      "release": "Release",
+      "track": "Track"
+    }
+  },
+  "orphans": {
+    "body": "These are in the playlist folder but are not in the playlist any more.",
+    "delete": "Delete them",
+    "deleting": "Deleting…",
+    "dismiss": "Keep them",
+    "pruned": "Removed {count} leftover file(s) from {playlist}.",
+    "title": "{count} leftover file(s) in {playlist}"
+  },
+  "palette": {
+    "cmd": {
+      "artistsearch": "Search for an artist",
+      "bit_depth": "Bit depth: {depth}-bit",
+      "cancel": "Cancel the running download",
+      "download": "Start download",
+      "export": "Export tracklist as {format}",
+      "focusurl": "Focus the link field",
+      "format": "Output format: {name}",
+      "goto": "Go to: {name}",
+      "hide_log": "Hide the activity log",
+      "import": "Import a playlist file (CSV, M3U, XSPF, JSON)",
+      "import_hint": "Exportify, TuneMyMusic, Soundiiz",
+      "mode": "Appearance: {name}",
+      "paste": "Paste link and download",
+      "reset_log_width": "Reset the activity-log panel width",
+      "save_log": "Save the activity log to a file",
+      "show_log": "Show the activity log",
+      "signin": "Sign in with Antra",
+      "signout": "Sign out",
+      "sound": "Notification sound: {name}",
+      "source_remove": "Remove source: {name}",
+      "source_use": "Use source: {name}",
+      "theme": "Theme: {name}",
+      "typeface": "Typeface: {name}",
+      "win_analyzer": "Open Audio Analyzer",
+      "win_availability": "Open Album Availability Studio",
+      "win_folder": "Open Folder & Library settings",
+      "win_history": "Open Library History",
+      "win_music": "Open Downloaded Music",
+      "win_settings": "Open Settings",
+      "win_themes": "Open Themes"
+    },
+    "command_palette": "Command palette",
+    "group": {
+      "account": "Account",
+      "actions": "Actions",
+      "activity_log": "Activity log",
+      "appearance": "Appearance",
+      "download_source": "Download source",
+      "export": "Export",
+      "goto": "Go to",
+      "notification_sound": "Notification sound",
+      "output_format": "Output format",
+      "settings": "Settings",
+      "theme": "Theme",
+      "typeface": "Typeface",
+      "windows": "Windows"
+    },
+    "hint": {
+      "current": "current",
+      "selected": "selected"
+    },
+    "no_matches": "No matches",
+    "results": "Results",
+    "search_commands_and_settings": "Search commands and settings",
+    "search_commands_and_settings_2": "Search commands and settings…",
+    "surface": {
+      "folder": "Folder & Library",
+      "main": "Main screen",
+      "settings": "Settings",
+      "themes": "Themes"
+    },
+    "tab": {
+      "artist": "Artist search",
+      "discover": "Discover",
+      "library": "My Library",
+      "url": "Paste a link"
+    }
+  },
+  "player": {
+    "albums": "Albums",
+    "browse_and_play_albums_or_playlists": "Browse and play albums or playlists already saved to your library.",
+    "cannot_play": "The file could not be played in the embedded player.",
+    "downloaded_music": "🎵 Downloaded Music",
+    "loading_lyrics": "Loading lyrics…",
+    "loading_release": "Loading release...",
+    "no_lyrics_embedded_in_this_track": "No lyrics embedded in this track.",
+    "nothing_found": "No {kind} found in `{path}`.",
+    "nothing_playing": "Nothing playing",
+    "pick_an_album_or_playlist_to_start": "Pick an album or playlist to start browsing.",
+    "play_from_start": "Play From Start",
+    "play_release": "Play Release",
+    "playback_error": "Playback error: {error}",
+    "playlists": "Playlists",
+    "refresh": "Refresh",
+    "scanning_your_library": "Scanning your library...",
+    "select_a_track": "Select a downloaded track to play it here.",
+    "toggle_lyrics": "Toggle lyrics",
+    "unknown_artist": "Unknown artist",
+    "vol": "Vol"
+  },
+  "preview": {
+    "add_to_queue_n_one": "Queue {count} track",
+    "add_to_queue_n_other": "Queue {count} tracks",
+    "cancel": "Cancel",
+    "could_not_read": "That link could not be read.",
+    "download_now": "Download now",
+    "include_track_aria": "Include {title} in this download",
+    "n_of_m_selected_one": "{count} of {total} selected",
+    "n_of_m_selected_other": "{count} of {total} selected",
+    "preview": "Preview",
+    "resolving": "Reading…",
+    "select_all": "Select all",
+    "select_none": "Select none",
+    "tooltip_resolve_first": "Look up this link and show it before downloading"
+  },
+  "search": {
+    "kind_album": "Album",
+    "kind_artist": "Artist",
+    "kind_song": "Song",
+    "nothing_found": "Nothing found.",
+    "placeholder_album": "Album title...",
+    "placeholder_song": "Song title...",
+    "results_for": "Search Results — \"{query}\"",
+    "search": "Search",
+    "searching": "Searching...",
+    "what_to_search_for": "What to search for"
+  },
+  "settings": {
+    "0_keep_the_original": "0 = keep the original.",
+    "0_keep_the_original_default_1000": "0 = keep the original. Default 1000.",
+    "a_plain_text_summary_you_can_open_in_any": "A plain-text summary you can open in any editor — artist, year, label, UPC, running time and the full tracklist.",
+    "advanced_tags": "Advanced tags",
+    "antra_account": "👤 Antra Account",
+    "antra_version": "Antra v{version}",
+    "antra_will_run_the_program_shown_above": "Antra will run the program shown above on your computer after every download. Check it is what you meant — this is not undone by cancelling a download. Editing the command asks again.",
+    "antra_will_run_these_arguments": "Antra will run these arguments:",
+    "apple_music_account": "Apple Music Account",
+    "apple_token_help": "DevTools (F12) → Network → filter amp-api.music.apple.com → copy the Music-User-Token request header. Valid for ~30 days.",
+    "aq": "AQ...",
+    "artist_image_file_name": "Artist image file name",
+    "artwork_saved_beside_your_music_and": "Artwork saved beside your music, and artwork embedded inside each track. These are independent — turning one off never affects the other.",
+    "at_0_px_and_quality_90_the_downloaded": "At 0 px and quality 90 the downloaded image is saved exactly as the service sent it — no re-encoding, no quality loss.",
+    "auto_captures_your_session_after_login": "Auto-captures your session after login.",
+    "auto_sync_scheduled_downloads": "Auto-Sync / Scheduled Downloads",
+    "automatic_retries_for_transient_failures": "Automatic retries for transient failures like truncated downloads before a track is marked failed.",
+    "automatically_check_your_spotify_library": "Automatically check your Spotify library for new tracks and download them on a schedule. Enable sync per-playlist using the ↺ button on each card.",
+    "avoid_radio_edits_and_clean_versions": "Avoid radio edits and clean versions. When a track is marked explicit, Antra keeps searching if the first result looks censored.",
+    "both": "Both",
+    "cancel": "Cancel",
+    "catalog": {
+      "album_track_filename_template": {
+        "desc": "Filename template for tracks that belong to an album.",
+        "label": "Track filename inside album folder"
+      },
+      "album_various_artists": {
+        "desc": "Off files each track of a compilation under its own artist instead of one Various Artists folder.",
+        "label": "Keep \"Various Artists\" as album artist"
+      },
+      "antra_api_key": {
+        "desc": "Paste the key emailed to you after supporting on Patreon. Unlocks unlimited downloads and faster speeds.",
+        "label": "Supporter key"
+      },
+      "apple_music_user_token": {
+        "desc": "Music-User-Token that connects your Apple Music library.",
+        "label": "Apple Music account token"
+      },
+      "artist_casing": {
+        "desc": "Rewrite artist and album artist names as lower, upper, title or sentence case.",
+        "label": "Artist casing"
+      },
+      "artist_image_template": {
+        "desc": "Naming template for the artist photo.",
+        "label": "Artist image file name"
+      },
+      "auto_sync_days": {
+        "desc": "Which days of the week the scheduled sync runs on.",
+        "label": "Auto-sync days"
+      },
+      "auto_sync_enabled": {
+        "desc": "Automatically download new tracks from tracked playlists on a schedule.",
+        "label": "Auto-sync scheduled downloads"
+      },
+      "auto_sync_time": {
+        "desc": "Hour and minute the scheduled sync runs.",
+        "label": "Auto-sync time"
+      },
+      "cover_image_template": {
+        "desc": "Naming template for the cover image. Most players look for cover or folder.",
+        "label": "Cover file name"
+      },
+      "date_format": {
+        "desc": "How the date tag is written — ISO, year only, day first or month first.",
+        "label": "Date format"
+      },
+      "disabled_tags": {
+        "desc": "Switch individual tags off: title artist album album artist cover art track number track total disc number date year genre record label composer ISRC barcode UPC ISWC Spotify ID audio traits lyrics synced lyrics LRC.",
+        "label": "Advanced tags"
+      },
+      "download_path": {
+        "desc": "Where downloaded music is saved on disk.",
+        "label": "Music library folder"
+      },
+      "download_sources": {
+        "desc": "Restrict downloads to chosen services — Tidal, Qobuz, Apple Music, Amazon, Deezer — or use the full chain.",
+        "label": "Download sources"
+      },
+      "embedded_artwork_png": {
+        "desc": "Much larger files. JPEG is what almost every player expects.",
+        "label": "Embed artwork as PNG"
+      },
+      "embedded_artwork_size": {
+        "desc": "Longest edge in pixels for the artwork embedded in every track. 0 keeps the original.",
+        "label": "Embedded artwork size"
+      },
+      "featured_artists_mode": {
+        "desc": "Remove a feat. / ft. / featuring credit from the title, or move guests out of the artist tag into the title. Moving them keeps one album artist, so a track with a guest stops showing up as a second copy of the album in your library.",
+        "label": "Featured artists"
+      },
+      "filename_conflict_behavior": {
+        "desc": "Skip, re-tag the existing file without re-downloading (tag only), overwrite and replace, or keep both copies.",
+        "label": "When the file already exists"
+      },
+      "folder_structure_template": {
+        "desc": "Folder layout template. Leave empty to save straight into the library folder.",
+        "label": "Folder structure"
+      },
+      "font": {
+        "desc": "Interface font, including OpenDyslexic.",
+        "label": "Typeface"
+      },
+      "illegal_character_replacement": {
+        "desc": "What to substitute for characters the filesystem will not accept.",
+        "label": "Illegal character replacement"
+      },
+      "jpeg_image_quality": {
+        "desc": "Compression quality for saved JPEG cover art.",
+        "label": "JPEG quality"
+      },
+      "language": {
+        "desc": "Interface language. System follows the OS. Download logs stay English.",
+        "label": "Language"
+      },
+      "library_mode": {
+        "desc": "Smart dedup skips a track already anywhere in the library; Full albums keeps every album complete.",
+        "label": "Library mode"
+      },
+      "local_artwork_format": {
+        "desc": "JPEG or PNG for the saved cover file.",
+        "label": "Cover format"
+      },
+      "local_artwork_size": {
+        "desc": "Longest edge in pixels for the saved cover file. 0 keeps the original.",
+        "label": "Cover max size"
+      },
+      "max_retries": {
+        "desc": "How many times to retry a transient failure before marking the track failed.",
+        "label": "Failed track retries"
+      },
+      "mode": {
+        "desc": "Follow the system setting, or force light or dark.",
+        "label": "Light / dark mode"
+      },
+      "multi_artist_separator": {
+        "desc": "How several artists are joined in a tag: a real multi-value field, or a comma, semicolon or slash.",
+        "label": "Multiple artists joined by"
+      },
+      "multi_disc_handling": {
+        "desc": "How disc numbers appear on multi-disc releases: 2-05, 101/201, track only, or CD1/CD2 subfolders.",
+        "label": "Multi-disc handling"
+      },
+      "notify_batch_only": {
+        "desc": "Silences the per-track sound. Useful for large albums.",
+        "label": "Only notify when the whole download finishes"
+      },
+      "notify_sound": {
+        "desc": "Which sound plays when a track finishes downloading.",
+        "label": "Notification sound"
+      },
+      "notify_volume": {
+        "desc": "How loud the download notification sound is.",
+        "label": "Notification volume"
+      },
+      "output_format": {
+        "desc": "FLAC, ALAC, AAC or MP3, and the bit depth for the lossless formats.",
+        "label": "Output format"
+      },
+      "playlist_prune_orphans": {
+        "desc": "What to do with files in a playlist folder that the playlist no longer contains.",
+        "label": "Leftover playlist files"
+      },
+      "playlist_renumber": {
+        "desc": "Keep the numbers in playlist filenames matching the playlist order when songs are added or removed.",
+        "label": "Renumber playlist files"
+      },
+      "playlist_storage_mode": {
+        "label": "Playlist storage",
+        "desc": "Save playlist tracks in a playlist folder, or file them into the library like an album."
+      },
+      "post_command": {
+        "desc": "The program and arguments to run. Values like the track title are passed as arguments, never through a shell.",
+        "label": "Post-download command"
+      },
+      "post_command_enabled": {
+        "desc": "Post-download hook — trigger a Navidrome or Jellyfin library rescan, run beets, sync a folder. Off by default.",
+        "label": "Run a command after downloads"
+      },
+      "post_command_mode": {
+        "desc": "After every track, or once after the whole album or playlist finishes.",
+        "label": "When to run the command"
+      },
+      "post_command_timeout": {
+        "desc": "Seconds before the post-download command is terminated so it cannot stall a download.",
+        "label": "Command timeout"
+      },
+      "prefer_explicit": {
+        "desc": "Avoid radio edits and clean versions when the track is marked explicit.",
+        "label": "Prefer explicit versions"
+      },
+      "prevent_lossy_transcode": {
+        "desc": "Keep the original lossy file rather than converting AAC to MP3 and losing quality twice.",
+        "label": "Never re-encode lossy audio"
+      },
+      "preview_volume": {
+        "desc": "How loud the 30-second track previews play.",
+        "label": "Preview volume"
+      },
+      "remove_album_version": {
+        "desc": "Remove the Album Version suffix from titles and filenames. Live, Remix and Instrumental are kept.",
+        "label": "Strip \"(Album Version)\""
+      },
+      "remove_duplicate_artists": {
+        "desc": "Drop a duplicate artist the service listed twice in the same track.",
+        "label": "Remove repeated artists"
+      },
+      "replaygain_enabled": {
+        "desc": "Measure loudness and write ReplayGain 2.0 track and album gain so players level volume. Adds a decode pass per track.",
+        "label": "Write ReplayGain tags"
+      },
+      "save_artist_image": {
+        "desc": "Write an artist photo into the artist folder. Standard Artist / Album layout only.",
+        "label": "Save artist image"
+      },
+      "save_cover_art_sidecar": {
+        "desc": "Write a separate image next to the audio for Plex, Jellyfin and foobar2000.",
+        "label": "Save cover art file"
+      },
+      "sidecar_cue": {
+        "desc": "Write a .cue next to the audio with track order, titles and ISRCs. One sheet per disc.",
+        "label": "CUE sheet"
+      },
+      "sidecar_json": {
+        "desc": "Write a machine-readable .json of the release and every track, for scripts and library tools.",
+        "label": "Metadata file"
+      },
+      "sidecar_nfo": {
+        "desc": "Write a plain-text .nfo summary — artist, year, label, UPC, running time and the tracklist.",
+        "label": "Info file"
+      },
+      "single_track_filename_template": {
+        "desc": "Filename template for a track downloaded on its own.",
+        "label": "Single track filename"
+      },
+      "soulseek_enabled": {
+        "desc": "Use the Soulseek peer-to-peer network as an additional source.",
+        "label": "Soulseek (P2P)"
+      },
+      "soulseek_password": {
+        "desc": "Your Soulseek account password.",
+        "label": "Soulseek password"
+      },
+      "soulseek_seed_after_download": {
+        "desc": "Share finished files back to the Soulseek network.",
+        "label": "Seed after download"
+      },
+      "soulseek_username": {
+        "desc": "Your Soulseek account name.",
+        "label": "Soulseek username"
+      },
+      "spotify_sp_dc": {
+        "desc": "Connects your Spotify library, podcasts and auto-sync.",
+        "label": "Spotify account (sp_dc cookie)"
+      },
+      "strict_format": {
+        "desc": "Never accept a lower-quality substitute. Fail the track instead of silently saving an MP3 or AAC.",
+        "label": "Strict format"
+      },
+      "strict_matching": {
+        "desc": "Stricter duration and confidence checks for niche music. Fails uncertain tracks instead of guessing.",
+        "label": "Strict matching mode"
+      },
+      "theme": {
+        "desc": "Colour scheme, including the artwork-derived and custom themes.",
+        "label": "Theme"
+      },
+      "title_casing": {
+        "desc": "Rewrite track titles as lower case, UPPER CASE, Title Case or Sentence case.",
+        "label": "Title casing"
+      },
+      "track_number_padding": {
+        "desc": "How many digits track numbers are padded to.",
+        "label": "Track number padding"
+      },
+      "verify_audio_enabled": {
+        "desc": "Verify a download really contains the requested recording by comparing it with the track's 30-second preview.",
+        "label": "Check the audio matches the track"
+      },
+      "whitespace_handling": {
+        "desc": "Keep spaces, or replace them with underscores or dashes.",
+        "label": "Whitespace handling"
+      },
+      "write_antra_tags": {
+        "desc": "Writes ANTRA_VERSION, ANTRA_SOURCE and ANTRA_DOWNLOADED tags so old downloads can be found and re-fetched.",
+        "label": "Record Antra version in downloaded files"
+      },
+      "write_id3v1": {
+        "desc": "The old MP3 tag some car stereos and hardware players still need.",
+        "label": "Write legacy ID3v1 tag"
+      }
+    },
+    "choose_one_or_more_services_to_use_auto": "Choose one or more services to use. Auto uses the full resolver chain.",
+    "command": "Command",
+    "configure_your_spotify_account_in_the": "Configure your Spotify account in the section above to see your library here.",
+    "confirm_before_this_runs": "Confirm before this runs",
+    "confirmed_this_command_will_run_after": "Confirmed — this command will run after downloads.",
+    "connect_apple": "Connect Apple Music Account",
+    "connect_spotify": "Connect Spotify Account",
+    "connect_your_apple_music_account_to": "Connect your Apple Music account to unlock your personal library and playlist downloads.",
+    "connect_your_spotify_account_to_unlock": "Connect your Spotify account to unlock your personal library, Liked Songs, podcast downloads, and scheduled auto-sync.",
+    "connected_apple_music_library_enabled": "● Connected — Apple Music library enabled",
+    "connected_library_podcasts_and_auto_sync": "● Connected — library, podcasts, and auto-sync enabled",
+    "converting_one_lossy_format_into_another": "Converting one lossy format into another (e.g. AAC → MP3) loses quality twice. With this on, Antra keeps the original lossy file rather than re-encoding it. Lossless → MP3/AAC is unaffected, and so is same-format output.",
+    "could_not_reach_the_antra_servers_so": "⚠ Could not reach the Antra servers, so this key could not be verified. It has been saved — it will be checked again next time you are online.",
+    "cover": "cover",
+    "cover_art": "Cover Art",
+    "cover_file_name": "Cover file name",
+    "cover_name_help": "Most players look for cover or folder. Filename variables work here too.",
+    "cue_sheet_cue": "CUE sheet (.cue)",
+    "curl_fss_http_localhost_4533_api_scanner": "curl -fsS http://localhost:4533/api/scanner/scan",
+    "date_format": "Date format",
+    "days": "Days",
+    "download_source": "Download Source",
+    "downloads_count": "Downloads: {used} / {limit}",
+    "embed_as_png": "Embed as PNG",
+    "embedded_artwork": "Embedded artwork",
+    "enable_scheduled_auto_sync": "Enable scheduled auto-sync",
+    "failed_track_retries": "Failed track retries",
+    "find_rare_or_hi_res_versions_not_on": "Find rare or hi-res versions not on streaming. Requires account.",
+    "folder": "folder",
+    "format": "Format",
+    "free_tier": "Free tier. Claim your supporter key on the website to link it to this account.",
+    "free_tier_with_key": "Free tier — supporter features come from your key below.",
+    "groups": {
+      "advanced_tags": "Advanced tags",
+      "antra_account": "Antra Account",
+      "appearance": "Appearance",
+      "apple_music_account": "Apple Music Account",
+      "auto_sync": "Auto-Sync",
+      "cover_art": "Cover Art",
+      "downloads": "Downloads",
+      "formatting": "Formatting",
+      "library": "Library",
+      "matching": "Matching",
+      "naming": "Naming",
+      "notification_sound": "Notification Sound",
+      "previews": "Previews",
+      "sidecar_files": "Sidecar Files",
+      "sources": "Sources",
+      "spotify_account": "Spotify Account",
+      "text": "Text"
+    },
+    "how_the_date_tag_is_written_leave_this": "How the date tag is written. Leave this on ISO unless you have a reason not to — Windows Media Player shows nothing useful for the other three.",
+    "i_understand_run_this_command": "I understand — run this command",
+    "info_file_nfo": "Info file (.nfo)",
+    "jpeg": "JPEG",
+    "jpeg_quality": "JPEG quality",
+    "keep_a_hardlink_in_slskds_folder_so": "Keep a hardlink in slskd's folder so files are seeded back to the Soulseek network. Zero extra disk space.",
+    "key_how_to_get": "Already a supporter? Your key is emailed to you automatically after your Patreon payment — paste it below. Message me on Telegram or Discord if it hasn’t arrived.",
+    "key_not_needed": "Your account already carries supporter tier, so you don’t need a key here. Pasting one is harmless.",
+    "key_not_recognized": "Key not recognized",
+    "key_rejected": "✗ {reason} — this key will not unlock supporter features.",
+    "library_not_loaded_return_to_the_home": "Library not loaded — return to the home screen and click ↺ to refresh.",
+    "liked_songs": "♥ Liked Songs",
+    "loading_your_library": "Loading your library…",
+    "max_size_px": "Max size (px)",
+    "measures_each_tracks_loudness_replaygain": "Measures each track's loudness (ReplayGain 2.0, −18 LUFS) so players that support it can level volume. Album gain is written only when a whole album is downloaded in one go; playlists and partial albums get track gain. Adds a full decode pass per track. FLAC, MP3 and M4A only; skipped for Dolby Atmos.",
+    "metadata_file_json": "Metadata file (.json)",
+    "much_larger_files_jpeg_is_what_almost": "Much larger files. JPEG is what almost every player expects.",
+    "music_user_token_manual": "Music-User-Token (manual)",
+    "never_re_encode_lossy_audio": "Never re-encode lossy audio",
+    "not_connected": "○ Not connected",
+    "off_by_default_nothing_runs_until_you": "Off by default. Nothing runs until you confirm the exact command below.",
+    "old_car_stereos_and_hardware_players": "Old car stereos and hardware players often read only ID3v1. Harmless to leave on; turn it off if a scanner is picking up the truncated 30-character version of your titles.",
+    "opening_browser": "Opening browser...",
+    "opt_in_safety_mode_for_niche_music_antra": "Opt-in safety mode for niche music. Antra uses stricter duration and confidence checks, and will fail uncertain tracks instead of downloading risky matches.",
+    "paste_your_music_user_token_here": "Paste your Music-User-Token here…",
+    "paste_your_supporter_key_here": "Paste your supporter key here…",
+    "patreon_promo": "Need unlimited downloads, 2× faster speed, and concurrent downloads? Support on Patreon to get a supporter key with no limits — it’s emailed to you automatically after your payment.",
+    "playlists_to_sync": "Playlists to Sync",
+    "post_command_help": "Run a program when a download finishes — trigger a Navidrome or Jellyfin rescan, hand the file to beets, sync a folder to a phone. Antra never passes this through a shell: the command is split into arguments first, and values like the track title are then filled into those arguments, so a song titled \"; rm -rf ~\" stays one harmless argument.",
+    "post_command_mode_help": "A library rescan or a beets import usually wants \"once, after the whole album\" — running it per track fires it 200 times for a 200-track release.",
+    "post_download_command": "Post-Download Command",
+    "prefer_explicit_versions": "Prefer explicit versions",
+    "premium_key_active_expires": "✓ Premium key active — expires {date}",
+    "premium_key_active_forever": "✓ Premium key active — no expiry",
+    "record_antra_version_in_downloaded_files": "Record Antra version in downloaded files",
+    "run_a_command_after_downloads": "Run a command after downloads",
+    "save_and_close": "Save & Close",
+    "save_artist_image": "Save artist image",
+    "save_close": "Save & Close",
+    "save_cover_art_file": "Save cover art file",
+    "seed_after_download": "Seed after download",
+    "settings": "⚙️ Settings",
+    "sidecar_files": "Sidecar Files",
+    "sidecar_help": "Extra description files written next to your music, from the tracks that actually landed on disk. A folder is only described when this download accounts for every audio file in it, so re-downloading one track can never shrink an album's existing sidecar. Playlists already get an .m3u.",
+    "sign_in_with_your_antra_website_account": "Sign in with your Antra website account. Your password is never entered into this app — the browser handles it, and this device gets its own revocable token.",
+    "sign_out": "Sign out",
+    "signed_in": "✓ Signed in",
+    "signed_in_as": "✓ Signed in as {name}",
+    "signed_in_as_supporter": "✓ Signed in as {name} — supporter",
+    "signed_in_supporter": "✓ Signed in — supporter",
+    "slskd_user_pass": "user: {user} · pass: {pass}",
+    "slskd_web_ui": "slskd Web UI",
+    "soulseek_p2p": "Soulseek (P2P)",
+    "soulseek_password": "Soulseek Password",
+    "soulseek_username": "Soulseek Username",
+    "sources": "Sources",
+    "sp_dc_cookie_manual": "sp_dc cookie (manual)",
+    "sp_dc_manual_help": "Or paste manually: DevTools (F12) → Application → Cookies → find sp_dc. Valid for ~1 year.",
+    "spotify_account": "Spotify Account",
+    "strict_format_never_accept_a_lower": "Strict format — never accept a lower-quality substitute",
+    "strict_matching_mode": "Strict matching mode",
+    "support_on_patreon": "♥ Support on Patreon →",
+    "supporter_key": "🔑 Supporter Key",
+    "supporter_key_active_expires": "✓ Supporter key active — expires {date}",
+    "supporter_key_active_forever": "✓ Supporter key active — no expiry",
+    "sync_now": "↺ Sync Now",
+    "tags_all_on": "all on",
+    "tags_n_off": "{count} off",
+    "the_command_is_terminated_after_this": "The command is terminated after this long so it can never stall a download.",
+    "the_cover_stored_inside_every_track_one": "The cover stored inside every track. One copy per file, so size matters far more here than for the cover file above.",
+    "the_same_information_in_a_machine": "The same information in a machine-readable form, for scripts and library tools.",
+    "this_session_has_ended_sign_in_again": "✗ This session has ended — sign in again.",
+    "tier_unknown": "⚠ Could not check your account tier right now.",
+    "tier_unknown_with_key": "⚠ Could not check your account tier right now — your supporter key is active, so supporter features stay on.",
+    "time": "Time",
+    "timeout_seconds": "Timeout (seconds)",
+    "track_order_titles_and_isrcs_for": "Track order, titles and ISRCs for foobar2000, Plex and CD-burning tools. One sheet per disc.",
+    "turn_every_tag_back_on": "Turn every tag back on",
+    "unlimited_downloads": "Unlimited downloads",
+    "validating_key": "Validating key…",
+    "verify_audio_matches_track": "Check the audio matches the track",
+    "verify_audio_matches_track_desc": "After each download, compares the audio against the track's free 30-second preview and rejects the file when it is a different recording, so Antra tries another source instead. Catches files that carry the right tags but the wrong song. Costs one small preview download per track. Tracks with no preview are left alone, and an official instrumental or remix of the same recording cannot be told apart this way.",
+    "waiting_for_login": "Waiting for login…",
+    "want_the_full_experience": "🎁 Want the full experience?",
+    "when_to_run_it": "When to run it",
+    "when_you_ask_for_a_lossless_format_and": "When you ask for a lossless format and only a lossy copy is available, fail the track instead of silently saving an MP3/AAC. Failed tracks appear in the Failed panel with a retry button and the reason.",
+    "which_tags_get_written_into_each_file": "Which tags get written into each file. Everything is on by default — open this only if a specific tag is causing trouble in your player or library scanner.",
+    "write_legacy_id3v1_tag_mp3": "Write legacy ID3v1 tag (MP3)",
+    "write_replaygain_tags": "Write ReplayGain tags",
+    "writes_a_separate_image_next_to_the": "Writes a separate image next to the audio so players like Plex, Jellyfin and foobar2000 can find it.",
+    "writes_an_artist_photo_into_the_artist": "Writes an artist photo into the artist folder. Only applies to the standard Artist / Album layout.",
+    "writes_antra_version_antra_source_and": "Writes ANTRA_VERSION, ANTRA_SOURCE and ANTRA_DOWNLOADED tags so you can find and re-fetch folders written by an older version. Invisible in normal players.",
+    "your_browser_has_been_opened_sign_in": "Your browser has been opened. Sign in, then enter this code:",
+    "your_soulseek_password": "Your Soulseek password",
+    "your_soulseek_username": "Your Soulseek username"
+  },
+  "setup": {
+    "antra_account": "Antra Account",
+    "build_my_library": "Build My Library →",
+    "downloads_go_through_your_own_antra": "Downloads go through your own Antra account. Your password is never entered into this app — the browser handles sign-in and this device gets its own revocable token.",
+    "enter_this_code_in_your_browser": "Enter this code in your browser:",
+    "log_in_with_antra": "Log in with Antra",
+    "opening_browser": "Opening browser…",
+    "optimized_for_navidrome_jellyfin": "OPTIMIZED FOR NAVIDROME & JELLYFIN",
+    "paste_a_spotify_apple_music_or_amazon": "Paste a Spotify, Apple Music, or Amazon Music playlist and Antra builds your music library automatically.",
+    "pick_library_folder": "Please select your Music Library folder.",
+    "select_your_music_library_location": "Select your music library location...",
+    "setup_your_music_library": "Setup Your Music Library",
+    "signed_in": "✓ Signed in",
+    "signed_in_as": "✓ Signed in as {name}",
+    "soulseek_credentials_needed": "Please enter Soulseek credentials to enable P2P lossless sourcing. You can register a free account at slsknet.org.",
+    "you_can_sign_in_later_from_settings": "You can sign in later from Settings — downloads need an account or a supporter key.",
+    "your_music_offline_lossless": "Your music. Offline. Lossless."
+  },
+  "sponsor": {
+    "default_message": "Solo-maintained by one developer. Help fund bug fixes, updates, and endpoint costs.",
+    "default_title": "Support Antra"
+  },
+  "status": {
+    "accepted_via": "Accepted via {source}",
+    "added_to_library": "✓ Added to library",
+    "added_untagged_failed": "⚠ Added, but its tags could not be written",
+    "added_untagged_unsupported": "⚠ Added without tags (this file type can't hold them)",
+    "already_in_library": "Already in library",
+    "autosync_complete": "Auto-sync complete.",
+    "autosync_error": "Error: {error}",
+    "download_failed": "Download failed",
+    "downloading_from": "Downloading from {source}",
+    "downloading_from_retry": "Downloading from {source} • Retry {n}",
+    "export_done": "Exported {count} tracks to {path}",
+    "export_done_partial": "Exported {count} tracks to {path} (no data for: {columns})",
+    "export_failed": "Export failed: {error}",
+    "export_paste_link": "Paste a link first.",
+    "export_preparing": "Preparing export…",
+    "resolving_best": "Resolving best source…",
+    "resolving_source": "Resolving source…",
+    "retagged": "Re-tagged",
+    "retry_failed": "Retry failed",
+    "retrying_track": "Retrying failed track…",
+    "saved_untagged": "Saved untagged",
+    "unknown_track": "Unknown Track",
+    "waiting_soulseek": "Waiting for Soulseek transfer…"
+  },
+  "tags": {
+    "fields": {
+      "advisory": {
+        "label": "Advisory (explicit / clean)",
+        "note": "ALAC and AAC only. Writes the iTunes ITUNESADVISORY atom: 1 explicit, 2 clean. Nothing is written when no source states it."
+      },
+      "album": {
+        "label": "Album"
+      },
+      "album_artist": {
+        "label": "Album artist"
+      },
+      "artist": {
+        "label": "Artist"
+      },
+      "audio_traits": {
+        "label": "Audio traits",
+        "note": "Apple Music quality hints such as hi-res-lossless."
+      },
+      "barcode": {
+        "label": "Barcode / UPC"
+      },
+      "composer": {
+        "label": "Composer"
+      },
+      "cover": {
+        "label": "Cover art",
+        "note": "Artwork embedded inside the file. The separate cover.jpg is above."
+      },
+      "date": {
+        "label": "Date"
+      },
+      "disc_number": {
+        "label": "Disc number"
+      },
+      "genre": {
+        "label": "Genre"
+      },
+      "isrc": {
+        "label": "ISRC"
+      },
+      "iswc": {
+        "label": "ISWC"
+      },
+      "label": {
+        "label": "Record label"
+      },
+      "lyrics": {
+        "label": "Lyrics"
+      },
+      "spotify_id": {
+        "label": "Spotify ID"
+      },
+      "synced_lyrics": {
+        "label": "Synced lyrics (LRC)"
+      },
+      "title": {
+        "label": "Title"
+      },
+      "track_number": {
+        "label": "Track number"
+      },
+      "track_total": {
+        "label": "Track total",
+        "note": "The \"/12\" half of 3/12."
+      },
+      "year": {
+        "label": "Year",
+        "note": "FLAC only. Kept 4-digit whatever the date format is, because Windows Media Player reads it."
+      }
+    },
+    "groups": {
+      "core": "Core",
+      "identifiers": "Identifiers",
+      "lyrics": "Lyrics",
+      "ordering": "Ordering",
+      "release": "Release"
+    }
+  },
+  "themes": {
+    "aa": "Aa",
+    "accent": "ACCENT",
+    "accent_aria": "Accent: {name}",
+    "active": "ACTIVE",
+    "antra_originals": "ANTRA ORIGINALS",
+    "appearance": "APPEARANCE",
+    "applies_across_the_whole_app": "Applies across the whole app",
+    "base_neutral": "BASE NEUTRAL",
+    "base_neutral_accent": "Base Neutral × Accent",
+    "base_neutral_aria": "Base neutral: {name}",
+    "buttons_links_and_highlights_lightness": "Buttons, links and highlights. Lightness is fixed by the ramp, so every accent reads at the same contrast.",
+    "cards": {
+      "amazon_music": "Amazon Music blue, modern slate panels, and a cleaner streaming-app look.",
+      "antra": "Midnight jade with polished glass surfaces and a vivid aqua edge.",
+      "apple_music": "Apple Music with bright porcelain surfaces instead of another dark clone.",
+      "artwork": "Follows the cover art of whatever you are downloading or viewing. The whole surface is tinted, not just the accent.",
+      "custom": "Your own pairing: pick which grey the chrome is tinted toward, then pick the accent.",
+      "deezer": "Deezer’s neon energy, but cleaner: aubergine depth with electric violet.",
+      "ember": "Burnished copper, smoked cacao, and warm lounge lighting.",
+      "graphite": "Refined monochrome with silver ink and gallery-style restraint.",
+      "ocean": "Ink-blue depth with steel-blue highlights and cool contrast.",
+      "qobuz": "Editorial navy, hi-fi blue, and a more premium liner-note feel.",
+      "spotify": "Closer to Spotify itself: charcoal layers, sharp type, green only on action.",
+      "sunset": "Plum dusk, rose glow, and a softer golden finish.",
+      "tidal": "Luxury black-and-white with a restrained cool-aqua highlight."
+    },
+    "choose_from_antra_originals_or_streaming": "Choose from Antra originals or streaming-service-inspired looks. Your selection saves instantly.",
+    "custom": "CUSTOM",
+    "derived_from_cover_art": "Derived From Cover Art",
+    "dynamic": "DYNAMIC",
+    "every_theme_has_a_light_and_a_dark": "Every theme has a light and a dark ground",
+    "fonts": {
+      "antra": {
+        "desc": "The default. Fixed-width, keeps the activity log in neat columns.",
+        "label": "Antra Mono"
+      },
+      "dyslexic": {
+        "desc": "Weighted letter bottoms to reduce swapping. Applies everywhere, including the log.",
+        "label": "OpenDyslexic"
+      },
+      "nunito": {
+        "desc": "Rounded and soft. Easier for long browsing sessions.",
+        "label": "Nunito"
+      },
+      "system": {
+        "desc": "Follows your OS interface font — Segoe UI on Windows, SF on macOS.",
+        "label": "System"
+      }
+    },
+    "language": "Language",
+    "language_help": "Antra is English-only for now. Translations are welcome: the whole interface lives in one JSON file per language. Download logs stay in English on purpose, so a bug report is readable by whoever has to fix it.",
+    "language_sub": "What the interface is written in",
+    "language_system": "System",
+    "language_system_desc": "Follow the OS — currently {name}",
+    "modes": {
+      "dark": {
+        "desc": "Always dark",
+        "label": "Dark"
+      },
+      "light": {
+        "desc": "Always light",
+        "label": "Light"
+      },
+      "system": {
+        "desc": "Follow the OS",
+        "label": "System"
+      }
+    },
+    "notification_sound": "NOTIFICATION SOUND",
+    "only_when_whole_download_finishes": "Only when the whole download finishes",
+    "only_when_whole_download_finishes_sub": "Silences the per-track sound — useful for large albums. The finish flourish still plays.",
+    "original_themes": "Original Themes",
+    "plays_when_a_track_is_saved_click_a_card": "Plays when a track is saved · click a card to hear it",
+    "previews": "PREVIEWS",
+    "resolver_inspired_themes": "Resolver-Inspired Themes",
+    "sounds": {
+      "blip": {
+        "desc": "Two quick ticks. Minimal and quiet.",
+        "label": "Blip"
+      },
+      "crystal": {
+        "desc": "FM bell with a soft sub and a short plate tail. The default.",
+        "label": "Crystal"
+      },
+      "off": {
+        "desc": "No sound at all.",
+        "label": "Off"
+      },
+      "pluck": {
+        "desc": "Warm filtered string. Subtle enough for long album runs.",
+        "label": "Pluck"
+      }
+    },
+    "streaming_services": "STREAMING SERVICES",
+    "themes": "🎨 Themes",
+    "typeface": "TYPEFACE",
+    "volume": "Volume",
+    "volume_for_the_30_second_previews": "Volume for the 30-second ▶ previews",
+    "which_grey_every_surface_border_and": "Which grey every surface, border and neutral label is tinted toward."
+  }
+}

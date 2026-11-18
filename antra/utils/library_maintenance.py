@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -59,6 +60,7 @@ class DedupeReport:
     duplicate_albums_removed: int = 0
     tracks_moved: int = 0
     duplicate_tracks_deleted: int = 0
+    tracks_kept_for_quality: int = 0
 
 
 @dataclass
@@ -94,7 +96,8 @@ def find_duplicate_albums(root: str) -> list[DuplicateAlbumGroup]:
 
 
 def dedupe_duplicate_albums(root: str) -> DedupeReport:
-    album_entries = _scan_album_entries(Path(root).resolve())
+    root_path = Path(root).resolve()
+    album_entries = _scan_album_entries(root_path)
     by_path = {entry.path: entry for entry in album_entries}
     report = DedupeReport()
 
@@ -107,7 +110,13 @@ def dedupe_duplicate_albums(root: str) -> DedupeReport:
             duplicate_entry = by_path[duplicate_path]
             for track in duplicate_entry.tracks:
                 if track.identity in canonical_tracks:
-                    _delete_track_bundle(track.path)
+                    # The canonical album is chosen by folder name / track count, not by audio
+                    # quality, so its copy of this track can be the worse one. Never delete a
+                    # better file in favour of a worse one; leave it where it is.
+                    if _quality_rank(track.path) > _quality_rank(canonical_tracks[track.identity].path):
+                        report.tracks_kept_for_quality += 1
+                        continue
+                    _delete_track_bundle(track.path, stop_at=root_path)
                     report.duplicate_tracks_deleted += 1
                     continue
 
@@ -124,7 +133,7 @@ def dedupe_duplicate_albums(root: str) -> DedupeReport:
                 )
                 report.tracks_moved += 1
 
-            _remove_empty_dir(duplicate_path)
+            _remove_empty_dir(duplicate_path, root_path)
             if not duplicate_path.exists():
                 report.duplicate_albums_removed += 1
 
@@ -139,12 +148,15 @@ def find_duplicate_songs(root: str) -> list[DuplicateSongGroup]:
     next_group_id = 0
 
     for track in tracks:
-        matching_group_ids = {key_to_group[key] for key in track.identity_keys if key in key_to_group}
+        # A bare "title:<name>" is not an identity: "Intro" by two different artists
+        # shares it. Grouping on it merged unrelated songs, kept one and DELETED the rest.
+        group_keys = [k for k in track.identity_keys if not k.startswith("title:")]
+        matching_group_ids = {key_to_group[key] for key in group_keys if key in key_to_group}
         if not matching_group_ids:
             group_id = next_group_id
             next_group_id += 1
             groups_by_id[group_id] = [track]
-            for key in track.identity_keys:
+            for key in group_keys:
                 key_to_group[key] = group_id
             continue
 
@@ -154,8 +166,9 @@ def find_duplicate_songs(root: str) -> list[DuplicateSongGroup]:
             for merged_track in groups_by_id.pop(other_group_id, []):
                 groups_by_id[group_id].append(merged_track)
                 for key in merged_track.identity_keys:
-                    key_to_group[key] = group_id
-        for key in track.identity_keys:
+                    if not key.startswith("title:"):
+                        key_to_group[key] = group_id
+        for key in group_keys:
             key_to_group[key] = group_id
 
     duplicates: list[DuplicateSongGroup] = []
@@ -186,7 +199,7 @@ def dedupe_duplicate_songs(root: str) -> SongDedupeReport:
         report.groups_found += 1
         for duplicate_path in group.duplicates:
             report.playlist_entries_rewritten += _rewrite_playlist_manifests(root_path, duplicate_path, group.canonical)
-            _delete_track_bundle(duplicate_path)
+            _delete_track_bundle(duplicate_path, stop_at=root_path)
             report.duplicate_tracks_deleted += 1
 
     return report
@@ -317,6 +330,7 @@ def _choose_canonical_track(entries: list[TrackEntry]) -> TrackEntry:
     return sorted(
         entries,
         key=lambda entry: (
+            -_quality_rank(entry.path),            # never keep an MP3 and delete the FLAC of it
             not _is_under_albums(entry.path),
             entry.path.stat().st_mtime,
             len(entry.path.parts),
@@ -380,19 +394,29 @@ def _rewrite_playlist_manifests(root: Path, duplicate_audio: Path, canonical_aud
     return rewrites
 
 
-def _delete_track_bundle(audio_path: Path):
+def _delete_track_bundle(audio_path: Path, stop_at: Optional[Path] = None):
     if audio_path.exists():
         audio_path.unlink()
     for ext in SIDECAR_EXTENSIONS:
         sidecar = audio_path.with_suffix(ext)
         if sidecar.exists():
             sidecar.unlink()
-    _remove_empty_dir(audio_path.parent)
+    _remove_empty_dir(audio_path.parent, stop_at)
 
 
-def _remove_empty_dir(path: Path):
+def _remove_empty_dir(path: Path, stop_at: Optional[Path] = None):
+    """Remove `path` if empty, then each empty parent - but never `stop_at` or above it.
+
+    Unbounded, this climbed past the library: once the last track was deleted it removed
+    the (now empty) library root and then every empty ancestor of it.
+    """
+    stop = stop_at.resolve() if stop_at else None
     current = path
     while current.exists():
+        if stop is not None:
+            resolved = current.resolve()
+            if resolved == stop or stop not in resolved.parents:
+                break
         try:
             current.rmdir()
         except OSError:
@@ -418,10 +442,20 @@ def _is_under_albums(path: Path) -> bool:
 
 
 def _normalize(value: str) -> str:
-    value = value.lower()
-    value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"[^a-z0-9 ]+", "", value)
+    # Unicode-aware. The old [^a-z0-9 ] class deleted every non-ASCII letter, so
+    # "Привет 2" and "Пока 2" both became "2" and were grouped as duplicates (and one
+    # deleted); accented and CJK titles collided the same way.
+    value = unicodedata.normalize("NFKC", value or "").lower()
+    value = re.sub(r"[\W_]+", " ", value)
     return value.strip()
+
+
+# Extension as a coarse quality ranking: keep the best copy when collapsing duplicates.
+_QUALITY_RANK = {".flac": 3, ".m4a": 2, ".mp4": 2, ".mp3": 1, ".aac": 1, ".opus": 1}
+
+
+def _quality_rank(path: Path) -> int:
+    return _QUALITY_RANK.get(path.suffix.lower(), 0)
 
 
 def _majority(values: list[str]) -> Optional[str]:

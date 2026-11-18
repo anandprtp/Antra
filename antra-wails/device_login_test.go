@@ -162,19 +162,23 @@ func TestChooseCredential(t *testing.T) {
 
 // ── Phase A: endpoints come from the account, not the public gist ────────────
 
+// Hosts here must be real-shaped: F2 added an allowlist, so a placeholder
+// like tidal.example is now dropped on purpose and would fail this plumbing
+// test for an unrelated reason. Host policy itself is covered by
+// TestIsTrustedAntraHost.
 func TestEndpointEnvFrom(t *testing.T) {
 	full := endpointManifest{Mirrors: endpointManifestMirrors{
-		Tidal: "https://tidal.example/", Qobuz: "https://qobuz.example",
-		Deezer: "https://deezer.example", Amazon: "https://amazon.example",
-		Apple: "https://apple.example",
+		Tidal: "https://tidal.anandserver.cfd/", Qobuz: "https://qobuz.anandserver.cfd",
+		Deezer: "https://deezer.anandserver.cfd", Amazon: "https://amazon.anandserver.cfd",
+		Apple: "https://apple.anandserver.cfd",
 	}}
 	env := endpointEnvFrom(full)
 	want := map[string]string{
-		"TIDAL_MIRROR_URL":  "https://tidal.example", // trailing slash trimmed
-		"QOBUZ_MIRROR_URL":  "https://qobuz.example",
-		"DEEZER_MIRROR_URL": "https://deezer.example",
-		"APPLE_MIRRORS":     "https://apple.example",
-		"AMAZON_MIRRORS":    "https://amazon.example",
+		"TIDAL_MIRROR_URL":  "https://tidal.anandserver.cfd", // trailing slash trimmed
+		"QOBUZ_MIRROR_URL":  "https://qobuz.anandserver.cfd",
+		"DEEZER_MIRROR_URL": "https://deezer.anandserver.cfd",
+		"APPLE_MIRRORS":     "https://apple.anandserver.cfd",
+		"AMAZON_MIRRORS":    "https://amazon.anandserver.cfd",
 	}
 	got := map[string]string{}
 	for _, kv := range env {
@@ -208,7 +212,7 @@ func TestEndpointEnvFrom(t *testing.T) {
 
 	// The manifest key must actually be handed over when there is one.
 	withKey := endpointEnvFrom(endpointManifest{
-		Mirrors: endpointManifestMirrors{Tidal: "https://t.example"},
+		Mirrors: endpointManifestMirrors{Tidal: "https://tidal.anandserver.cfd"},
 		ApiKey:  "ak_shared_example",
 	})
 	if !contains(withKey, "ANTRA_MANIFEST_API_KEY=ak_shared_example") {
@@ -224,9 +228,9 @@ func TestEndpointEnvFrom(t *testing.T) {
 
 	// Partial manifest: absent entries are omitted, not exported blank — a blank
 	// would override a URL the backend could otherwise resolve for itself.
-	partial := endpointEnvFrom(endpointManifest{Mirrors: endpointManifestMirrors{Tidal: "https://t.example"}})
+	partial := endpointEnvFrom(endpointManifest{Mirrors: endpointManifestMirrors{Tidal: "https://tidal.anandserver.cfd"}})
 	joined := strings.Join(partial, " ")
-	if !strings.Contains(joined, "TIDAL_MIRROR_URL=https://t.example") {
+	if !strings.Contains(joined, "TIDAL_MIRROR_URL=https://tidal.anandserver.cfd") {
 		t.Error("partial manifest lost the one URL it had")
 	}
 	for _, absent := range []string{"QOBUZ_MIRROR_URL", "APPLE_MIRRORS", "AMAZON_MIRRORS", "DEEZER_MIRROR_URL"} {

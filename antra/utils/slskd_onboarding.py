@@ -129,26 +129,33 @@ def generate_config(username, password, api_key, port):
     SLSKD_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     SLSKD_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     
+    # json.dumps -> a YAML double-quoted scalar. Bare interpolation truncated a password at
+    # " #", broke on ": " and quotes, and let a newline in the value inject extra config keys.
+    q = json.dumps
     config_content = f"""
 soulseek:
-  username: {username}
-  password: {password}
+  username: {q(str(username))}
+  password: {q(str(password))}
 shares:
   directories:
-    downloads: {SLSKD_DOWNLOADS_DIR.absolute().as_posix()}
+    downloads: {q(SLSKD_DOWNLOADS_DIR.absolute().as_posix())}
 web:
-  port: {port}
+  port: {int(port)}
   https:
     disabled: true
   authentication:
     disabled: false
     api_keys:
       antra:
-        key: {api_key}
+        key: {q(str(api_key))}
         role: administrator
 """
     config_file = SLSKD_CONFIG_DIR / "slskd.yml"
     config_file.write_text(config_content.strip())
+    try:
+        config_file.chmod(0o600)   # holds the Soulseek password
+    except OSError:
+        pass
     return config_file
 
 

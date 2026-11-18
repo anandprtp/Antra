@@ -23,6 +23,7 @@ from typing import Optional
 import requests
 
 from antra.core.models import TrackMetadata
+from antra.utils.matching import search_match_score
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,41 @@ _AM_CATALOG = "https://amp-api.music.apple.com/v1/catalog/{storefront}"
 
 REQUEST_TIMEOUT = 15
 MAX_PLAYLIST_PAGES = 200  # safety cap at 5000 tracks (25 per page)
+MAX_ALBUM_PAGES = 50  # follow-up pages of an album's tracks relationship
+
+
+# ── Search-result helpers (issue #58) ─────────────────────────────────────────
+
+def _clean_itunes_url(url: str) -> str:
+    """Drop iTunes' `uo=4` tracking parameter from a music.apple.com URL.
+
+    It is not ours to propagate, and `?uo=4` on an album URL would otherwise be
+    carried into the download as part of the link the user queued.
+    """
+    if not url:
+        return ""
+    for sep in ("&uo=", "?uo="):
+        i = url.find(sep)
+        if i != -1:
+            url = url[:i]
+    return url
+
+
+def _itunes_artwork(url: Optional[str], size: int = 300) -> Optional[str]:
+    """Upscale iTunes' 100x100 thumbnail URL. Returns None unchanged."""
+    if not url:
+        return None
+    return re.sub(r"/\d+x\d+bb\.jpg$", f"/{size}x{size}bb.jpg", url)
+
+
+def _itunes_year(release_date: Optional[str]) -> Optional[int]:
+    """`1975-10-31T12:00:00Z` -> 1975. None when absent or unparseable."""
+    if not release_date or len(release_date) < 4:
+        return None
+    try:
+        return int(release_date[:4])
+    except ValueError:
+        return None
 
 
 def is_apple_music_url(url: str) -> bool:
@@ -215,7 +251,39 @@ class AppleFetcher:
                         cat_artist_name = (album_attrs.get("artistName") or "").strip()
                         cat_album_artists = [cat_artist_name] if cat_artist_name else []
 
-                        track_relationships = album_data[0].get("relationships", {}).get("tracks", {}).get("data", [])
+                        _rel = (album_data[0].get("relationships") or {}).get("tracks") or {}
+                        track_relationships = list(_rel.get("data") or [])
+                        # The relationship is paged: `include=tracks` returns the
+                        # first page and a `next` path for the rest. Ignoring it
+                        # returned a long album (box set, complete works) short
+                        # with no signal, and skipped the iTunes fallback below.
+                        # If a later page cannot be read, the partial list is NOT
+                        # returned as the album - fall through to the lookup path.
+                        _next = _rel.get("next")
+                        _complete = True
+                        for _page in range(MAX_ALBUM_PAGES):
+                            if not _next:
+                                break
+                            try:
+                                _r2 = self._session.get(
+                                    f"https://amp-api.music.apple.com{_next}",
+                                    headers={"Authorization": f"Bearer {token}", "Origin": "https://music.apple.com"},
+                                    params={"extend": "audioTraits"},
+                                    timeout=REQUEST_TIMEOUT,
+                                )
+                                if not _r2.ok:
+                                    raise RuntimeError(f"HTTP {_r2.status_code}")
+                                _d2 = _r2.json() or {}
+                            except Exception as _e:
+                                logger.debug(f"[Apple] Album tracks page failed ({_e}); using the lookup fallback")
+                                _complete = False
+                                break
+                            track_relationships.extend(_d2.get("data") or [])
+                            _next = _d2.get("next")
+                        else:
+                            _complete = not _next  # page ceiling hit with more to come
+                        if not _complete:
+                            raise RuntimeError("album track pages incomplete")
                         tracks = []
                         for t in track_relationships:
                             meta = self._catalog_item_to_metadata(t.get("attributes", {}), track_id=t.get("id"))
@@ -896,6 +964,91 @@ class AppleFetcher:
             return results
         except Exception as e:
             logger.debug(f"[Apple] Artist search failed: {e}")
+            return []
+
+    # ── Song / album search (issue #58) ──────────────────────────────────────
+    #
+    # The app could only ever search for an ARTIST, so finding one song meant
+    # opening the artist, reading the whole discography and guessing which
+    # release carried it. These two use the same free iTunes Search endpoint as
+    # search_artists() above - no token, no account - and return a real
+    # music.apple.com URL, which _RE_SONG / _RE_ALBUM at the top of this file
+    # already parse. Nothing downstream needs to change: the URL goes straight
+    # into the existing preview -> download path.
+
+    def search_songs(self, query: str, limit: int = 25) -> list[dict]:
+        """Search Apple Music for songs. Returns UI rows, iTunes' order kept.
+
+        Each result: {kind, id, title, artists, album, artwork_url, duration_ms,
+        is_explicit, year, match_score, url, source}
+        """
+        items = self._itunes_search(query, "song", limit)
+        out = []
+        for s in items:
+            title = s.get("trackName") or ""
+            url = _clean_itunes_url(s.get("trackViewUrl") or "")
+            if not title or not url:
+                continue
+            artist = s.get("artistName") or ""
+            out.append({
+                "kind": "song",
+                "id": str(s.get("trackId") or ""),
+                "title": title,
+                "artists": artist,
+                "album": s.get("collectionName") or "",
+                "artwork_url": _itunes_artwork(s.get("artworkUrl100")),
+                "duration_ms": s.get("trackTimeMillis") or 0,
+                "is_explicit": (s.get("trackExplicitness") or "") == "explicit",
+                "year": _itunes_year(s.get("releaseDate")),
+                "match_score": search_match_score(query, artist, title),
+                "url": url,
+                "source": "apple",
+            })
+        return out
+
+    def search_albums(self, query: str, limit: int = 25) -> list[dict]:
+        """Search Apple Music for albums. Returns UI rows, iTunes' order kept."""
+        items = self._itunes_search(query, "album", limit)
+        out = []
+        for a in items:
+            title = a.get("collectionName") or ""
+            url = _clean_itunes_url(a.get("collectionViewUrl") or "")
+            if not title or not url:
+                continue
+            artist = a.get("artistName") or ""
+            out.append({
+                "kind": "album",
+                "id": str(a.get("collectionId") or ""),
+                "title": title,
+                "artists": artist,
+                "album": "",
+                "artwork_url": _itunes_artwork(a.get("artworkUrl100")),
+                "track_count": a.get("trackCount") or 0,
+                "is_explicit": (a.get("collectionExplicitness") or "") == "explicit",
+                "year": _itunes_year(a.get("releaseDate")),
+                "match_score": search_match_score(query, artist, title),
+                "url": url,
+                "source": "apple",
+            })
+        return out
+
+    def _itunes_search(self, query: str, entity: str, limit: int) -> list[dict]:
+        """One iTunes Search call. Returns [] on any failure, never raises."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        # iTunes caps limit at 200 and 400s above it.
+        limit = max(1, min(int(limit or 25), 200))
+        try:
+            resp = self._session.get(
+                _ITUNES_SEARCH,
+                params={"term": query, "entity": entity, "limit": limit, "media": "music"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return resp.json().get("results", []) or []
+        except Exception as e:
+            logger.debug(f"[Apple] {entity} search failed: {e}")
             return []
 
     def _fetch_artist_artwork(self, artist_id: str, storefront: str) -> Optional[str]:

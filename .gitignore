@@ -163,3 +163,19 @@ OPERATIONS.md
 CHANGELOG_v1.1.8.md
 CHANGELOG_v1.1.*.md
 ANNOUNCEMENT_*.md
+*_ISSUE_HANDOFF.md
+# Flatpak build outputs (packaging/flatpak/ itself IS tracked)
+flatpak-stage/
+*.flatpak
+
+# Vendored fpcalc binary (fetched by tools/fetch_fpcalc.py)
+antra-wails/third_party/chromaprint/
+
+# Reference clones of third-party projects (not part of Antra)
+Symphonia/
+SpotiFlyer/
+chromaprint/
+
+# local AI agent skills (not part of the app)
+.agents/
+skills-lock.json

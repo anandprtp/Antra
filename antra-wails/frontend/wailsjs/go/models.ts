@@ -36,6 +36,9 @@ export namespace main {
 	    folder_structure?: string;
 	    album_folder_structure?: string;
 	    playlist_folder_structure?: string;
+	    playlist_storage_mode?: string;
+	    playlist_renumber?: boolean;
+	    playlist_prune_orphans?: string;
 	    single_track_structure?: string;
 	    filename_format?: string;
 	    single_track_filename_template?: string;
@@ -60,13 +63,47 @@ export namespace main {
 	    antra_api_key?: string;
 	    antra_device_token?: string;
 	    theme?: string;
+	    mode?: string;
 	    font?: string;
+	    language?: string;
+	    log_panel_width?: number;
+	    custom_base?: string;
+	    custom_accent?: string;
 	    notify_sound?: string;
 	    notify_volume?: number;
+	    preview_volume?: number;
 	    notify_batch_only?: boolean;
 	    download_source?: string;
 	    download_sources?: string[];
 	    save_cover_art_sidecar: boolean;
+	    cover_image_template?: string;
+	    local_artwork_size?: number;
+	    local_artwork_format?: string;
+	    jpeg_image_quality?: number;
+	    embedded_artwork_size?: number;
+	    embedded_artwork_png: boolean;
+	    save_artist_image: boolean;
+	    artist_image_template?: string;
+	    disabled_tags?: string[];
+	    date_format?: string;
+	    write_id3v1?: boolean;
+	    title_casing?: string;
+	    artist_casing?: string;
+	    remove_album_version?: boolean;
+	    remove_duplicate_artists?: boolean;
+	    featured_artists_mode?: string;
+	    multi_artist_separator?: string;
+	    album_various_artists?: boolean;
+	    post_command_enabled?: boolean;
+	    post_command_confirmed?: boolean;
+	    post_command?: string;
+	    post_command_mode?: string;
+	    post_command_timeout?: number;
+	    replaygain_enabled?: boolean;
+	    verify_audio_enabled?: boolean;
+	    sidecar_cue: boolean;
+	    sidecar_nfo: boolean;
+	    sidecar_json: boolean;
 	    auto_sync_enabled: boolean;
 	    auto_sync_hour: number;
 	    auto_sync_minute: number;
@@ -114,6 +151,9 @@ export namespace main {
 	        this.folder_structure = source["folder_structure"];
 	        this.album_folder_structure = source["album_folder_structure"];
 	        this.playlist_folder_structure = source["playlist_folder_structure"];
+	        this.playlist_storage_mode = source["playlist_storage_mode"];
+	        this.playlist_renumber = source["playlist_renumber"];
+	        this.playlist_prune_orphans = source["playlist_prune_orphans"];
 	        this.single_track_structure = source["single_track_structure"];
 	        this.filename_format = source["filename_format"];
 	        this.single_track_filename_template = source["single_track_filename_template"];
@@ -138,18 +178,68 @@ export namespace main {
 	        this.antra_api_key = source["antra_api_key"];
 	        this.antra_device_token = source["antra_device_token"];
 	        this.theme = source["theme"];
+	        this.mode = source["mode"];
 	        this.font = source["font"];
+	        this.language = source["language"];
+	        this.log_panel_width = source["log_panel_width"];
+	        this.custom_base = source["custom_base"];
+	        this.custom_accent = source["custom_accent"];
 	        this.notify_sound = source["notify_sound"];
 	        this.notify_volume = source["notify_volume"];
+	        this.preview_volume = source["preview_volume"];
 	        this.notify_batch_only = source["notify_batch_only"];
 	        this.download_source = source["download_source"];
 	        this.download_sources = source["download_sources"];
 	        this.save_cover_art_sidecar = source["save_cover_art_sidecar"];
+	        this.cover_image_template = source["cover_image_template"];
+	        this.local_artwork_size = source["local_artwork_size"];
+	        this.local_artwork_format = source["local_artwork_format"];
+	        this.jpeg_image_quality = source["jpeg_image_quality"];
+	        this.embedded_artwork_size = source["embedded_artwork_size"];
+	        this.embedded_artwork_png = source["embedded_artwork_png"];
+	        this.save_artist_image = source["save_artist_image"];
+	        this.artist_image_template = source["artist_image_template"];
+	        this.disabled_tags = source["disabled_tags"];
+	        this.date_format = source["date_format"];
+	        this.write_id3v1 = source["write_id3v1"];
+	        this.title_casing = source["title_casing"];
+	        this.artist_casing = source["artist_casing"];
+	        this.remove_album_version = source["remove_album_version"];
+	        this.remove_duplicate_artists = source["remove_duplicate_artists"];
+	        this.featured_artists_mode = source["featured_artists_mode"];
+	        this.multi_artist_separator = source["multi_artist_separator"];
+	        this.album_various_artists = source["album_various_artists"];
+	        this.post_command_enabled = source["post_command_enabled"];
+	        this.post_command_confirmed = source["post_command_confirmed"];
+	        this.post_command = source["post_command"];
+	        this.post_command_mode = source["post_command_mode"];
+	        this.post_command_timeout = source["post_command_timeout"];
+	        this.replaygain_enabled = source["replaygain_enabled"];
+	        this.verify_audio_enabled = source["verify_audio_enabled"];
+	        this.sidecar_cue = source["sidecar_cue"];
+	        this.sidecar_nfo = source["sidecar_nfo"];
+	        this.sidecar_json = source["sidecar_json"];
 	        this.auto_sync_enabled = source["auto_sync_enabled"];
 	        this.auto_sync_hour = source["auto_sync_hour"];
 	        this.auto_sync_minute = source["auto_sync_minute"];
 	        this.auto_sync_days = source["auto_sync_days"];
 	        this.tracked_playlists = source["tracked_playlists"];
+	    }
+	}
+	export class DeletePlaylistOrphansResult {
+	    deleted: number;
+	    failed: number;
+	    message: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DeletePlaylistOrphansResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.deleted = source["deleted"];
+	        this.failed = source["failed"];
+	        this.message = source["message"];
 	    }
 	}
 	export class DeviceAccountStatus {
@@ -187,6 +277,7 @@ export namespace main {
 	    expires_in: number;
 	    interval: number;
 	    error?: string;
+	    can_diagnose?: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new DeviceCodeResult(source);
@@ -200,6 +291,7 @@ export namespace main {
 	        this.expires_in = source["expires_in"];
 	        this.interval = source["interval"];
 	        this.error = source["error"];
+	        this.can_diagnose = source["can_diagnose"];
 	    }
 	}
 	export class DeviceRenewResult {
@@ -303,6 +395,84 @@ export namespace main {
 	        this.error = source["error"];
 	        this.reachable = source["reachable"];
 	    }
+	}
+	export class QueueEnqueueResult {
+	    id: string;
+	    started: boolean;
+	    position: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new QueueEnqueueResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.started = source["started"];
+	        this.position = source["position"];
+	    }
+	}
+	export class QueueItem {
+	    id: string;
+	    kind: string;
+	    urls?: string[];
+	    title: string;
+	    track_count?: number;
+	    state: string;
+	    added_at: string;
+	    interrupted?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new QueueItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.kind = source["kind"];
+	        this.urls = source["urls"];
+	        this.title = source["title"];
+	        this.track_count = source["track_count"];
+	        this.state = source["state"];
+	        this.added_at = source["added_at"];
+	        this.interrupted = source["interrupted"];
+	    }
+	}
+	export class QueueSnapshot {
+	    items: QueueItem[];
+	    paused: boolean;
+	    running_id: string;
+	    restored: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new QueueSnapshot(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.items = this.convertValues(source["items"], QueueItem);
+	        this.paused = source["paused"];
+	        this.running_id = source["running_id"];
+	        this.restored = source["restored"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 
 }

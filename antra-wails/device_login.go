@@ -14,8 +14,13 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +35,40 @@ type DeviceCodeResult struct {
 	ExpiresIn       int    `json:"expires_in"`
 	Interval        int    `json:"interval"`
 	Error           string `json:"error,omitempty"`
+	// CanDiagnose marks a failure the network diagnostic can say something
+	// useful about, so the UI only offers it when it would actually help.
+	CanDiagnose bool `json:"can_diagnose,omitempty"`
+}
+
+// describeSignInFailure turns a transport error into something a user can act
+// on, and logs the original so a bug report carries it (issue #72).
+//
+// The wording deliberately avoids "check your connection": in every report so
+// far the connection was fine and the problem was the path to these specific
+// hosts. Saying the wrong thing confidently is what kept this issue open.
+func describeSignInFailure(err error) string {
+	log.Printf("[SignIn] could not reach %s: %v", deviceAuthBase, err)
+	switch {
+	case looksNotTLS(err):
+		return "Something on your network replied instead of the Antra server, so the secure connection could not be set up. " +
+			"This is usually an ISP filter, a proxy, or a Wi-Fi sign-in page - a VPN normally fixes it. Run the connection diagnostic for details."
+	case isDNSFailure(err):
+		return "The Antra server's address could not be looked up. Your DNS provider may be blocking it - " +
+			"switching DNS to 1.1.1.1 or 8.8.8.8, or turning on a VPN, normally fixes this."
+	case isTimeout(err):
+		return "The Antra server did not answer in time. If this keeps happening, run the connection diagnostic."
+	}
+	return "Could not open a connection to the Antra servers. Other sites may work fine while these are blocked - run the connection diagnostic to find out which."
+}
+
+func isDNSFailure(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 type DeviceTokenResult struct {
@@ -38,6 +77,27 @@ type DeviceTokenResult struct {
 	Username string `json:"username,omitempty"`
 	Tier     string `json:"tier,omitempty"`
 	Error    string `json:"error,omitempty"`
+}
+
+// isTrustedAntraHost reports whether a base URL may be given the device token.
+//
+// The login endpoints use the hardcoded deviceAuthBase, but /api/device/status
+// and /api/device/renew are called against mirror URLs that come from the
+// PUBLIC gist manifest — and the token travels in X-API-Key. Without this check
+// anyone who could edit that gist (i.e. anyone who took the GitHub account)
+// could repoint the mirrors at their own server and harvest every user's token
+// on the next status poll.
+//
+// Failing the check withholds the credential; it does not disable the mirror.
+// A self-hosted endpoint therefore still serves downloads, it just never sees
+// an Antra account token it has no use for.
+func isTrustedAntraHost(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "antra.hoshi.cfd" || strings.HasSuffix(host, ".anandserver.cfd")
 }
 
 func deviceAuthURL(path string) string {
@@ -56,15 +116,32 @@ func (a *App) StartDeviceLogin() DeviceCodeResult {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return DeviceCodeResult{Error: "Could not reach the Antra servers. Check your connection."}
+		// Issue #72. This used to answer "Could not reach the Antra servers.
+		// Check your connection." and throw `err` away - which is the title of
+		// the bug report, and it was doubly unhelpful: the user's connection is
+		// usually fine (other sites work, and a VPN fixes it instantly), and
+		// the one fact that would have identified the cause was discarded, so
+		// the first reply on the issue had to be "have you tried a VPN?".
+		return DeviceCodeResult{Error: describeSignInFailure(err), CanDiagnose: true}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return DeviceCodeResult{Error: fmt.Sprintf("Server returned %d.", resp.StatusCode)}
 	}
+	return parseDeviceCode(resp.Body)
+}
+
+// parseDeviceCode decodes the /api/device/code reply and refuses a
+// verification_url that is not an https page on an Antra host: the UI hands it
+// straight to the OS browser.
+func parseDeviceCode(body io.Reader) DeviceCodeResult {
 	var out DeviceCodeResult
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(body).Decode(&out); err != nil {
 		return DeviceCodeResult{Error: "Unexpected response from server."}
+	}
+	if msg := verificationURLProblem(out.VerificationURL); msg != "" {
+		log.Printf("[SignIn] refusing verification_url %q", out.VerificationURL)
+		return DeviceCodeResult{Error: msg}
 	}
 	return out
 }
@@ -270,6 +347,10 @@ func (a *App) fetchDeviceAccountStatus(token string) DeviceAccountStatus {
 	client := &http.Client{Timeout: 6 * time.Second}
 	lastErr := ""
 	for _, base := range bases {
+		if !isTrustedAntraHost(base) {
+			lastErr = "No trusted Antra endpoint is available."
+			continue
+		}
 		req, err := http.NewRequest(http.MethodGet, base+"/api/device/status", nil)
 		if err != nil {
 			continue
@@ -406,7 +487,7 @@ func (a *App) RenewDeviceTokenIfNeeded() DeviceRenewResult {
 			break
 		}
 		base = strings.TrimRight(strings.TrimSpace(base), "/")
-		if base == "" {
+		if base == "" || !isTrustedAntraHost(base) {
 			continue
 		}
 		req, err := http.NewRequest(http.MethodPost, base+"/api/device/renew", bytes.NewReader([]byte("{}")))

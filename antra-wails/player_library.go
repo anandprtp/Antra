@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"math/rand"
+	"crypto/rand"
 	"mime"
 	"net"
 	"net/http"
@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -143,6 +144,7 @@ func (a *App) GetDownloadedRelease(relativePath string) string {
 		applyTrackProbeMetadata(&track, a.ffprobeExe)
 		tracks = append(tracks, track)
 	}
+	sortReleaseTracks(tracks)
 
 	detail := libraryReleaseDetail{
 		Kind:         kind,
@@ -177,8 +179,11 @@ func (a *App) ensureMediaServer() string {
 	}
 
 	token := make([]byte, 12)
-	if _, err := rand.New(rand.NewSource(time.Now().UnixNano())).Read(token); err != nil {
-		copy(token, []byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	// crypto/rand: the token is the only thing stopping other local processes and
+	// web pages from reading the library through this loopback server.
+	if _, err := rand.Read(token); err != nil {
+		listener.Close()
+		return ""
 	}
 	tokenHex := hex.EncodeToString(token)
 
@@ -415,6 +420,8 @@ func collectLegacyAlbumReleaseDirs(albumsRoot, folderStructure string) []string 
 	if folderStructure == "flat" {
 		return collectTopLevelReleaseDirs(albumsRoot)
 	}
+	// Top-level dirs are albums here, so CD<n>/ below them is already inside a
+	// release; collectTopLevelReleaseDirs never descends, nothing to collapse.
 
 	var releases []string
 	artistDirs, err := os.ReadDir(albumsRoot)
@@ -427,7 +434,7 @@ func collectLegacyAlbumReleaseDirs(albumsRoot, folderStructure string) []string 
 		}
 		fullArtistDir := filepath.Join(albumsRoot, artistDir.Name())
 		childReleases := collectTopLevelReleaseDirs(fullArtistDir)
-		if len(childReleases) == 0 && hasAudioFilesRecursive(fullArtistDir) {
+		if (len(childReleases) == 0 || allDiscFolders(childReleases)) && hasAudioFilesRecursive(fullArtistDir) {
 			releases = append(releases, fullArtistDir)
 			continue
 		}
@@ -469,13 +476,48 @@ func collectRootAlbumReleaseDirs(root string) []string {
 		}
 
 		childReleases := collectTopLevelReleaseDirs(fullPath)
-		if len(childReleases) == 0 {
+		if len(childReleases) == 0 || allDiscFolders(childReleases) {
 			releases = append(releases, fullPath)
 			continue
 		}
 		releases = append(releases, childReleases...)
 	}
 	return releases
+}
+
+var discFolderRe = regexp.MustCompile(`^CD\d+$`)
+
+// allDiscFolders reports whether every candidate release is a per-disc
+// subfolder (v2.0.0 DMX-4 "CD1/", "CD2/") — in which case their parent is the
+// release, not each disc on its own.
+func allDiscFolders(dirs []string) bool {
+	if len(dirs) == 0 {
+		return false
+	}
+	for _, d := range dirs {
+		if !discFolderRe.MatchString(filepath.Base(d)) {
+			return false
+		}
+	}
+	return true
+}
+
+// sortReleaseTracks orders tracks by disc then track number when every track
+// carries both tags. Path order puts CD10/ before CD2/, so a box set of ten or
+// more discs would otherwise play out of order. Tracks missing either tag keep
+// the plain path order they already had.
+func sortReleaseTracks(tracks []libraryReleaseTrack) {
+	for _, t := range tracks {
+		if t.DiscNumber <= 0 || t.TrackNumber <= 0 {
+			return
+		}
+	}
+	sort.SliceStable(tracks, func(i, j int) bool {
+		if tracks[i].DiscNumber != tracks[j].DiscNumber {
+			return tracks[i].DiscNumber < tracks[j].DiscNumber
+		}
+		return tracks[i].TrackNumber < tracks[j].TrackNumber
+	})
 }
 
 func collectPlaylistReleaseDirs(root string) []string {
@@ -750,6 +792,18 @@ func resolveLibraryPath(root, requested string) (string, error) {
 	rel, err := filepath.Rel(rootAbs, targetAbs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes library root")
+	}
+	// The check above is textual; a symlink inside the library could still lead out.
+	// A path that does not exist yet cannot be followed, so it keeps the textual verdict.
+	if realTarget, err := filepath.EvalSymlinks(targetAbs); err == nil {
+		realRoot, rerr := filepath.EvalSymlinks(rootAbs)
+		if rerr != nil {
+			realRoot = rootAbs
+		}
+		rel, err := filepath.Rel(realRoot, realTarget)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return "", fmt.Errorf("path escapes library root")
+		}
 	}
 	return targetAbs, nil
 }

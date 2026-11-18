@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,6 +63,9 @@ type Config struct {
 	FolderStructure             string `json:"folder_structure,omitempty"`
 	AlbumFolderStructure        string `json:"album_folder_structure,omitempty"`
 	PlaylistFolderStructure     string `json:"playlist_folder_structure,omitempty"`
+	PlaylistStorageMode         string `json:"playlist_storage_mode,omitempty"`  // issue #78: "playlist_folder" (default) | "library"
+	PlaylistRenumber            *bool  `json:"playlist_renumber,omitempty"`      // issue #75: pointer — default is true, so "" must not read as false
+	PlaylistPruneOrphans        string `json:"playlist_prune_orphans,omitempty"` // issue #75: "ask" (default) | "auto" | "off"
 	SingleTrackStructure        string `json:"single_track_structure,omitempty"`
 	FilenameFormat              string `json:"filename_format,omitempty"`
 	SingleTrackFilenameTemplate string `json:"single_track_filename_template,omitempty"`
@@ -102,7 +106,31 @@ type Config struct {
 	AntraApiKey      string `json:"antra_api_key,omitempty"`
 	AntraDeviceToken string `json:"antra_device_token,omitempty"`
 	Theme            string `json:"theme,omitempty"`
+	// "" = system (follow the OS), "light", "dark".  v2.0.0 THEME-2
+	Mode             string `json:"mode,omitempty"`
 	Font             string `json:"font,omitempty"`
+	// UI language (v2.0.0 SF-3). "" = follow the OS, which the webview reports
+	// via navigator.language on all three platforms — so this needs no Go binding.
+	// A plain string like Theme/Mode, not a *string: "" is itself the meaningful
+	// default (auto), so an absent key and an empty one mean the same thing and
+	// there is no third state to tell apart.
+	Language         string `json:"language,omitempty"`
+
+	// Custom theme axes (v2.0.0 THEME-4). Both are plain strings, not pointers:
+	// unlike the *bool settings, "" is itself the meaningful default here (the
+	// pair the [data-theme="custom"] block declares), so an absent key and an
+	// empty one mean the same thing and there is no third state to distinguish.
+	// v2.0.0 PORT-5 — width of the draggable activity-log panel, in CSS px.
+	// *int, NOT a plain int: the default is 380 and a plain int would read 0
+	// from every config.json written before PORT-5, which renders as a
+	// collapsed panel nobody can see. Same trap as NotifyVolume /
+	// EmbeddedArtworkSize. Absent means "never dragged" — the frontend
+	// supplies the default and omitempty keeps the key out of config.json
+	// until the user actually resizes.
+	LogPanelWidth *int `json:"log_panel_width,omitempty"`
+
+	CustomBase   string `json:"custom_base,omitempty"`
+	CustomAccent string `json:"custom_accent,omitempty"`
 	// Notification sounds (v1.1.8 FEAT-13). Volume is a *int and BatchOnly a
 	// *bool on purpose: a plain int reads 0 (= silent) and a plain bool reads
 	// false when the key is absent from an existing config.json, which would
@@ -110,10 +138,76 @@ type Config struct {
 	// PreferExplicit / the FEAT-3/2/4 settings.
 	NotifySound         string        `json:"notify_sound,omitempty"`
 	NotifyVolume        *int          `json:"notify_volume,omitempty"`
+	// v2.0.0 FR-5 — previews get their OWN volume, separate from both the
+	// notification sounds and the library player. Pointer for the same reason
+	// as NotifyVolume: a plain int reads 0 (silent) when the key is absent.
+	PreviewVolume       *int          `json:"preview_volume,omitempty"`
 	NotifyBatchOnly     *bool         `json:"notify_batch_only,omitempty"`
 	DownloadSource      string        `json:"download_source,omitempty"`
 	DownloadSources     []string      `json:"download_sources,omitempty"`
 	SaveCoverArtSidecar bool          `json:"save_cover_art_sidecar"`
+
+	// v2.0.0 FR-2 — cover art settings. The three ints are *int and NOT plain
+	// ints on purpose: JpegImageQuality defaults to 90 and EmbeddedArtworkSize
+	// to 1000, so a plain int would read 0 from any config.json written before
+	// FR-2 and silently drop quality to the floor and uncap embedded artwork
+	// for every existing user. Same trap as NotifyVolume / PreferExplicit.
+	CoverImageTemplate  string        `json:"cover_image_template,omitempty"`
+	LocalArtworkSize    *int          `json:"local_artwork_size,omitempty"`
+	LocalArtworkFormat  string        `json:"local_artwork_format,omitempty"`
+	JpegImageQuality    *int          `json:"jpeg_image_quality,omitempty"`
+	EmbeddedArtworkSize *int          `json:"embedded_artwork_size,omitempty"`
+	EmbeddedArtworkPng  bool          `json:"embedded_artwork_png"`
+	SaveArtistImage     bool          `json:"save_artist_image"`
+	ArtistImageTemplate string        `json:"artist_image_template,omitempty"`
+	// v2.0.0 PORT-2 - sidecar files. Plain bools, NOT pointers: false IS the
+	// default here, so an older config.json reading false is the correct
+	// answer - not the silent-downgrade trap that made the FR-2 ints *int.
+	// v2.0.0 DMX-1 - per-tag write toggles. DisabledTags is a []string of the
+	// tags switched OFF, not twenty booleans: a nil slice (what every
+	// pre-DMX-1 config.json produces) means nothing is disabled, so absent
+	// naturally reads as the default. Twenty plain bools would each read
+	// false there and strip every tag at once - the *bool trap, twentyfold.
+	// WriteId3v1 IS a pointer, because that one defaults to true.
+	DisabledTags        []string      `json:"disabled_tags,omitempty"`
+	DateFormat          string        `json:"date_format,omitempty"`
+	WriteId3v1          *bool         `json:"write_id3v1,omitempty"`
+	// v2.0.0 DMX-2 - output-only text transforms. RemoveDuplicateArtists and
+	// AlbumVariousArtists ARE pointers because both default to TRUE: a plain
+	// bool would read false from every config.json written before DMX-2 and
+	// silently turn them off - the NotifyVolume / PreferExplicit / FR-2 trap.
+	// RemoveAlbumVersion is a plain bool because false IS its default, and the
+	// three strings use "" to mean "use the default" (clamped in Python by
+	// migrate_legacy_templates).
+	TitleCasing            string `json:"title_casing,omitempty"`
+	ArtistCasing           string `json:"artist_casing,omitempty"`
+	RemoveAlbumVersion     bool   `json:"remove_album_version,omitempty"`
+	RemoveDuplicateArtists *bool  `json:"remove_duplicate_artists,omitempty"`
+	FeaturedArtistsMode    string `json:"featured_artists_mode,omitempty"`
+	MultiArtistSeparator   string `json:"multi_artist_separator,omitempty"`
+	AlbumVariousArtists    *bool  `json:"album_various_artists,omitempty"`
+	// v2.0.0 DMX-6 - post-download command hook. All plain (non-pointer):
+	// every default here is the SAFE value (off / empty), so an older
+	// config.json reading false is the correct answer, not the silent-
+	// downgrade trap that made the FR-2 ints *int. PostCommandTimeout is an
+	// int whose zero IS invalid, but Python clamps 0 back to the 30s default
+	// in normalize_timeout(), so an absent key still gets the real default.
+	PostCommandEnabled   bool   `json:"post_command_enabled,omitempty"`
+	PostCommandConfirmed bool   `json:"post_command_confirmed,omitempty"`
+	PostCommand          string `json:"post_command,omitempty"`
+	PostCommandMode      string `json:"post_command_mode,omitempty"`
+	PostCommandTimeout   int    `json:"post_command_timeout,omitempty"`
+	// v2.0.0 SF-2 - ReplayGain tags. Plain bool: false IS the default, so an
+	// older config.json reading false is the correct answer.
+	ReplaygainEnabled bool `json:"replaygain_enabled,omitempty"`
+	// Audio fingerprint verification against the track's store preview.
+	// *bool, not bool: this defaults to ON, and a plain bool reads false from
+	// every config.json written before the setting existed -- silently
+	// disabling it for every current user. Same trap as PreferExplicit.
+	VerifyAudioEnabled *bool `json:"verify_audio_enabled,omitempty"`
+	SidecarCue          bool          `json:"sidecar_cue"`
+	SidecarNfo          bool          `json:"sidecar_nfo"`
+	SidecarJson         bool          `json:"sidecar_json"`
 	AutoSyncEnabled     bool          `json:"auto_sync_enabled"`
 	AutoSyncHour        int           `json:"auto_sync_hour"`
 	AutoSyncMinute      int           `json:"auto_sync_minute"`
@@ -175,6 +269,7 @@ func (a *App) GetConfig() Config {
 		cfg.FolderStructure = "standard"
 		cfg.AlbumFolderStructure = "standard"
 		cfg.PlaylistFolderStructure = "standard"
+		cfg.PlaylistStorageMode = "playlist_folder"
 		cfg.SingleTrackStructure = "album_numbered"
 		cfg.MultiDiscHandling = "prefix"
 		cfg.TrackNumberPadding = 2
@@ -194,7 +289,12 @@ func (a *App) GetConfig() Config {
 		return cfg
 	}
 
-	json.Unmarshal(data, &cfg)
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		// A damaged config used to be silently replaced by defaults on the next
+		// save, destroying every setting and credential. Keep the bad file.
+		preserveCorruptConfig(cfgPath, data)
+		log.Printf("config.json is not valid JSON, kept a copy: %v", err)
+	}
 	if !bytes.Contains(data, []byte(`"fetch_lyrics"`)) {
 		cfg.FetchLyrics = true
 	}
@@ -239,6 +339,9 @@ func (a *App) GetConfig() Config {
 	}
 	if cfg.PlaylistFolderStructure == "" {
 		cfg.PlaylistFolderStructure = cfg.FolderStructure
+	}
+	if cfg.PlaylistStorageMode == "" {
+		cfg.PlaylistStorageMode = "playlist_folder"
 	}
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"
@@ -297,6 +400,9 @@ func (a *App) SaveConfig(cfg Config) error {
 	if cfg.PlaylistFolderStructure == "" {
 		cfg.PlaylistFolderStructure = cfg.FolderStructure
 	}
+	if cfg.PlaylistStorageMode == "" {
+		cfg.PlaylistStorageMode = "playlist_folder"
+	}
 	if cfg.SingleTrackStructure == "" {
 		cfg.SingleTrackStructure = "album_numbered"
 	}
@@ -331,8 +437,54 @@ func (a *App) SaveConfig(cfg Config) error {
 		return err
 	}
 
-	return os.WriteFile(getConfigPath(), data, 0644)
+	// config.json holds API keys, the device token and cookies: owner-only, and
+	// atomic so a crash mid-save cannot leave a truncated file.
+	return writeFileAtomic(getConfigPath(), data, 0o600)
 }
+
+// writeFileAtomic writes data to a temp file beside path, fsyncs it and renames it
+// into place. The temp file is created 0600, so the result is owner-only even when
+// an older, more permissive file is being replaced.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	fail := func(err error) error {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Chmod(perm); err != nil && runtime.GOOS != "windows" {
+		return fail(err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// Windows can refuse a rename-over briefly while another rename/scan holds the target.
+	var rerr error
+	for i := 0; i < 20; i++ {
+		if rerr = os.Rename(tmpName, path); rerr == nil || runtime.GOOS != "windows" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rerr != nil {
+		os.Remove(tmpName)
+		return rerr
+	}
+	return nil
+}
+
+var historyMu sync.Mutex
 
 // GetHistory returns the application history
 func (a *App) GetHistory() []HistoryItem {
@@ -355,6 +507,8 @@ func (a *App) GetHistory() []HistoryItem {
 
 // AddHistory appends a new run to the history file
 func (a *App) AddHistory(item HistoryItem) error {
+	historyMu.Lock() // read-modify-write: two finishing jobs must not drop each other's entry
+	defer historyMu.Unlock()
 	history := a.GetHistory()
 	history = append([]HistoryItem{item}, history...) // prepend
 
@@ -366,7 +520,7 @@ func (a *App) AddHistory(item HistoryItem) error {
 
 	dir := getAppDataDir()
 	os.MkdirAll(dir, 0755)
-	return os.WriteFile(getHistoryPath(), data, 0644)
+	return writeFileAtomic(getHistoryPath(), data, 0o600)
 }
 
 // ClearHistory deletes history
@@ -383,9 +537,12 @@ func (a *App) PickDirectory() string {
 	dir, err := wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 		Title: "Select Download Folder",
 	})
-	if err != nil {
+	if err != nil || dir == "" {
 		return ""
 	}
+	a.mu.Lock()
+	a.writeGrants = append(a.writeGrants, dir)
+	a.mu.Unlock()
 	return dir
 }
 
@@ -430,11 +587,11 @@ func (a *App) StartDownload(playlists []string) error {
 	command, args, workDir, env, err := a.resolveBackendCommand(playlists)
 	if err != nil {
 		cancel()
-		wailsRuntime.LogErrorf(a.ctx, err.Error())
+		wailsRuntime.LogErrorf(a.ctx, "%s", err.Error())
 		return err
 	}
 
-	return a.startBackendProcess(ctx, cancel, command, args, workDir, env)
+	return a.startBackendProcess(ctx, cancel, command, args, workDir, env, nil)
 }
 
 func (a *App) RetryTrackDownload(trackJSON string) error {
@@ -461,13 +618,13 @@ func (a *App) RetryTrackDownload(trackJSON string) error {
 	command, baseArgs, workDir, env, err := a.resolveBackendCommand([]string{})
 	if err != nil {
 		cancel()
-		wailsRuntime.LogErrorf(a.ctx, err.Error())
+		wailsRuntime.LogErrorf(a.ctx, "%s", err.Error())
 		return err
 	}
 
 	args := append([]string{}, baseArgs...)
 	args = append(args, "--retry-track-json", trackJSON)
-	return a.startBackendProcess(ctx, cancel, command, args, workDir, env)
+	return a.startBackendProcess(ctx, cancel, command, args, workDir, env, nil)
 }
 
 func (a *App) startBackendProcess(
@@ -477,12 +634,19 @@ func (a *App) startBackendProcess(
 	args []string,
 	workDir string,
 	env []string,
+	onEnd func(status string), // SF-1: runs before process_ended is emitted; nil for non-queue jobs
 ) error {
 
 	cmd := exec.CommandContext(ctx, command, args...)
 	hideProcess(cmd)
+	// Stop must reach the whole tree, not just the PID we hold: the bundled
+	// backend is a PyInstaller onefile binary that forks its real engine.
+	setProcessGroup(cmd)
 	cmd.Dir = workDir
 	cmd.Env = env
+	// CommandContext's default cancel kills only cmd.Process, which would
+	// leave that forked engine running. Route it through the same tree kill.
+	cmd.Cancel = func() error { return killProcessTree(cmd) }
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -539,6 +703,18 @@ func (a *App) startBackendProcess(
 			// Parse JSON line and re-emit via Wails
 			var payload map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &payload); err == nil {
+				// issue #75 — swap the filesystem paths for an opaque id before
+				// this reaches the webview. See playlist_orphans.go.
+				if payload["type"] == "playlist_orphans" {
+					safe := a.interceptPlaylistOrphans(payload)
+					if safe == nil {
+						// Malformed or empty report. Dropping it is right: the
+						// alternative is relaying the original, which is the one
+						// message in the stream that carries raw paths.
+						continue
+					}
+					payload = safe
+				}
 				wailsRuntime.EventsEmit(a.ctx, "backend-event", payload)
 			} else {
 				// If it's not JSON, just send it as a raw log
@@ -575,6 +751,11 @@ func (a *App) startBackendProcess(
 				"level":   "error",
 				"message": fmt.Sprintf("Library engine exited with error: %v", err),
 			})
+		}
+		// SF-1 — update the queue BEFORE process_ended, because the frontend
+		// asks for the next job the moment it sees that event.
+		if onEnd != nil {
+			onEnd(status)
 		}
 		wailsRuntime.EventsEmit(a.ctx, "backend-event", map[string]interface{}{
 			"type":   "process_ended",
@@ -650,29 +831,22 @@ func shouldHideLogMessage(msg string) bool {
 	return false
 }
 
-func killCommandTree(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-
-	if runtime.GOOS == "windows" {
-		killer := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", cmd.Process.Pid), "/T", "/F")
-		hideProcess(killer)
-		output, err := killer.CombinedOutput()
-		if err != nil {
-			text := strings.ToLower(string(output))
-			if strings.Contains(text, "not found") || strings.Contains(text, "no running instance") {
-				return nil
-			}
-			return fmt.Errorf("taskkill failed: %v (%s)", err, strings.TrimSpace(string(output)))
+// validateBackendLinks refuses link arguments the backend's argparse would read as
+// flags. The links are passed positionally, so "--export-path" pasted as a "URL"
+// would otherwise switch the backend into another mode.
+func validateBackendLinks(links []string) error {
+	for _, l := range links {
+		if strings.HasPrefix(strings.TrimSpace(l), "-") {
+			return fmt.Errorf("refused: %q is not a link", l)
 		}
-		return nil
-	}
-
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return err
 	}
 	return nil
+}
+
+// killCommandTree stops cmd and everything it spawned. The per-platform work
+// lives in proc_windows.go / proc_unix.go.
+func killCommandTree(cmd *exec.Cmd) error {
+	return killProcessTree(cmd)
 }
 
 func (a *App) runPythonCommand(args []string) (string, error) {
@@ -901,6 +1075,9 @@ func (a *App) ConfirmAmazonLogin() error {
 // Returns a JSON string: {"artist_id","artist_name","artwork_url","albums":[...]}
 // On error returns: {"error":"..."}
 func (a *App) GetArtistDiscography(artistUrl string) string {
+	if err := validateBackendLinks([]string{artistUrl}); err != nil {
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -1066,6 +1243,140 @@ func parseLibraryOutput(out []byte, eventType string) string {
 	return `{"error":"no ` + eventType + ` event in backend output"}`
 }
 
+// exportFormatExtensions mirrors antra/utils/playlist_export.py's EXPORT_EXTENSIONS.
+var exportFormatExtensions = map[string]string{
+	"csv":  ".csv",
+	"m3u8": ".m3u8",
+	"xspf": ".xspf",
+	"json": ".json",
+	"txt":  ".txt",
+}
+
+var exportFormatFilters = map[string]string{
+	"csv":  "Comma-separated values (*.csv)",
+	"m3u8": "Playlist (*.m3u8)",
+	"xspf": "XSPF playlist (*.xspf)",
+	"json": "JSON (*.json)",
+	"txt":  "Text file (*.txt)",
+}
+
+// ExportPlaylist resolves `url` and writes its tracklist to a file the user
+// picks (v2.0.0 FR-3). Returns the backend's playlist_exported summary as JSON,
+// {"cancelled":true} if the save dialog is dismissed, or {"error":"..."}.
+//
+// The metadata is re-fetched rather than taken from the frontend: the
+// playlist_loaded event carries only artist/title/duration, which is far short
+// of an Exportify CSV, and widening it would put a per-track metadata blob on
+// every resolve for a feature most runs never use.
+func (a *App) ExportPlaylist(url string, format string, suggestedName string) string {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if _, ok := exportFormatExtensions[format]; !ok {
+		format = "csv"
+	}
+	if strings.TrimSpace(url) == "" {
+		return `{"error":"No link to export - resolve a release first."}`
+	}
+	// exportTracklist() has no http-prefix filter on inputUrl; refuse here.
+	if err := validateBackendLinks([]string{url}); err != nil {
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+
+	ext := exportFormatExtensions[format]
+	defaultName := strings.TrimSpace(suggestedName)
+	if defaultName == "" {
+		defaultName = "playlist"
+	}
+	if !strings.HasSuffix(strings.ToLower(defaultName), ext) {
+		defaultName += ext
+	}
+
+	target, dlgErr := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+		Title:                "Export tracklist",
+		DefaultFilename:      defaultName,
+		CanCreateDirectories: true,
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: exportFormatFilters[format], Pattern: "*" + ext},
+		},
+	})
+	if dlgErr != nil {
+		return `{"error":"` + strings.ReplaceAll(dlgErr.Error(), `"`, `'`) + `"}`
+	}
+	if strings.TrimSpace(target) == "" {
+		return `{"cancelled":true}`
+	}
+
+	// A large playlist genuinely takes minutes to fetch, so this is generous
+	// rather than the 30s used by the small one-shot lookups.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	args := []string{
+		"--export-playlist", url,
+		"--export-format", format,
+		"--export-path", target,
+		"--config", getConfigPath(),
+	}
+
+	backend, err := ensureBundledBackend()
+	var out []byte
+	if err == nil {
+		cmd := exec.CommandContext(ctx, backend, args...)
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	} else {
+		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
+		if resolveErr != nil {
+			return `{"error":"could not resolve backend"}`
+		}
+		cmd := exec.CommandContext(ctx, pythonExe, append([]string{"-m", "antra.json_cli"}, args...)...)
+		cmd.Dir = workDir
+		cmd.Env = env
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	}
+
+	// A non-zero exit still carries a JSON error line on stdout, so parse first
+	// and only fall back to the process error when nothing usable came back.
+	parsed := parseExportOutput(out)
+	if parsed != "" {
+		return parsed
+	}
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"Export timed out while fetching the tracklist."}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+	return `{"error":"The backend produced no export result."}`
+}
+
+// parseExportOutput scans newline-delimited JSON for the playlist_exported
+// event. Log lines precede it, so the whole buffer cannot simply be unmarshalled.
+func parseExportOutput(out []byte) string {
+	for _, line := range bytes.Split(bytes.TrimSpace(out), []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var wrapper map[string]interface{}
+		if err := json.Unmarshal(line, &wrapper); err != nil {
+			continue
+		}
+		switch wrapper["type"] {
+		case "playlist_exported":
+			result, marshalErr := json.Marshal(wrapper)
+			if marshalErr != nil {
+				return `{"error":"could not encode export result"}`
+			}
+			return string(result)
+		case "error":
+			msg, _ := wrapper["message"].(string)
+			return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+		}
+	}
+	return ""
+}
+
 // RunAutoSync triggers an immediate auto-sync of all tracked playlists.
 // Streams newline-delimited JSON events on stdout (same format as StartDownload).
 // Returns empty string on success or an error string.
@@ -1107,6 +1418,14 @@ func (a *App) RunAutoSync() string {
 }
 
 // SearchArtists searches for artists by name using the given source ("spotify" or "apple").
+// searchArtistsArgs builds the backend argv for an artist search. The query is
+// joined with "=" because a query that begins with a dash (the real artist
+// "-M-", say) is otherwise read by argparse as the next flag and the CLI exits
+// with "expected one argument" (measured 2026-10-26).
+func searchArtistsArgs(query, source, configPath string) []string {
+	return []string{"--search-artists=" + query, "--search-source", source, "--config", configPath}
+}
+
 // Returns a JSON string: {"type":"artist_search","data":[...]} or {"error":"..."}
 func (a *App) SearchArtists(query string, source string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1119,7 +1438,7 @@ func (a *App) SearchArtists(query string, source string) string {
 	backend, err := ensureBundledBackend()
 	var out []byte
 	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--search-artists", query, "--search-source", source, "--config", getConfigPath())
+		cmd := exec.CommandContext(ctx, backend, searchArtistsArgs(query, source, getConfigPath())...)
 		hideProcess(cmd)
 		out, err = cmd.Output()
 	} else {
@@ -1128,7 +1447,7 @@ func (a *App) SearchArtists(query string, source string) string {
 		if resolveErr != nil {
 			return `{"error":"could not resolve backend"}`
 		}
-		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--search-artists", query, "--search-source", source, "--config", getConfigPath())
+		cmd := exec.CommandContext(ctx, pythonExe, append([]string{"-m", "antra.json_cli"}, searchArtistsArgs(query, source, getConfigPath())...)...)
 		cmd.Dir = workDir
 		cmd.Env = env
 		hideProcess(cmd)
@@ -1143,6 +1462,92 @@ func (a *App) SearchArtists(query string, source string) string {
 	}
 
 	// Unwrap {"type":"artist_search","data":[...]} → just the data array as JSON string
+	var wrapper map[string]interface{}
+	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
+		return string(out)
+	}
+	if wrapper["type"] == "error" {
+		msg, _ := wrapper["message"].(string)
+		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
+	}
+	result, _ := json.Marshal(wrapper["data"])
+	return string(result)
+}
+
+// searchCatalogArgs builds the backend argv for a catalogue search.
+//
+// kind and source are normalised HERE rather than passed through, because
+// --search-kind and --search-source are argparse `choices=`: an unknown value
+// makes the CLI exit 2 with the reason on stderr, which reaches the user as a
+// bare "exit status 2". Split out from SearchCatalog so it can be tested
+// without spawning a process.
+func searchCatalogArgs(query, kind, source, configPath string) []string {
+	switch kind {
+	case "song", "album", "artist":
+	default:
+		kind = "song"
+	}
+	switch source {
+	case "apple", "spotify":
+	default:
+		source = "apple"
+	}
+	// `--search-catalog=<query>` rather than two argv elements: a query that
+	// begins with a dash ("-", "--config", a song actually titled "--") is
+	// otherwise read by argparse as the NEXT FLAG, and the CLI exits 2 with
+	// "expected one argument". Measured 2026-09-26: the separate-argument form
+	// exits 2 on `--config`, the `=` form returns results. The other three are
+	// fixed strings we control, so they stay as plain pairs.
+	return []string{
+		"--search-catalog=" + query,
+		"--search-kind", kind,
+		"--search-source", source,
+		"--config", configPath,
+	}
+}
+
+// SearchCatalog searches for songs, albums or artists (issue #58 - the app
+// could only ever search for an artist, so finding one song meant opening the
+// artist and reading the whole discography).
+//
+// kind is "song", "album" or "artist"; source is "apple" or "spotify". Both are
+// normalised here rather than passed through, because --search-kind and
+// --search-source are argparse `choices=` and an unknown value makes the CLI
+// exit 2 with the error on stderr, which surfaces as a bare "exit status 2".
+//
+// Returns a JSON string: the data array, or {"error":"..."}.
+func (a *App) SearchCatalog(query string, kind string, source string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	args := searchCatalogArgs(query, kind, source, getConfigPath())
+
+	backend, err := ensureBundledBackend()
+	var out []byte
+	if err == nil {
+		cmd := exec.CommandContext(ctx, backend, args...)
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	} else {
+		// Dev fallback
+		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
+		if resolveErr != nil {
+			return `{"error":"could not resolve backend"}`
+		}
+		cmd := exec.CommandContext(ctx, pythonExe, append([]string{"-m", "antra.json_cli"}, args...)...)
+		cmd.Dir = workDir
+		cmd.Env = env
+		hideProcess(cmd)
+		out, err = cmd.Output()
+	}
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return `{"error":"search timed out"}`
+		}
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
+
 	var wrapper map[string]interface{}
 	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
 		return string(out)
@@ -1273,6 +1678,11 @@ func (a *App) GetDiscoveryGenres(region string, source string) string {
 // Deezer album URL. Returns a JSON string with service, segments, stats, and
 // artwork. Takes ~5-30s for Spotify (probes every market in parallel).
 func (a *App) GetAlbumAvailability(url string) string {
+	// The availability box has no http-prefix filter in the frontend; refuse
+	// here rather than let argparse read a dash-leading paste as another flag.
+	if err := validateBackendLinks([]string{url}); err != nil {
+		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -1480,9 +1890,19 @@ func endpointEnv() []string {
 func endpointEnvFrom(m endpointManifest) []string {
 	var env []string
 	add := func(name, value string) {
-		if v := strings.TrimRight(strings.TrimSpace(value), "/"); v != "" {
-			env = append(env, name+"="+v)
+		v := strings.TrimRight(strings.TrimSpace(value), "/")
+		if v == "" {
+			return
 		}
+		// The backend is handed the account credential alongside these URLs, so
+		// a host the manifest invented would receive it. Anything not on the
+		// allowlist is dropped rather than exported, and Python then resolves
+		// that mirror the old way from its own built-in defaults — the same
+		// degradation an absent entry already produced.
+		if !isTrustedAntraHost(v) {
+			return
+		}
+		env = append(env, name+"="+v)
 	}
 	add("TIDAL_MIRROR_URL", m.Mirrors.Tidal)
 	add("QOBUZ_MIRROR_URL", m.Mirrors.Qobuz)
@@ -1517,6 +1937,9 @@ func endpointEnvFrom(m endpointManifest) []string {
 }
 
 func (a *App) resolveBackendCommand(playlists []string) (string, []string, string, []string, error) {
+	if err := validateBackendLinks(playlists); err != nil {
+		return "", nil, "", nil, err
+	}
 	// Determine concurrent-worker count: 2 for supporter keys, 1 for everyone else.
 	// v1.1.8 FEAT-7 — concurrency is the SAFE supporter speed lever. The mirrors'
 	// politeness delay is per streaming account, so N workers use N *different*
@@ -2259,4 +2682,14 @@ func (a *App) SaveCoverArt(artworkUrl string, title string) string {
 	}
 
 	return fmt.Sprintf("ok: %s", outPath)
+}
+
+// preserveCorruptConfig copies an unreadable config.json aside once, so the
+// defaults that replace it cannot overwrite the only copy of the user's settings.
+func preserveCorruptConfig(path string, data []byte) {
+	bak := path + ".corrupt"
+	if _, err := os.Stat(bak); err == nil {
+		return // keep the first bad copy; later ones are usually the same file
+	}
+	_ = os.WriteFile(bak, data, 0o600)
 }

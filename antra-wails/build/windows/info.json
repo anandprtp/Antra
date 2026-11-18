@@ -1,6 +1,7 @@
 {
 	"fixed": {
-		"file_version": "{{.Info.ProductVersion}}"
+		"file_version": "{{.Info.ProductVersion}}",
+		"product_version": "{{.Info.ProductVersion}}"
 	},
 	"info": {
 		"0000": {

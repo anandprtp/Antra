@@ -25,7 +25,7 @@ import requests as _requests
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 from antra.sources.base import BaseSourceAdapter
 from antra.sources.odesli import OdesliEnricher
-from antra.utils.matching import score_similarity, duration_close
+from antra.utils.matching import score_similarity, duration_close, has_severe_duration_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +171,7 @@ class TidalAdapter(BaseSourceAdapter):
         if direct:
             return direct
 
-        query = f"{track.title} {track.primary_artist}"
+        query = f"{track.title} {track.artists[0] if track.artists else ''}".strip()
         try:
             import tidalapi
             logger.debug(
@@ -195,6 +195,11 @@ class TidalAdapter(BaseSourceAdapter):
         for t in tidal_tracks:
             candidate_count += 1
             artist_name = t.artist.name if hasattr(t, "artist") else ""
+            t_dur = getattr(t, "duration", None)   # may be None; compare only when known
+            # A wildly different length is a different recording even when the ISRC
+            # matches (one ISRC can cover several mixes): reject, don't discount.
+            if t_dur and has_severe_duration_mismatch(track.duration_ms, t_dur * 1000):
+                continue
             score = score_similarity(
                 query_title=track.title,
                 query_artists=track.artists,
@@ -209,8 +214,8 @@ class TidalAdapter(BaseSourceAdapter):
                     score = 1.0
                     isrc_match = True
 
-            if hasattr(t, "duration") and track.duration_seconds:
-                if not duration_close(track.duration_seconds, t.duration, tolerance=5):
+            if t_dur and track.duration_seconds:
+                if not duration_close(track.duration_seconds, t_dur, tolerance=5):
                     score *= 0.8
 
             # Quality boost: prefer 24-bit HiRes versions over 16-bit FLAC versions of the same track
@@ -282,10 +287,20 @@ class TidalAdapter(BaseSourceAdapter):
 
         try:
             tidal_track = session.track(int(tidal_id))
+            # An Odesli id is a cross-platform GUESS: hold it to the same length rule.
+            _d = getattr(tidal_track, "duration", None)
+            if _d and has_severe_duration_mismatch(track.duration_ms, _d * 1000):
+                logger.info(
+                    "[Tidal] Odesli id %s rejected for %r - duration %.0fs vs requested %.0fs (a different recording)",
+                    tidal_id, track.title, _d, (track.duration_ms or 0) / 1000,
+                )
+                return None
             result = self._track_to_result(
                 tidal_track,
                 score=1.0,
-                isrc_match=bool(track.isrc and getattr(tidal_track, "isrc", "").upper() == track.isrc.upper()),
+                # isrc can be present-but-None; .upper() on it used to raise and the
+                # except below then reported a perfectly good track as unloadable.
+                isrc_match=bool(track.isrc and (getattr(tidal_track, "isrc", None) or "").upper() == track.isrc.upper()),
             )
             logger.info(
                 "[Tidal] Resolved platform ID for %r: tidal_id=%s title=%r album=%r",
@@ -318,7 +333,7 @@ class TidalAdapter(BaseSourceAdapter):
             title=tidal_track.name,
             artists=[artist_name] if artist_name else [],
             album=tidal_track.album.name if hasattr(tidal_track, "album") else None,
-            duration_ms=int(tidal_track.duration * 1000) if hasattr(tidal_track, "duration") else None,
+            duration_ms=int(tidal_track.duration * 1000) if getattr(tidal_track, "duration", None) else None,
             audio_format=AudioFormat.FLAC,
             quality_kbps=None,
             is_lossless=True,
@@ -484,7 +499,7 @@ class TidalAdapter(BaseSourceAdapter):
     def _download_single_url(self, url: str, output_base: str, ext: str) -> str:
         import requests
 
-        with requests.get(url, stream=True) as r:
+        with requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
 
             content_type = r.headers.get("Content-Type", "").lower()

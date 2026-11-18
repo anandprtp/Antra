@@ -228,10 +228,40 @@ func extractDuration(probe map[string]interface{}) float64 {
 	return d
 }
 
+// validateAnalysisFile vets a path the webview hands to ffprobe / the backend.
+// These bindings legitimately read files outside the library (drag-and-drop), so
+// the path cannot be confined to a root; what can be required is that it is an
+// ABSOLUTE path (so it can never start with "-" and be read by ffprobe, where
+// the path is a bare positional argument, as an option) to a regular file with
+// an audio extension (so a device, pipe or directory is never opened).
+func validateAnalysisFile(p string) (string, error) {
+	if p == "" || strings.ContainsRune(p, 0) {
+		return "", fmt.Errorf("invalid path")
+	}
+	if !filepath.IsAbs(p) {
+		return "", fmt.Errorf("path must be absolute")
+	}
+	ext := strings.ToLower(filepath.Ext(p))
+	if !audioExtensions[ext] && !playerAudioExtensions[ext] { // the player plays more types than the analyzer lists
+		return "", fmt.Errorf("not an audio file")
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file")
+	}
+	return p, nil
+}
+
 // ScanFolder returns sorted audio file paths from a directory (non-recursive).
 // Returns an empty slice (not nil) on error so the frontend always gets an array.
 func (a *App) ScanFolder(folderPath string) []string {
 	var files []string
+	if info, err := os.Stat(folderPath); err != nil || !filepath.IsAbs(folderPath) || !info.IsDir() {
+		return []string{}
+	}
 
 	_ = filepath.WalkDir(folderPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -267,6 +297,10 @@ func (a *App) ScanFolder(folderPath string) []string {
 // the probe returns a duration.
 func (a *App) AnalyzeAudio(filePath string) map[string]interface{} {
 	result := make(map[string]interface{})
+	if _, err := validateAnalysisFile(filePath); err != nil {
+		result["probeError"] = err.Error()
+		return result
+	}
 
 	// Blocks only if the startup resolution has not finished yet; otherwise free.
 	a.ensureFfmpegPaths()
@@ -451,6 +485,9 @@ var lyricsTagKeys = []string{
 // a JSON-encoded TrackLyrics.  Returns {"lines":[],"synced":false} on any error
 // or when no lyrics tag is found so the frontend always gets valid JSON.
 func (a *App) GetTrackLyrics(filePath string) string {
+	if _, err := validateAnalysisFile(filePath); err != nil {
+		return `{"lines":[],"synced":false}`
+	}
 	a.ensureFfmpegPaths()
 	a.mu.Lock()
 	ffprobeExe := a.ffprobeExe
@@ -547,16 +584,47 @@ func (a *App) PickAnalyzerFiles() []string {
 }
 
 // WriteFile writes raw bytes (base64-encoded) to a file path on disk.
-// Used by the analyzer "Export All" to save PNGs directly to the chosen folder.
+// Used by the analyzer to save PNGs into a folder the user picked with
+// PickDirectory. It is a webview-callable binding, so it is confined: .png only,
+// directly inside a granted folder, never through a symlink.
 func (a *App) WriteFile(filePath string, base64Data string) error {
+	a.mu.Lock()
+	grants := append([]string(nil), a.writeGrants...)
+	a.mu.Unlock()
+	target, err := resolveWritableTarget(grants, filePath)
+	if err != nil {
+		return err
+	}
 	data, err := base64.StdEncoding.DecodeString(base64Data)
 	if err != nil {
 		return fmt.Errorf("base64 decode: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+	return os.WriteFile(target, data, 0644)
+}
+
+// resolveWritableTarget returns the path to write, or an error unless filePath is a
+// .png whose parent directory is (after resolving symlinks) one of the granted folders.
+func resolveWritableTarget(grants []string, filePath string) (string, error) {
+	if !filepath.IsAbs(filePath) {
+		return "", fmt.Errorf("write refused: path must be absolute")
 	}
-	return os.WriteFile(filePath, data, 0644)
+	if strings.ToLower(filepath.Ext(filePath)) != ".png" {
+		return "", fmt.Errorf("write refused: only .png files may be written")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filepath.Clean(filePath)))
+	if err != nil {
+		return "", fmt.Errorf("write refused: folder not found")
+	}
+	for _, g := range grants {
+		if realGrant, err := filepath.EvalSymlinks(g); err == nil && parent == realGrant {
+			target := filepath.Join(parent, filepath.Base(filePath))
+			if fi, err := os.Lstat(target); err == nil && !fi.Mode().IsRegular() {
+				return "", fmt.Errorf("write refused: target is not a regular file")
+			}
+			return target, nil
+		}
+	}
+	return "", fmt.Errorf("write refused: folder was not chosen by the user")
 }
 
 // ─── ffprobe ──────────────────────────────────────────────────────────────────

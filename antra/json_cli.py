@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import asdict
 from typing import Optional
 
@@ -30,7 +32,7 @@ if sys.platform == 'win32':
 
 from antra.core.models import BulkDownloadProgress
 from antra.core.service import AntraService, RuntimeOptions
-from antra.core.events import EngineEvent
+from antra.core.events import EngineEvent, EngineEventType
 from antra.utils.runtime import ensure_runtime_environment
 from antra.core.models import TrackMetadata
 
@@ -198,6 +200,20 @@ def setup_json_logging(level=logging.INFO):
     logger.addHandler(handler)
 
 def emit_event(event: EngineEvent):
+    # issue #75 — leftover playlist files go out as their OWN top-level message
+    # rather than inside the generic "event" envelope, because the Go side has to
+    # intercept them: it keeps the paths and hands the webview an opaque id. A
+    # filesystem path crossing the webview would come back as an arbitrary-file
+    # argument to a delete call (the same rule PV-1 established for its cache).
+    if event.type is EngineEventType.PLAYLIST_ORPHANS:
+        print(json.dumps({
+            "type": "playlist_orphans",
+            "playlist": event.message or "",
+            "pruned": bool(event.pruned),
+            "paths": list(event.paths or []),
+        }), flush=True)
+        return
+
     track_payload = None
     if event.track:
         track_payload = asdict(event.track)
@@ -210,12 +226,16 @@ def emit_event(event: EngineEvent):
         "payload": {
             "track": event.track.title if event.track else None,
             "artist": event.track.artist_string if event.track else None,
+            # issue #74 - lifted out of track_data so an event carries the row
+            # identity even on a path that does not ship the full metadata.
+            "row_id": getattr(event.track, "row_id", None) if event.track else None,
             "track_index": event.track_index,
             "track_total": event.track_total,
             "message": event.message,
             "source": event.source,
             "error": event.error,
             "quality_label": event.quality_label,
+            "tags_problem": getattr(event, "tags_problem", None),
             "attempt": event.attempt,
             "track_data": track_payload,
         }
@@ -295,6 +315,425 @@ def _track_from_payload(payload: dict) -> TrackMetadata:
     payload["genres"] = list(payload.get("genres") or [])
     payload["album_artists"] = list(payload.get("album_artists") or [])
     return TrackMetadata(**payload)
+
+
+# v2.0.0 PV-1 - the header the preview screen and the selective-download job
+# both render. Built from the SAME helpers the mid-download playlist_loaded
+# event uses, so a release cannot describe itself one way in the preview and
+# another way once it is downloading.
+def _playlist_header(url: str, tracks, cfg) -> dict:
+    artwork = ""
+    title = ""
+    if tracks:
+        artwork = (
+            getattr(tracks[0], "playlist_artwork_url", None)
+            or getattr(tracks[0], "artwork_url", None)
+            or ""
+        )
+        title = (
+            getattr(tracks[0], "playlist_name", None)
+            or getattr(tracks[0], "album", None)
+            or ""
+        )
+    return {
+        "url": url,
+        "title": title,
+        "artwork_url": artwork,
+        "content_type": _infer_playlist_content_type(url, tracks),
+        "artists_string": _playlist_artists_string(tracks),
+        "release_date": _format_track_release_date(tracks),
+        "quality_badge": _QUALITY_BADGES.get(cfg.output_format or "", ""),
+        "track_count": len(tracks),
+    }
+
+
+# issue #74 - a stable identity for the UI row a track owns.
+#
+# The app used to correlate progress events with rows by track_index, but the
+# list the engine indexes is not the list the UI was given: enrichment ends in
+# _stamp_disc_totals, which groups by album. A playlist holding two
+# non-adjacent tracks from one album - i.e. most playlists - therefore reported
+# every status against the wrong song. An id is stamped once, before the
+# tracklist is emitted, and travels with the track from then on, so reordering,
+# filtering or deduplication downstream cannot move a status onto another row.
+#
+# The prefix is per process, so ids minted by an earlier job in the same
+# session - or by the preview process, which caches its tracks to disk for a
+# later download process to reload - can never collide with this one's.
+_ROW_ID_PREFIX = uuid.uuid4().hex[:8]
+_row_id_counter = itertools.count(1)
+
+
+def _stamp_row_ids(tracks) -> None:
+    """Give every track a row id, leaving any it already carries alone."""
+    for track in tracks or []:
+        try:
+            if not getattr(track, "row_id", None):
+                track.row_id = f"{_ROW_ID_PREFIX}-{next(_row_id_counter)}"
+        except AttributeError:
+            # Not a TrackMetadata. Index keying still works; say nothing.
+            return
+
+
+def _verify_row_ids(tracks) -> None:
+    """Keep row keying only while every track has a distinct id.
+
+    Enrichment can rebuild track objects. If any path ever drops or duplicates
+    an id, SOME rows would key by id and the rest fall back to index keying -
+    a half-correct display, which is worse than the original bug because it is
+    harder to notice. So the ids are cleared wholesale instead, putting the job
+    back on index keying uniformly, and the reason is logged.
+    """
+    rows = list(tracks or [])
+    if not rows:
+        return
+    ids = [getattr(track, "row_id", None) for track in rows]
+    if all(ids) and len(set(ids)) == len(ids):
+        return
+    for track in rows:
+        try:
+            track.row_id = None
+        except AttributeError:
+            pass
+    print(json.dumps({
+        "type": "log", "level": "warning",
+        "message": f"[Rows] Track identity was lost during enrichment "
+                   f"({sum(1 for i in ids if not i)} of {len(ids)} missing or "
+                   f"duplicated); falling back to positional track status.",
+    }), flush=True)
+
+
+# The rows the webview renders. Deliberately NOT the full TrackMetadata: a
+# 5000-track playlist's complete metadata is tens of megabytes and the UI needs
+# four fields per row. The full objects stay on disk (see --preview-out) so the
+# download does not have to re-fetch the link.
+def _preview_rows(tracks) -> list:
+    return [
+        {
+            "row_id": getattr(t, "row_id", "") or "",
+            "artist": t.artist_string,
+            "title": t.title,
+            "duration_ms": t.duration_ms or 0,
+            "isrc": getattr(t, "isrc", "") or "",
+            "album": getattr(t, "album", "") or "",
+            "track_number": getattr(t, "track_number", None),
+            "disc_number": getattr(t, "disc_number", None),
+            # Only a playlist fetch sets this, so it doubles as the "is this a
+            # playlist row?" flag the preview screen numbers by. It is also the
+            # number the file itself gets in playlist_folder mode
+            # (LibraryOrganizer.playlist_stem_for), so the preview and the
+            # written filename agree.
+            "playlist_position": getattr(t, "playlist_position", None),
+            "artwork_url": getattr(t, "artwork_url", "") or "",
+            "is_explicit": getattr(t, "is_explicit", None),
+        }
+        for t in tracks
+    ]
+
+
+_QUALITY_BADGES = {
+    'lossless': 'LOSSLESS', 'flac': 'LOSSLESS',
+    'alac': 'ALAC',
+    'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
+}
+
+
+def _make_organizer(cfg):
+    # Imported here, like main() does: this module has no module-level import of
+    # it and no `from __future__ import annotations`, so naming it in the
+    # signature would raise NameError at import time.
+    from antra.utils.organizer import LibraryOrganizer
+    return LibraryOrganizer(
+        cfg.output_dir,
+        full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
+        library_index_enabled=getattr(cfg, "library_index_enabled", True),
+        library_index_db_path=getattr(cfg, "library_index_db_path", ""),
+        folder_structure=getattr(cfg, "folder_structure", "standard"),
+        album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+        playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+        playlist_storage_mode=getattr(cfg, "playlist_storage_mode", "playlist_folder"),
+        playlist_renumber=getattr(cfg, "playlist_renumber", True),
+        playlist_prune_orphans=getattr(cfg, "playlist_prune_orphans", "ask"),
+        single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
+        filename_format=getattr(cfg, "filename_format", "default"),
+        single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
+        album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
+        folder_structure_template=getattr(cfg, "folder_structure_template", ""),
+        flat_library_root=getattr(cfg, "flat_library_root", False),
+        multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
+        track_number_padding=getattr(cfg, "track_number_padding", 2),
+        illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
+        whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
+        filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
+        # v2.0.0 DMX-2 - output-only text transforms. They live HERE and only
+        # here: json_cli used to carry four byte-identical copies of this
+        # construction, and adding a kwarg to some of them is exactly how the
+        # shipped app ended up ignoring every transform while the tests passed.
+        title_casing=getattr(cfg, "title_casing", "nothing"),
+        artist_casing=getattr(cfg, "artist_casing", "nothing"),
+        remove_album_version=getattr(cfg, "remove_album_version", False),
+        remove_duplicate_artists=getattr(cfg, "remove_duplicate_artists", True),
+        featured_artists_mode=getattr(cfg, "featured_artists_mode", "nothing"),
+        multi_artist_separator=getattr(cfg, "multi_artist_separator", "default"),
+        album_various_artists=getattr(cfg, "album_various_artists", True),
+    )
+
+
+# v2.0.0 PV-1 - download a subset of a previewed release.
+#
+# The rows arrive as FULL TrackMetadata dicts saved by --preview-url, not as a
+# link to re-resolve: the preview already paid the 25-35 s fetch a Qobuz album
+# costs, and making the user pay it twice is exactly the regression this feature
+# would otherwise introduce. Because the objects are complete, this path runs the
+# same enrich -> download pipeline as a pasted link and produces the same
+# playlist_summary, so history, the failed-track panel and Export all behave
+# identically to a full download.
+def _run_track_selection(path: str, cfg, service, options) -> None:
+    _started = time.time()
+    url = ""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error",
+                          "message": f"Could not read the selected tracks: {e}"}), flush=True)
+        print(json.dumps(_selection_summary(url, [], _started, error=str(e))), flush=True)
+        return
+    finally:
+        # Written by the Go side for this one run; nothing else cleans it up.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    try:
+        organizer = _make_organizer(cfg)
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error",
+                          "message": f"Cannot access output directory: {e}"}), flush=True)
+        print(json.dumps(_selection_summary(url, [], _started, error=str(e))), flush=True)
+        return
+
+    try:
+        url = str(payload.get("url") or "")
+        rows = payload.get("tracks") or []
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("No tracks were selected.")
+        tracks = [_track_from_payload(r) for r in rows]
+        # issue #74 - normally a no-op: the ids were minted by --preview-url and
+        # round-trip through the cache. A cache written by an older build has
+        # none, so they are minted here instead.
+        _stamp_row_ids(tracks)
+
+        header = dict(payload.get("header") or {})
+        # Is this a subset of the release, or all of it?
+        #
+        # It matters because enrich_tracks_for_download ends in
+        # _stamp_disc_totals, which renumbers a group sequentially from 1 per
+        # disc on the assumption that the group IS the album. For a full
+        # download that is right. For a subset it is actively wrong: picking
+        # tracks 5 and 9 of Scorpion wrote "1-01 - God's Plan" and
+        # "2-01 - In My Feelings", mislabelling both files and colliding with
+        # the real track 1 of each disc. Verified on a live download before
+        # this guard existed.
+        try:
+            release_total = int(header.get("track_count") or 0)
+        except (TypeError, ValueError):
+            release_total = 0
+        is_partial = release_total > 0 and len(tracks) < release_total
+        # Re-derive rather than trust the stored copy: output_format can have
+        # changed between the preview and pressing Download now, and the badge
+        # must describe what is about to be written.
+        header.update({
+            "type": "playlist_loaded",
+            "quality_badge": _QUALITY_BADGES.get(cfg.output_format or "", ""),
+            "track_count": len(tracks),
+            "tracks": _preview_rows(tracks),
+        })
+        header.pop("url", None)
+        header.setdefault("title", "")
+        header.setdefault("artwork_url", "")
+        print(json.dumps({"type": "log", "level": "info",
+                          "message": f"Downloading {len(tracks)} selected track(s)"
+                                     f"{' from ' + url if url else ''}"}), flush=True)
+        print(json.dumps(header), flush=True)
+
+        # Enrichment still runs on a subset - it is what fills in ISRCs and album
+        # data - but its renumbering is undone afterwards so each file keeps the
+        # position it holds on the real release, which is also the number shown
+        # in the preview. A full selection is left alone, so downloading
+        # everything through the preview produces byte-identical files to
+        # pasting the link.
+        numbering = None
+        if is_partial:
+            numbering = [
+                (t.track_number, t.disc_number, t.total_tracks, t.total_discs)
+                for t in tracks
+            ]
+        tracks = service.enrich_tracks_for_download(tracks, url, options=options)
+        _verify_row_ids(tracks)   # issue #74
+        if numbering is not None and len(tracks) == len(numbering):
+            for t, (tn, dn, tt, td) in zip(tracks, numbering):
+                t.track_number, t.disc_number = tn, dn
+                t.total_tracks, t.total_discs = tt, td
+        elif numbering is not None:
+            # Enrichment changed the list length, so position-wise restoration
+            # would assign the wrong numbers. Say so rather than guess.
+            print(json.dumps({"type": "log", "level": "warning",
+                              "message": "Track numbering could not be preserved for this "
+                                         "partial selection; files may be numbered from 1."}),
+                  flush=True)
+        results = service.download_tracks(
+            tracks,
+            options=options,
+            event_callback=emit_event,
+            organizer=organizer,
+            # issue #75 — a strict subset of the release is NOT the whole
+            # playlist; the tracks left out would all look like orphans.
+            complete_playlist=not is_partial,
+        )
+        summary = _selection_summary(url, results, _started,
+                                     title=header.get("title") or "",
+                                     artwork=header.get("artwork_url") or "")
+        print(json.dumps({"type": "library_update", "tracks_added": summary["downloaded"],
+                          "url": url}), flush=True)
+        print(json.dumps(summary), flush=True)
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error", "message": str(e)}), flush=True)
+        print(json.dumps(_selection_summary(url, [], _started, error=str(e))), flush=True)
+
+
+def _selection_summary(url, results, started, title="", artwork="", error=None) -> dict:
+    # Imported here, like every other summary builder in this module: there is no
+    # module-level `datetime` import, and naming it at module scope would be a
+    # start-time NameError that py_compile cannot see.
+    from datetime import datetime
+    total_bytes = sum(
+        os.path.getsize(r.file_path)
+        for r in results
+        if r.file_path and os.path.exists(r.file_path)
+    )
+    summary = {
+        "type": "playlist_summary",
+        "url": url,
+        "title": title,
+        "artwork_url": artwork,
+        "total": len(results),
+        "downloaded": sum(1 for r in results if r.status.name == "COMPLETED"),
+        "failed": sum(1 for r in results if r.status.name == "FAILED"),
+        "skipped": sum(1 for r in results if r.status.name == "SKIPPED"),
+        "tags_incomplete": sum(1 for r in results if getattr(r, "tags_problem", None)),
+        "error": error,
+        "sources": {},
+        "date": datetime.now().isoformat(),
+        "total_mb": round(total_bytes / (1024 * 1024), 1),
+        "elapsed_seconds": round(time.time() - started),
+    }
+    for r in results:
+        if r.status.name == "COMPLETED" and r.source_used:
+            summary["sources"][r.source_used] = summary["sources"].get(r.source_used, 0) + 1
+    return summary
+
+
+def _run_playlist_import(path: str, cfg, service, options) -> None:
+    """Download an imported playlist file (v2.0.0 PORT-3).
+
+    The rows ARE the metadata: nothing is fetched, so this works with no Spotify
+    token, no sp_dc and no metadata proxy. Deliberately NOT run:
+    ``enrich_tracks_for_download`` (it calls Spotify - the exposure an import
+    exists to avoid) and ``_stamp_disc_totals`` (it regroups tracks by album,
+    which would reorder the playlist away from the file the user imported).
+    """
+    started = time.time()
+    source = ""
+    title = ""
+
+    def _summary(results, error=None):
+        results = results or []
+        total_bytes = sum(
+            os.path.getsize(r.file_path) for r in results
+            if r.file_path and os.path.exists(r.file_path)
+        )
+        sources = {}
+        for r in results:
+            if r.status.name == "COMPLETED" and r.source_used:
+                sources[r.source_used] = sources.get(r.source_used, 0) + 1
+        from datetime import datetime
+        return {
+            "type": "playlist_summary",
+            # Not a link: history must not offer to re-queue it as one.
+            "url": f"file:{source}" if source else "file:",
+            "title": title,
+            "artwork_url": "",
+            "total": len(results),
+            "downloaded": sum(1 for r in results if r.status.name == "COMPLETED"),
+            "failed": sum(1 for r in results if r.status.name == "FAILED"),
+            "skipped": sum(1 for r in results if r.status.name == "SKIPPED"),
+            "tags_incomplete": sum(1 for r in results if getattr(r, "tags_problem", None)),
+            "error": error,
+            "sources": sources,
+            "date": datetime.now().isoformat(),
+            "total_mb": round(total_bytes / (1024 * 1024), 1),
+            "elapsed_seconds": round(time.time() - started),
+        }
+
+    try:
+        from antra.utils.playlist_import import load_import_payload
+        try:
+            data = load_import_payload(path)
+        finally:
+            # The rows were written to a temp file by the desktop app; nothing
+            # else will clean it up.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        tracks = data["tracks"]
+        source = data["source_file"]
+        title = data["name"]
+        isrcs = sum(1 for t in tracks if t.isrc)
+        dropped = f", {data['dropped']} row(s) dropped as invalid" if data["dropped"] else ""
+        print(json.dumps({
+            "type": "log", "level": "info",
+            "message": f"Importing playlist '{title}' from {source or 'file'} — "
+                       f"{len(tracks)} tracks, {isrcs} with ISRC{dropped}",
+        }), flush=True)
+        if not tracks:
+            raise ValueError("The imported playlist contained no usable tracks.")
+        _stamp_row_ids(tracks)   # issue #74 - before the rows are emitted below
+
+        print(json.dumps({
+            "type": "playlist_loaded",
+            "title": title,
+            "artwork_url": "",
+            "content_type": "PLAYLIST",
+            "artists_string": f"Imported from {source}" if source else "Imported playlist file",
+            "release_date": "",
+            "quality_badge": _QUALITY_BADGES.get(cfg.output_format or '', ''),
+            "track_count": len(tracks),
+            "tracks": [
+                {"row_id": getattr(t, "row_id", "") or "",
+                 "artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0,
+                 "isrc": t.isrc or ""}
+                for t in tracks
+            ],
+        }), flush=True)
+
+        results = service.download_tracks(
+            tracks,
+            options=options,
+            event_callback=emit_event,
+            organizer=_make_organizer(cfg),
+            # The imported file lists the whole playlist (issue #75).
+            complete_playlist=True,
+        )
+        summary = _summary(results)
+        print(json.dumps({"type": "library_update", "tracks_added": summary["downloaded"],
+                          "url": summary["url"]}), flush=True)
+        print(json.dumps(summary), flush=True)
+    except Exception as e:
+        print(json.dumps({"type": "log", "level": "error", "message": str(e)}), flush=True)
+        print(json.dumps(_summary([], error=str(e))), flush=True)
 
 
 def _emit(obj: dict):
@@ -635,8 +1074,7 @@ def _run_tidal_oauth_login(cfg, config_path: str | None) -> None:
                 antra_cfg.pop("tidal_access_token", None)
                 antra_cfg.pop("tidal_refresh_token", None)
                 antra_cfg.pop("tidal_session_id", None)
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(antra_cfg, f, indent=2)
+                _write_config_atomic(config_path, antra_cfg, indent=2)
             except Exception as save_err:
                 # Non-fatal: emit a warning but still emit the session JSON so UI can paste it.
                 print(json.dumps({"type": "tidal_oauth_status", "message": f"Warning: could not save config automatically: {save_err}"}), flush=True)
@@ -653,14 +1091,36 @@ def _run_tidal_oauth_login(cfg, config_path: str | None) -> None:
         print(json.dumps({"type": "tidal_oauth_error", "message": f"OAuth login failed: {exc}"}), flush=True)
 
 
+def _write_config_atomic(config_path: str, data: dict, **dump_kw) -> None:
+    """Replace config.json without ever exposing a truncated file.
+
+    open(path, "w") truncates first, so a crash or overlapping writer left an empty
+    config (API keys and all settings lost). mkstemp creates the temp 0600, which is
+    also the right mode for a file holding keys and cookies.
+    """
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(config_path)), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, **dump_kw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, config_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _update_config_file(config_path: str | None, mutator) -> None:
     if not config_path or not os.path.exists(config_path):
         return
     with open(config_path, "r", encoding="utf-8") as f:
         current = json.load(f)
     mutator(current)
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(current, f, indent=2)
+    _write_config_atomic(config_path, current, indent=2)
 
 
 def _detect_windows_default_browser_family() -> str:
@@ -2290,7 +2750,7 @@ def _run_auto_sync(cfg) -> None:
     synced = 0
 
     for entry in tracked:
-        # sync_enabled defaults True for legacy entries created before Stash-model migration
+        # sync_enabled defaults True for legacy entries created before the per-playlist opt-in migration
         if not entry.get("sync_enabled", True):
             continue
         url = (entry.get("url") or "").strip()
@@ -2334,6 +2794,11 @@ def _run_auto_sync(cfg) -> None:
                     "status": getattr(ev, "status", None),
                 }), flush=True)
 
+            # complete_playlist stays False (issue #75): this downloads only the
+            # tracks the playlist GAINED, so every track already in the folder
+            # would read as an orphan. Renumbering is skipped for the same
+            # reason — renaming only the new arrivals would leave the folder
+            # half-numbered. A full run of the link fixes both.
             service.download_tracks(new_tracks, options=options, event_callback=_on_event)
             total_new += len(new_tracks)
 
@@ -2363,8 +2828,7 @@ def _persist_tracked_playlists(tracked: list) -> None:
         with open(config_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         data["tracked_playlists"] = tracked
-        with open(config_path, "w", encoding="utf-8") as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
+        _write_config_atomic(config_path, data, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Could not persist tracked_playlists to config: %s", e)
 
@@ -2393,6 +2857,8 @@ def main():
     parser = argparse.ArgumentParser(description="Antra JSON backend")
     parser.add_argument("playlists", nargs="*", help="Spotify URLs to download")
     parser.add_argument("--config", help="Path to config.json from Go launcher")
+    parser.add_argument("--get-fpcalc", action="store_true",
+                        help="Print the path to the bundled fpcalc binary and exit")
     parser.add_argument("--get-ffmpeg-dir", action="store_true",
                         help="Print the paths to bundled ffmpeg/ffprobe (two lines) and exit")
     parser.add_argument("--debug-manifest", action="store_true",
@@ -2412,8 +2878,24 @@ def main():
                         help="Search for artists by name and return scored results as JSON, then exit")
     parser.add_argument("--search-source", default="spotify", choices=["spotify", "apple"],
                         help="Source to use for artist search (default: spotify)")
+    # Issue #58 - the app could only search for artists. --search-artists is kept
+    # as-is so nothing that calls it has to change; this is the wider entry point.
+    parser.add_argument("--search-catalog", metavar="QUERY",
+                        help="Search for songs, albums or artists and return scored results "
+                             "as JSON, then exit (issue #58)")
+    parser.add_argument("--search-kind", default="song", choices=["song", "album", "artist"],
+                        help="What --search-catalog looks for (default: song)")
+    parser.add_argument("--search-limit", type=int, default=25,
+                        help="Maximum --search-catalog results (default: 25)")
     parser.add_argument("--retry-track-json", metavar="TRACK_JSON",
                         help="Retry a single previously failed track from serialized track metadata")
+    parser.add_argument("--export-playlist", metavar="URL",
+                        help="Resolve URL and export its tracklist to a file, then exit (v2.0.0 FR-3)")
+    parser.add_argument("--export-format", default="csv",
+                        choices=["csv", "m3u8", "xspf", "json", "txt"],
+                        help="Export file format (default: csv)")
+    parser.add_argument("--export-path", metavar="FILE", default="",
+                        help="Destination file for --export-playlist")
     parser.add_argument("--discovery-json", action="store_true",
                         help="Fetch discovery data (Top Albums/Playlists) and exit")
     parser.add_argument("--discovery-region", default="us",
@@ -2442,6 +2924,20 @@ def main():
                         help="Fetch user's Apple Music library (playlists + saved songs count) and exit")
     parser.add_argument("--auto-sync", action="store_true",
                         help="Run auto-sync: download new tracks from all tracked playlists, then exit")
+    parser.add_argument("--preview-url", metavar="URL",
+                        help="Resolve a link's metadata and tracklist WITHOUT downloading "
+                             "anything (v2.0.0 PV-1). Prints one preview event.")
+    parser.add_argument("--preview-out", metavar="FILE", default="",
+                        help="With --preview-url: write the full TrackMetadata of every "
+                             "resolved track here, so a later --tracks-json download does "
+                             "not have to re-resolve the link.")
+    parser.add_argument("--tracks-json", metavar="FILE",
+                        help="Download the tracks in this file, written by --preview-out "
+                             "and filtered to the user's selection (v2.0.0 PV-1). "
+                             "The file is deleted once read.")
+    parser.add_argument("--import-json", metavar="FILE",
+                        help="Download a playlist file parsed by the desktop app (v2.0.0 PORT-3). "
+                             "The file is deleted once read.")
     args = parser.parse_args()
 
     # Several subcommands (discovery, artist search, discography) exit before the
@@ -2531,6 +3027,22 @@ def main():
             service = AntraService(config=cfg)
             results = service.search_artists(args.search_artists, source=args.search_source)
             print(json.dumps({"type": "artist_search", "data": results}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        sys.exit(0)
+
+    if args.search_catalog:
+        try:
+            from antra.core.config import load_config
+            cfg = load_config()
+            service = AntraService(config=cfg)
+            results = service.search_catalog(
+                args.search_catalog,
+                kind=args.search_kind,
+                source=args.search_source,
+                limit=args.search_limit,
+            )
+            print(json.dumps({"type": "catalog_search", "data": results}), flush=True)
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
         sys.exit(0)
@@ -2659,6 +3171,15 @@ def main():
         info["resolved_qobuz"] = m.mirror_qobuz
         print(json.dumps(info, indent=2))
         sys.exit(0)
+
+    if args.get_fpcalc:
+
+        from antra.utils.runtime import get_fpcalc_exe
+
+        print(get_fpcalc_exe() or '')
+
+        return 0
+
 
     if args.get_ffmpeg_dir:
         from antra.utils.runtime import get_ffmpeg_exe, get_ffprobe_exe
@@ -2817,6 +3338,16 @@ def main():
             os.environ["FOLDER_STRUCTURE"] = settings.get("folder_structure") or "standard"
             os.environ["ALBUM_FOLDER_STRUCTURE"] = settings.get("album_folder_structure") or settings.get("folder_structure") or "standard"
             os.environ["PLAYLIST_FOLDER_STRUCTURE"] = settings.get("playlist_folder_structure") or settings.get("folder_structure") or "standard"
+            # issue #78. Unconditional with its documented default, per the
+            # BUG-23 trap noted further down: a key absent from an older
+            # config.json must not let a stale .env value decide the layout.
+            os.environ["PLAYLIST_STORAGE_MODE"] = settings.get("playlist_storage_mode") or "playlist_folder"
+            # issue #75 — same unconditional rule. `or True` would be wrong here:
+            # False is a value the user chose, and `or` cannot tell it from an
+            # absent key, so the toggle could never be turned off.
+            _renumber = settings.get("playlist_renumber")
+            os.environ["PLAYLIST_RENUMBER"] = "true" if (_renumber is None or _renumber) else "false"
+            os.environ["PLAYLIST_PRUNE_ORPHANS"] = settings.get("playlist_prune_orphans") or "ask"
             os.environ["SINGLE_TRACK_STRUCTURE"] = settings.get("single_track_structure") or "album_numbered"
             os.environ["FILENAME_FORMAT"] = settings.get("filename_format") or "default"
             os.environ["SINGLE_TRACK_FILENAME_TEMPLATE"] = settings.get("single_track_filename_template") or ""
@@ -2838,10 +3369,11 @@ def main():
             os.environ["FILENAME_CONFLICT_BEHAVIOR"] = settings.get("filename_conflict_behavior") or "skip"
             os.environ["FETCH_LYRICS"] = "true" if settings.get("fetch_lyrics", True) else "false"
 
-            if "prefer_explicit" in settings:
-                os.environ["PREFER_EXPLICIT"] = "true" if settings["prefer_explicit"] else "false"
-            if "strict_matching" in settings:
-                os.environ["STRICT_MATCHING"] = "true" if settings["strict_matching"] else "false"
+            # Unconditional, with their documented defaults, for the BUG-23
+            # reason spelled out below: a key absent from an older config.json
+            # must not leave the env var unset and let a stale .env value win.
+            os.environ["PREFER_EXPLICIT"] = "true" if settings.get("prefer_explicit", True) else "false"
+            os.environ["STRICT_MATCHING"] = "true" if settings.get("strict_matching", False) else "false"
             # v1.1.8 FEAT-2/3/4. Set unconditionally with their documented
             # defaults: an absent key in an older config.json must not leave the
             # env var unset and let a stale .env value win — that is exactly the
@@ -2869,6 +3401,89 @@ def main():
 
             if "save_cover_art_sidecar" in settings:
                 os.environ["SAVE_COVER_ART_SIDECAR"] = "true" if settings["save_cover_art_sidecar"] else "false"
+
+            # v2.0.0 FR-2 - cover art settings. Set UNCONDITIONALLY with their
+            # defaults: the `if key in settings` form above is the BUG-23 trap,
+            # where a stale .env value wins for any key an older config.json
+            # does not carry.
+            def _art_str(key: str, default: str) -> str:
+                value = settings.get(key)
+                value = "" if value is None else str(value).strip()
+                return value or default
+
+            def _art_int(key: str, default: int) -> str:
+                try:
+                    return str(int(settings.get(key)))
+                except (TypeError, ValueError):
+                    return str(default)
+
+            def _art_bool(key: str, default: bool) -> str:
+                value = settings.get(key)
+                if value is None:
+                    value = default
+                return "true" if value else "false"
+
+            os.environ["COVER_IMAGE_TEMPLATE"] = _art_str("cover_image_template", "cover")
+            os.environ["LOCAL_ARTWORK_SIZE"] = _art_int("local_artwork_size", 0)
+            os.environ["LOCAL_ARTWORK_FORMAT"] = _art_str("local_artwork_format", "jpg")
+            os.environ["JPEG_IMAGE_QUALITY"] = _art_int("jpeg_image_quality", 90)
+            os.environ["EMBEDDED_ARTWORK_SIZE"] = _art_int("embedded_artwork_size", 1000)
+            os.environ["EMBEDDED_ARTWORK_PNG"] = _art_bool("embedded_artwork_png", False)
+            os.environ["SAVE_ARTIST_IMAGE"] = _art_bool("save_artist_image", False)
+            os.environ["ARTIST_IMAGE_TEMPLATE"] = _art_str("artist_image_template", "folder")
+
+            # v2.0.0 PORT-2 - sidecar files. Set UNCONDITIONALLY with their
+            # defaults for the same BUG-23 reason as the FR-2 block above: the
+            # `if key in settings` form lets a stale .env win for any key an
+            # older config.json does not carry.
+            os.environ["SIDECAR_CUE"] = _art_bool("sidecar_cue", False)
+            os.environ["SIDECAR_NFO"] = _art_bool("sidecar_nfo", False)
+            os.environ["SIDECAR_JSON"] = _art_bool("sidecar_json", False)
+
+            # v2.0.0 DMX-1 - per-tag write toggles. Set UNCONDITIONALLY, same
+            # BUG-23 reasoning as the two blocks above: an older config.json
+            # carries none of these keys, and leaving the env var unset would
+            # let a stale .env value decide which tags get written.
+            _dis = settings.get("disabled_tags")
+            if isinstance(_dis, list):
+                _dis_clean = [str(name).strip().lower() for name in _dis if str(name).strip()]
+            else:
+                _dis_clean = []
+            os.environ["DISABLED_TAGS"] = ",".join(_dis_clean)
+            os.environ["DATE_FORMAT"] = _art_str("date_format", "iso")
+            os.environ["WRITE_ID3V1"] = _art_bool("write_id3v1", True)
+
+            # v2.0.0 DMX-2 - output-only text transforms. Set UNCONDITIONALLY
+            # with their defaults, same BUG-23 reasoning as every block above:
+            # an older config.json carries none of these keys, and leaving the
+            # env var unset would let a stale .env value rewrite the user's
+            # titles and artist tags.
+            os.environ["TITLE_CASING"] = _art_str("title_casing", "nothing")
+            os.environ["ARTIST_CASING"] = _art_str("artist_casing", "nothing")
+            os.environ["REMOVE_ALBUM_VERSION"] = _art_bool("remove_album_version", False)
+            os.environ["REMOVE_DUPLICATE_ARTISTS"] = _art_bool("remove_duplicate_artists", True)
+            os.environ["FEATURED_ARTISTS_MODE"] = _art_str("featured_artists_mode", "nothing")
+            os.environ["MULTI_ARTIST_SEPARATOR"] = _art_str("multi_artist_separator", "default")
+            os.environ["ALBUM_VARIOUS_ARTISTS"] = _art_bool("album_various_artists", True)
+
+            # v2.0.0 DMX-6 - post-download command hook. Set
+            # UNCONDITIONALLY with their defaults, same BUG-23 reasoning as
+            # every block above - and it matters most here: leaving these
+            # unset would let a stale .env decide whether a program runs.
+            os.environ["POST_COMMAND_ENABLED"] = _art_bool("post_command_enabled", False)
+            os.environ["POST_COMMAND_CONFIRMED"] = _art_bool("post_command_confirmed", False)
+            os.environ["POST_COMMAND"] = _art_str("post_command", "")
+            os.environ["POST_COMMAND_MODE"] = _art_str("post_command_mode", "track")
+            os.environ["POST_COMMAND_TIMEOUT"] = _art_int("post_command_timeout", 30)
+
+            # v2.0.0 SF-2 - ReplayGain. Unconditional, same BUG-23 reasoning:
+            # a stale .env must not switch a decode pass per track on.
+            os.environ["REPLAYGAIN_ENABLED"] = _art_bool("replaygain_enabled", False)
+
+            # Audio fingerprint verification. Unconditional for the same
+            # BUG-23 reason: a stale .env must not switch a per-track
+            # preview fetch on behind the user's back.
+            os.environ["VERIFY_AUDIO_ENABLED"] = _art_bool("verify_audio_enabled", True)
 
             # Auto-sync settings
             if "auto_sync_enabled" in settings:
@@ -2967,26 +3582,122 @@ def main():
         output_format=cfg.output_format
     )
 
+    # v2.0.0 PV-1 - resolve the link and stop. Nothing is written to the library
+    # and no organizer is built, so a preview can never touch the user's files.
+    if args.preview_url:
+        try:
+            # A podcast link never goes through fetch_playlist_tracks - the
+            # download path routes it to _download_podcast_url before that call -
+            # so it has nothing to preview. Say so in a way the frontend can act
+            # on: it falls back to queueing the link directly, which is what
+            # podcasts did before the preview step existed.
+            from antra.core.podcast import is_podcast_url
+            if is_podcast_url(args.preview_url):
+                print(json.dumps({
+                    "type": "preview_unsupported",
+                    "reason": "Podcast episodes and shows are downloaded without a preview.",
+                }), flush=True)
+                sys.exit(0)
+            tracks = service.fetch_playlist_tracks(
+                args.preview_url, options=options, enrich_override=False
+            )
+            if not tracks:
+                raise RuntimeError("No tracks were found at that link.")
+            # issue #74 - stamped before _preview_rows renders them and before
+            # the cache below is written, so the download process that reloads
+            # that cache addresses the same rows the preview screen created.
+            _stamp_row_ids(tracks)
+            data = _playlist_header(args.preview_url, tracks, cfg)
+            data["tracks"] = _preview_rows(tracks)
+            if args.preview_out:
+                # Full objects for the download that may follow. Written before
+                # the event is printed so the frontend never holds a preview id
+                # whose cache does not exist yet.
+                with open(args.preview_out, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        {
+                            "url": args.preview_url,
+                            "header": _playlist_header(args.preview_url, tracks, cfg),
+                            "tracks": [asdict(t) for t in tracks],
+                        },
+                        fh,
+                    )
+            print(json.dumps({"type": "preview", "data": data}), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+            sys.exit(1)
+        sys.exit(0)
+
+    # v2.0.0 FR-3 - export the resolved tracklist without downloading anything.
+    if args.export_playlist:
+        try:
+            from antra.utils.playlist_export import (
+                EXPORT_EXTENSIONS,
+                export_playlist,
+                suggested_filename,
+            )
+            from antra_shared.filename_prefs import migrate_legacy_templates
+            from antra.utils.transcoder import OUTPUT_FORMAT_EXTENSION
+
+            tracks = service.fetch_playlist_tracks(
+                args.export_playlist, options=options, enrich_override=False
+            )
+            if not tracks:
+                raise RuntimeError("No tracks were found at that link.")
+
+            prefs = migrate_legacy_templates(
+                {
+                    "single_track_filename_template": getattr(cfg, "single_track_filename_template", ""),
+                    "album_track_filename_template": getattr(cfg, "album_track_filename_template", ""),
+                    "folder_structure_template": getattr(cfg, "folder_structure_template", ""),
+                    "multi_disc_handling": getattr(cfg, "multi_disc_handling", "prefix"),
+                    "track_number_padding": getattr(cfg, "track_number_padding", 2),
+                    "illegal_character_replacement": getattr(cfg, "illegal_character_replacement", "_"),
+                    "whitespace_handling": getattr(cfg, "whitespace_handling", "preserve"),
+                    "filename_conflict_behavior": getattr(cfg, "filename_conflict_behavior", "skip"),
+                    # v2.0.0 DMX-2 - without these the exported playlist would
+                    # render paths from untransformed text and point at files
+                    # that are not on disk under those names.
+                    "title_casing": getattr(cfg, "title_casing", "nothing"),
+                    "artist_casing": getattr(cfg, "artist_casing", "nothing"),
+                    "remove_album_version": getattr(cfg, "remove_album_version", False),
+                    "remove_duplicate_artists": getattr(cfg, "remove_duplicate_artists", True),
+                    "featured_artists_mode": getattr(cfg, "featured_artists_mode", "nothing"),
+                    "multi_artist_separator": getattr(cfg, "multi_artist_separator", "default"),
+                    "album_various_artists": getattr(cfg, "album_various_artists", True),
+                },
+                filename_format=getattr(cfg, "filename_format", "default"),
+                album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
+            )
+
+            title = ""
+            for candidate in tracks:
+                title = candidate.playlist_name or candidate.album or ""
+                if title:
+                    break
+
+            out_path = args.export_path or suggested_filename(title, args.export_format, prefs)
+            audio_ext = OUTPUT_FORMAT_EXTENSION.get(cfg.output_format or "", ".flac") or ".flac"
+
+            summary = export_playlist(
+                tracks,
+                args.export_format,
+                out_path,
+                playlist_title=title,
+                source_url=args.export_playlist,
+                filename_preferences=prefs,
+                audio_extension=audio_ext,
+            )
+            summary["type"] = "playlist_exported"
+            print(json.dumps(summary), flush=True)
+        except Exception as e:
+            print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+            sys.exit(1)
+        sys.exit(0)
+
     if args.retry_track_json:
         try:
-            organizer = LibraryOrganizer(
-                cfg.output_dir,
-                full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
-                folder_structure=getattr(cfg, "folder_structure", "standard"),
-                album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
-                playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
-                single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
-                filename_format=getattr(cfg, "filename_format", "default"),
-                single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
-                album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
-                folder_structure_template=getattr(cfg, "folder_structure_template", ""),
-                flat_library_root=getattr(cfg, "flat_library_root", False),
-                multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
-                track_number_padding=getattr(cfg, "track_number_padding", 2),
-                illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
-                whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
-                filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
-            )
+            organizer = _make_organizer(cfg)
         except Exception as e:
             print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
             print(json.dumps({"type": "done"}))
@@ -3011,6 +3722,16 @@ def main():
         print(json.dumps({"type": "done"}), flush=True)
         return
 
+    if args.import_json:
+        _run_playlist_import(args.import_json, cfg, service, options)
+        print(json.dumps({"type": "done"}), flush=True)
+        return
+
+    if args.tracks_json:
+        _run_track_selection(args.tracks_json, cfg, service, options)
+        print(json.dumps({"type": "done"}), flush=True)
+        return
+
     if not args.playlists:
         print(json.dumps({"type": "log", "level": "error", "message": "No playlists provided"}))
         return
@@ -3021,24 +3742,7 @@ def main():
     # be very slow on a NAS. Reusing one instance across all URLs in this batch
     # means the scan happens exactly once per run, not once per URL.
     try:
-        organizer = LibraryOrganizer(
-            cfg.output_dir,
-            full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
-            folder_structure=getattr(cfg, "folder_structure", "standard"),
-            album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
-            playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
-            single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
-            filename_format=getattr(cfg, "filename_format", "default"),
-            single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
-            album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
-            folder_structure_template=getattr(cfg, "folder_structure_template", ""),
-            flat_library_root=getattr(cfg, "flat_library_root", False),
-            multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
-            track_number_padding=getattr(cfg, "track_number_padding", 2),
-            illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
-            whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
-            filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
-        )
+        organizer = _make_organizer(cfg)
     except Exception as e:
         print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
         print(json.dumps({"type": "done"}))
@@ -3081,16 +3785,13 @@ def main():
             # Progressive page callback — fires after each 1000-track GraphQL page.
             # First call emits playlist_loaded (partial), subsequent calls emit tracks_appended.
             _page_state = {"sent": 0}
-            _quality_badge_map = {
-                'lossless': 'LOSSLESS', 'flac': 'LOSSLESS',
-                'alac': 'ALAC',
-                'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
-            }
 
             def _on_page(tracks_so_far):
                 new_tracks = tracks_so_far[_page_state["sent"]:]
                 if not new_tracks:
                     return
+                # issue #74 - before the rows reach the webview, never after.
+                _stamp_row_ids(new_tracks)
                 if _page_state["sent"] == 0:
                     _artwork_p = (
                         getattr(tracks_so_far[0], "playlist_artwork_url", None)
@@ -3110,10 +3811,12 @@ def main():
                         "content_type": _infer_playlist_content_type(url, tracks_so_far),
                         "artists_string": _playlist_artists_string(tracks_so_far),
                         "release_date": _format_track_release_date(tracks_so_far),
-                        "quality_badge": _quality_badge_map.get(cfg.output_format or '', ''),
+                        "quality_badge": _QUALITY_BADGES.get(cfg.output_format or '', ''),
                         "track_count": len(tracks_so_far),
                         "tracks": [
-                            {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
+                            {"row_id": getattr(t, "row_id", "") or "",
+                             "artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0,
+                             "isrc": getattr(t, "isrc", "") or ""}
                             for t in tracks_so_far
                         ],
                     }), flush=True)
@@ -3121,13 +3824,18 @@ def main():
                     print(json.dumps({
                         "type": "tracks_appended",
                         "tracks": [
-                            {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
+                            {"row_id": getattr(t, "row_id", "") or "",
+                             "artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0,
+                             "isrc": getattr(t, "isrc", "") or ""}
                             for t in new_tracks
                         ],
                     }), flush=True)
                 _page_state["sent"] = len(tracks_so_far)
 
             tracks = service.fetch_playlist_tracks(url, options=options, enrich_override=False, page_callback=_on_page)
+            # issue #74 - idempotent: the page callback above has already
+            # stamped anything it emitted.
+            _stamp_row_ids(tracks)
 
             # Emit the full tracklist immediately after metadata is fetched,
             # before any individual downloads begin.
@@ -3144,11 +3852,6 @@ def main():
                     or getattr(tracks[0], "album", None)
                     or ""
                 )
-                _quality_badge_map = {
-                    'lossless': 'LOSSLESS', 'flac': 'LOSSLESS',
-                    'alac': 'ALAC',
-                    'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
-                }
                 print(json.dumps({
                     "type": "playlist_loaded",
                     "title": _title_early,
@@ -3156,25 +3859,33 @@ def main():
                     "content_type": _infer_playlist_content_type(url, tracks),
                     "artists_string": _playlist_artists_string(tracks),
                     "release_date": _format_track_release_date(tracks),
-                    "quality_badge": _quality_badge_map.get(cfg.output_format or '', ''),
+                    "quality_badge": _QUALITY_BADGES.get(cfg.output_format or '', ''),
                     "track_count": len(tracks),
                     "tracks": [
                         {
+                            "row_id": getattr(t, "row_id", "") or "",
                             "artist": t.artist_string,
                             "title": t.title,
                             "duration_ms": t.duration_ms or 0,
+                            "isrc": getattr(t, "isrc", "") or "",
                         }
                         for t in tracks
                     ],
                 }), flush=True)
 
             tracks = service.enrich_tracks_for_download(tracks, url, options=options)
+            # issue #74 - enrichment is the step that reorders the list and can
+            # rebuild its objects. This is the point where the ids have to still
+            # be intact, so it is the point where they are checked.
+            _verify_row_ids(tracks)
 
             results = service.download_tracks(
                 tracks,
                 options=options,
                 event_callback=emit_event,
                 organizer=organizer,
+                # The link's full tracklist was just fetched (issue #75).
+                complete_playlist=True,
             )
 
             _elapsed = time.time() - _url_start
@@ -3205,6 +3916,7 @@ def main():
                 "downloaded": sum(1 for r in results if r.status.name == "COMPLETED"),
                 "failed": sum(1 for r in results if r.status.name == "FAILED"),
                 "skipped": sum(1 for r in results if r.status.name == "SKIPPED"),
+                "tags_incomplete": sum(1 for r in results if getattr(r, "tags_problem", None)),
                 "error": None,
                 "sources": {},
                 "date": datetime.now().isoformat(),

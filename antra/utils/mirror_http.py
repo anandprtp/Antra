@@ -50,6 +50,18 @@ class TlsFallbackSession:
     def headers(self):
         return self._s.headers
 
+    # Forwarded so an adapter can opt out of inheriting system/environment
+    # proxies the way a plain requests.Session can. The Apple adapter does
+    # (it talks only to our own mirror), and losing that on the way through
+    # this wrapper would silently change which proxy its requests take.
+    @property
+    def trust_env(self):
+        return self._s.trust_env
+
+    @trust_env.setter
+    def trust_env(self, value):
+        self._s.trust_env = value
+
     def _log_proxy_diagnostics(self, url: str) -> None:
         try:
             from requests.utils import get_environ_proxies
@@ -105,6 +117,39 @@ class TlsFallbackSession:
 
     def post(self, url, **kwargs):
         return self._s.post(url, **kwargs)
+
+
+def has_http_status(text: str, code: int) -> bool:
+    """True when `code` appears as a standalone number in an error message.
+
+    `"401" in err` also matched an ASIN, track id or URL that merely contains those
+    digits (B00401XYZ, an Apple id 1404991234), turning an unrelated failure into
+    "credentials expired" or "404, do not retry".
+    """
+    import re
+    return re.search(rf"(?<![A-Za-z0-9]){code}(?![A-Za-z0-9])", text or "") is not None
+
+
+def ensure_complete_transfer(response, written: int, label: str) -> None:
+    """Raise if a streamed body is shorter than the Content-Length it announced.
+
+    iter_content() does not always raise when a connection is cut early (it depends
+    on the urllib3 version), so a short transfer would otherwise be accepted as a
+    finished file. Skipped when the length is absent (relay streams) or the body is
+    content-encoded (Content-Length then counts the compressed bytes).
+    """
+    cl = response.headers.get("Content-Length")
+    if not cl or response.headers.get("Content-Encoding"):
+        return
+    try:
+        expected = int(cl)
+    except ValueError:
+        return
+    if written < expected:
+        raise RuntimeError(
+            f"[{label}] Truncated download: got {written}/{expected} bytes - "
+            "the stream was cut short"
+        )
 
 
 def humanize_network_error(message: str, service: str) -> str:

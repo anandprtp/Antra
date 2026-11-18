@@ -10,7 +10,7 @@ CRITICAL: As of 2026 the REST endpoints are dead for sp_dc tokens:
   - /v1/me/tracks permanently 429-blocks sp_dc tokens
 The GraphQL Partner API is the only reliable path.
 
-Approach mirrors the Stash Android client (SpotifyAuthManager.kt + SpotifyApiClient.kt).
+Approach mirrors Spotify's own web player: TOTP token -> client token -> GraphQL.
 """
 import json as _json
 import logging
@@ -31,14 +31,14 @@ _GRAPHQL_URL = "https://api-partner.spotify.com/pathfinder/v1/query"
 _OPEN_SPOTIFY = "https://open.spotify.com/"
 
 # ── TOTP ──────────────────────────────────────────────────────────────────────
-# Same secret used in spotify.py — confirmed matching SpotiFLAC v61.
+# Same secret used in spotify.py — web-player TOTP version 61.
 _SP_TOTP_SECRET = (
     "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4D"
     "QOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 )
 _SP_TOTP_VERSION = 61
 
-# ── GraphQL persisted-query hashes (from Stash SpotifyAuthConfig.kt) ─────────
+# ── GraphQL persisted-query hashes (read from the web-player bundle) ───────
 _HASH_LIBRARY_V3 = (
     "973e511ca44261fda7eebac8b653155e7caee3675abb4fb110cc1b8c78b091c3"
 )
@@ -277,9 +277,12 @@ class SpotifyLibraryClient:
 
     # ── GraphQL Partner API ───────────────────────────────────────────────────
 
-    def _graphql(self, operation: str, variables: dict, hash_: str) -> Optional[dict]:
+    def _graphql(self, operation: str, variables: dict, hash_: str, _retried: bool = False) -> Optional[dict]:
         """Execute a persisted GraphQL query against api-partner.spotify.com."""
         import urllib.parse
+        from antra.core.spotify_partner import is_stale_hash, persisted_hash, refresh_persisted_hash
+
+        hash_ = persisted_hash(operation, hash_)
 
         access_token = self._ensure_access_token()
         client_token = self._ensure_client_token()
@@ -320,6 +323,11 @@ class SpotifyLibraryClient:
             headers["Authorization"] = f"Bearer {access_token}"
             headers["Client-Token"] = client_token
             r = requests.get(url, headers=headers, timeout=20)
+
+        if not _retried and is_stale_hash(r.status_code, r.text):
+            fresh = refresh_persisted_hash(operation, hash_)
+            if fresh:
+                return self._graphql(operation, variables, fresh, _retried=True)
 
         r.raise_for_status()
         return r.json()

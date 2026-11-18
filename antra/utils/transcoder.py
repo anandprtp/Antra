@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
 from mutagen import File as MutagenFile
 
@@ -122,7 +123,7 @@ class AudioTranscoder:
             return False  # lossless source — encoding once is correct
         return self._lossy_family(file_path) != target_family
 
-    def needs_conversion(self, file_path: str, target_format: str) -> bool:
+    def needs_conversion(self, file_path: str, target_format: str, allow_lossy_reencode: bool = False) -> bool:
         # Normalise bit-depth variants to their base format for conversion logic.
         # lossless-16 / lossless-24 → lossless, alac-16 / alac-24 → alac
         base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
@@ -143,7 +144,9 @@ class AudioTranscoder:
         # FEAT-2: refuse a lossy → different-lossy re-encode. Checked before the
         # per-format branches below, which otherwise return True unconditionally
         # for aac/m4a targets and would happily re-encode an AAC source to MP3.
-        if self.blocks_lossy_reencode(file_path, base_format):
+        # allow_lossy_reencode: the source is a last resort (YouTube), so nothing better exists
+        # and delivering the requested container beats handing back an .m4a for an MP3 job.
+        if not allow_lossy_reencode and self.blocks_lossy_reencode(file_path, base_format):
             return False
         if base_format == "lossless":
             ext = os.path.splitext(file_path)[1].lower()
@@ -177,17 +180,35 @@ class AudioTranscoder:
         target_ext = OUTPUT_FORMAT_EXTENSION.get(target_format)
         return target_ext is not None and ext != target_ext
 
-    def convert(self, file_path: str, target_format: str) -> str:
+    # Standard encoder steps. A lossy source of N kbps is re-encoded at the first step that is not
+    # below N-4 (the 4 kbps absorbs VBR/measurement noise: 128.4 -> 128, 131 -> 128, 136 -> 160),
+    # never at the configured ceiling: a 128 kbps stream re-encoded at 320 is ~2.5x the size for
+    # no extra audio.
+    _BITRATE_STEPS = (48, 64, 96, 128, 160, 192, 224, 256, 320)
+
+    @classmethod
+    def cap_kbps(cls, configured_kbps: int, source_kbps: Optional[int]) -> int:
+        """Encode bitrate for a lossy -> lossy conversion: the configured one, but never more
+        than the source warrants. Unknown source bitrate leaves the configured value alone."""
+        if not source_kbps or source_kbps <= 0:
+            return configured_kbps
+        step = next((s for s in cls._BITRATE_STEPS if s >= source_kbps - 4), cls._BITRATE_STEPS[-1])
+        return min(configured_kbps, step)
+
+    def convert(self, file_path: str, target_format: str, allow_lossy_reencode: bool = False,
+                max_source_kbps: Optional[int] = None) -> str:
+        """`max_source_kbps` is the bitrate of a LOSSY source (None for lossless or unknown); it
+        caps the bitrate of any lossy re-encode, see [cap_kbps]."""
         if target_format == "source":
             return file_path
-        if not self.needs_conversion(file_path, target_format):
+        if not self.needs_conversion(file_path, target_format, allow_lossy_reencode):
             return file_path
         from antra.utils.runtime import get_ffmpeg_exe, get_clean_subprocess_env
         ffmpeg = get_ffmpeg_exe()
         if not ffmpeg:
             raise RuntimeError("ffmpeg is required for output format conversion")
 
-        plan = self._plan(target_format, file_path=file_path)
+        plan = self._plan(target_format, file_path=file_path, max_source_kbps=max_source_kbps)
         base, _ = os.path.splitext(file_path)
         temp_output = base + f".antra-convert{plan.extension}"
         final_output = base + plan.extension
@@ -212,10 +233,12 @@ class AudioTranscoder:
                     f"ffmpeg conversion to {target_format} failed: {result.stderr.strip() or result.stdout.strip()}"
                 )
 
-            if os.path.exists(final_output) and os.path.normcase(final_output) != os.path.normcase(file_path):
-                os.remove(final_output)
-            if os.path.normcase(final_output) == os.path.normcase(file_path):
-                os.remove(file_path)
+            # ffmpeg can exit 0 and still leave nothing usable; never swap that in over the source.
+            if not os.path.exists(temp_output) or os.path.getsize(temp_output) == 0:
+                raise RuntimeError(f"ffmpeg conversion to {target_format} produced an empty file")
+            # os.replace overwrites atomically. This used to delete the source (same-extension
+            # conversion, e.g. 24-bit -> 16-bit FLAC) or the existing target FIRST, so any
+            # failure of the rename afterwards (a Windows lock, antivirus) lost the only copy.
             os.replace(temp_output, final_output)
             if os.path.exists(file_path) and os.path.normcase(file_path) != os.path.normcase(final_output):
                 os.remove(file_path)
@@ -228,8 +251,8 @@ class AudioTranscoder:
             raise
         return final_output
 
-    @staticmethod
-    def _plan(target_format: str, file_path: str = "") -> ConversionPlan:
+    @classmethod
+    def _plan(cls, target_format: str, file_path: str = "", max_source_kbps: Optional[int] = None) -> ConversionPlan:
         # Normalise bit-depth variants to base format
         base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
         # For a "-16" request, force 16-bit output (ffmpeg dithers on bit-depth
@@ -246,7 +269,7 @@ class AudioTranscoder:
             return ConversionPlan(
                 target_format=base_format,
                 extension=".mp3",
-                codec_args=["-c:a", "libmp3lame", "-b:a", "320k"],
+                codec_args=["-c:a", "libmp3lame", "-b:a", f"{cls.cap_kbps(320, max_source_kbps)}k"],
             )
         if base_format == "alac":
             return ConversionPlan(
@@ -264,7 +287,7 @@ class AudioTranscoder:
             return ConversionPlan(
                 target_format=base_format,
                 extension=".m4a",
-                codec_args=["-c:a", "aac", "-b:a", "320k", "-f", "ipod", "-movflags", "+faststart"],
+                codec_args=["-c:a", "aac", "-b:a", f"{cls.cap_kbps(320, max_source_kbps)}k", "-f", "ipod", "-movflags", "+faststart"],
             )
         if base_format == "m4a":
             if AudioTranscoder._can_normalize_aac_container(file_path):
@@ -276,7 +299,7 @@ class AudioTranscoder:
             return ConversionPlan(
                 target_format=base_format,
                 extension=".m4a",
-                codec_args=["-c:a", "aac", "-b:a", "256k", "-f", "ipod", "-movflags", "+faststart"],
+                codec_args=["-c:a", "aac", "-b:a", f"{cls.cap_kbps(256, max_source_kbps)}k", "-f", "ipod", "-movflags", "+faststart"],
             )
         raise ValueError(f"Unsupported output format: {target_format}")
 

@@ -26,12 +26,56 @@ export function ClearHistory() {
   return window['go']['main']['App']['ClearHistory']();
 }
 
+export function ClearQueue() {
+  return window['go']['main']['App']['ClearQueue']();
+}
+
 export function ConfirmAmazonLogin() {
   return window['go']['main']['App']['ConfirmAmazonLogin']();
 }
 
+export function CustomThemeSeed(arg1, arg2) {
+  return window['go']['main']['App']['CustomThemeSeed'](arg1, arg2);
+}
+
+export function CustomThemeTable() {
+  return window['go']['main']['App']['CustomThemeTable']();
+}
+
+export function DeletePlaylistOrphans(arg1) {
+  return window['go']['main']['App']['DeletePlaylistOrphans'](arg1);
+}
+
+export function DiagnoseNetwork() {
+  return window['go']['main']['App']['DiagnoseNetwork']();
+}
+
+export function EnqueueDownload(arg1, arg2) {
+  return window['go']['main']['App']['EnqueueDownload'](arg1, arg2);
+}
+
+export function EnqueueImport(arg1, arg2, arg3) {
+  return window['go']['main']['App']['EnqueueImport'](arg1, arg2, arg3);
+}
+
+export function EnqueuePreviewSelection(arg1, arg2, arg3) {
+  return window['go']['main']['App']['EnqueuePreviewSelection'](arg1, arg2, arg3);
+}
+
+export function ExportPlaylist(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ExportPlaylist'](arg1, arg2, arg3);
+}
+
+export function ExtractArtworkSeed(arg1) {
+  return window['go']['main']['App']['ExtractArtworkSeed'](arg1);
+}
+
 export function GetAlbumAvailability(arg1) {
   return window['go']['main']['App']['GetAlbumAvailability'](arg1);
+}
+
+export function GetAppVersion() {
+  return window['go']['main']['App']['GetAppVersion']();
 }
 
 export function GetAppleMusicLibrary() {
@@ -74,6 +118,10 @@ export function GetKeyInfo() {
   return window['go']['main']['App']['GetKeyInfo']();
 }
 
+export function GetQueue() {
+  return window['go']['main']['App']['GetQueue']();
+}
+
 export function GetSlskdWebUIInfo() {
   return window['go']['main']['App']['GetSlskdWebUIInfo']();
 }
@@ -114,12 +162,36 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
+export function PickPlaylistFile() {
+  return window['go']['main']['App']['PickPlaylistFile']();
+}
+
 export function PollDeviceLogin(arg1) {
   return window['go']['main']['App']['PollDeviceLogin'](arg1);
 }
 
+export function PreviewAlbum(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PreviewAlbum'](arg1, arg2, arg3);
+}
+
+export function PreviewRelease(arg1) {
+  return window['go']['main']['App']['PreviewRelease'](arg1);
+}
+
+export function PreviewTrack(arg1, arg2, arg3) {
+  return window['go']['main']['App']['PreviewTrack'](arg1, arg2, arg3);
+}
+
+export function RemoveQueueItem(arg1) {
+  return window['go']['main']['App']['RemoveQueueItem'](arg1);
+}
+
 export function RenewDeviceTokenIfNeeded() {
   return window['go']['main']['App']['RenewDeviceTokenIfNeeded']();
+}
+
+export function ResumeQueue() {
+  return window['go']['main']['App']['ResumeQueue']();
 }
 
 export function RetryTrackDownload(arg1) {
@@ -128,6 +200,10 @@ export function RetryTrackDownload(arg1) {
 
 export function RunAutoSync() {
   return window['go']['main']['App']['RunAutoSync']();
+}
+
+export function SaveActivityLog(arg1, arg2) {
+  return window['go']['main']['App']['SaveActivityLog'](arg1, arg2);
 }
 
 export function SaveConfig(arg1) {
@@ -144,6 +220,14 @@ export function ScanFolder(arg1) {
 
 export function SearchArtists(arg1, arg2) {
   return window['go']['main']['App']['SearchArtists'](arg1, arg2);
+}
+
+export function SearchCatalog(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SearchCatalog'](arg1, arg2, arg3);
+}
+
+export function SetQueueItemTitle(arg1, arg2) {
+  return window['go']['main']['App']['SetQueueItemTitle'](arg1, arg2);
 }
 
 export function SetSpotifyCookie(arg1) {
@@ -172,6 +256,14 @@ export function StartDeviceLogin() {
 
 export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
+}
+
+export function StartImportDownload(arg1) {
+  return window['go']['main']['App']['StartImportDownload'](arg1);
+}
+
+export function StartNextQueued() {
+  return window['go']['main']['App']['StartNextQueued']();
 }
 
 export function StartTidalOAuthLogin() {

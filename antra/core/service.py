@@ -4,12 +4,15 @@ Reusable application service for CLI and future desktop frontends.
 import logging
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from antra.core.config import Config, load_config
 from antra.core.control import DownloadController
+from antra.utils.tagger import ArtworkPreferences
 from antra.core.engine import DownloadEngine, EngineConfig
 from antra.core.events import EngineEvent
 from antra.core.spotify import SpotifyAvailabilityError, SpotifyResourceError
@@ -28,8 +31,16 @@ from antra.core.spotify import SpotifyClient
 from antra.utils.matching import duration_close, score_similarity
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
+from antra.utils.post_command import PostCommandConfig
 
 logger = logging.getLogger(__name__)
+
+# How many public-metadata fills run at once in _fill_missing_years.
+# Small on purpose: these are unauthenticated public endpoints (the Spotify
+# track page and the iTunes Search API) and the point is to remove latency,
+# not to hammer them. Measured on a 48-track playlist from a throttled link:
+# 37.3s serial -> a few seconds here, with the fetch itself costing 1.3s.
+_YEAR_FILL_WORKERS = 8
 
 SOURCE_PREFERENCE_CHOICES = ("auto", "apple", "hifi", "amazon", "qobuz", "deezer", "soulseek", "youtube", "jiosaavn")
 OUTPUT_FORMAT_CHOICES = ("source", "flac", "alac", "m4a", "aac", "mp3", "lossless-16", "lossless-24", "alac-16", "alac-24")
@@ -205,6 +216,18 @@ def _resolve_apple_mirrors(cfg, manifest=None) -> list:
     if mirror_apple_url and mirror_apple_url not in mirrors:
         mirrors = [mirror_apple_url] + mirrors
     return mirrors
+
+
+def _resolve_deezer_mirrors(cfg) -> list:
+    """Deezer mirror for lyrics: env/config first, else the endpoint manifest."""
+    url = (getattr(cfg, "deezer_mirror_url", "") or "").strip()
+    if not url:
+        try:
+            from antra.core.endpoint_manifest import load_endpoint_manifest
+            url = (getattr(load_endpoint_manifest(), "mirror_deezer", "") or "").strip()
+        except Exception:
+            url = ""
+    return [url.rstrip("/")] if url else []
 
 
 def _validated_supporter_mirror_key() -> str:
@@ -528,7 +551,11 @@ class AntraService:
         if source_group_enabled("deezer_mirror") and deezer_mirror_url:
             try:
                 from antra.sources.deezer_mirror import DeezerMirrorAdapter
-                adapter = DeezerMirrorAdapter(mirror_url=deezer_mirror_url, api_key=mirror_api_key)
+                adapter = DeezerMirrorAdapter(
+                    mirror_url=deezer_mirror_url,
+                    api_key=mirror_api_key,
+                    preferred_output_format=cfg.output_format,
+                )
                 if adapter.is_available():
                     adapters.append(adapter)
                     logger.info("[OK] Deezer mirror adapter enabled")
@@ -748,8 +775,8 @@ class AntraService:
     def _enrich_isrcs(tracks: list[TrackMetadata]) -> None:
         """Bulk-enrich ISRCs and release dates for Spotify-sourced tracks missing them.
 
-        Uses the Spotify v1 /tracks endpoint with an anonymous TOTP token (same
-        mechanism as the main Spotify client).  Only fires when at least one track
+        Uses spclient's per-track metadata route with an anonymous TOTP token
+        (NOT api.spotify.com/v1/tracks, which 429s).  Only fires when at least one track
         has a spotify_id but no isrc — skipped entirely otherwise so there is zero
         overhead for fully-enriched track lists (e.g. tracks from authenticated
         Spotify or Apple Music catalog API).
@@ -761,7 +788,7 @@ class AntraService:
             from antra.core.isrc_enricher import ISRCEnricher
             logger.info(
                 f"[Service] Enriching ISRCs for {len(missing)}/{len(tracks)} tracks "
-                "via Spotify API"
+                "via Spotify spclient"
             )
             ISRCEnricher().enrich_tracks(tracks)
         except Exception as e:
@@ -787,6 +814,11 @@ class AntraService:
            filename numbering — sequential renumbering fixes this.
         """
         from collections import defaultdict, Counter
+        # issue #74 - grouping by album permutes the list. That is wanted for an
+        # album request (it sequences the release) and unwanted for a playlist,
+        # where the user chose the order. Objects are mutated in place below and
+        # never replaced, so id() is a stable handle on the input position.
+        input_order = {id(track): index for index, track in enumerate(tracks)}
         album_groups: dict[str, list[TrackMetadata]] = defaultdict(list)
         for track in tracks:
             key = AntraService._album_group_key(track)
@@ -890,7 +922,18 @@ class AntraService:
             else:
                 reordered_tracks.extend(group)
 
-        return reordered_tracks if len(reordered_tracks) == len(tracks) else tracks
+        if len(reordered_tracks) != len(tracks):
+            return tracks
+
+        # issue #74 - a playlist is returned in the order it was fetched in. The
+        # per-group work above (year, disc and track numbering) still applies; only
+        # the sequence is restored. Without this a playlist holding two
+        # non-adjacent tracks from one album - i.e. most playlists - downloaded in
+        # an order the user never saw. An album request keeps its new sequence,
+        # because the filename numbering is derived from it.
+        if any((track.request_kind or "").lower() == "playlist" for track in tracks):
+            reordered_tracks.sort(key=lambda track: input_order[id(track)])
+        return reordered_tracks
 
     @staticmethod
     def _album_group_key(track: TrackMetadata) -> str:
@@ -1102,9 +1145,12 @@ class AntraService:
 
                 self._apply_request_kind(tracks, playlist)
 
-        # Note: ISRC enrichment removed — text search on Qobuz/Tidal mirrors
-        # works without ISRCs. Enrichment was causing 15s+ delays due to
-        # Spotify anonymous token rate limiting (429 on every run).
+        # ISRC enrichment is back, on spclient's per-track metadata route. It was
+        # removed in v1.1.3 (BUG-14) because it batched against
+        # api.spotify.com/v1/tracks, which 429s for the web-player client id
+        # (15s+ of retries, 0 ISRCs). Without an ISRC the adapters fall back to
+        # fuzzy text search, which loses obscure/remix titles outright.
+        self._enrich_isrcs(tracks)
 
         # Fill missing release_year via iTunes Search (free, no auth).
         # Only fires for tracks that still have no year after the fetch above.
@@ -1174,14 +1220,44 @@ class AntraService:
 
         try:
             spotify = self._make_spotify_client(cfg)
-            for track in missing:
-                try:
-                    spotify.enrich_public_track_metadata(track)
-                except Exception as e:
-                    logger.debug("[Service] Year fill failed for '%s': %s", track.title, e)
         except Exception as e:
             logger.debug("[Service] Year fill skipped: %s", e)
+            return tracks
 
+        # Run in parallel. Each fill is two independent HTTP round trips (the
+        # public track page, then an iTunes search) and they share nothing but
+        # the client, so the serial loop this replaced was pure latency:
+        # measured on a 48-track playlist, 48 fills x 0.78 s = 37.3 s, which was
+        # 98% of the whole fetch. The playlist itself takes 1.3 s.
+        #
+        # This fires at all because Spotify's `fetchPlaylist` GraphQL payload
+        # carries NO date on albumOfTrack (measured: keys are artists, coverArt,
+        # name, uri), so every track comes back without a release year.
+        #
+        # The pool is small on purpose: these are unauthenticated public
+        # endpoints and the point is to remove latency, not to hammer them.
+        workers = min(_YEAR_FILL_WORKERS, len(missing))
+        started = time.time()
+
+        def _fill(track):
+            try:
+                spotify.enrich_public_track_metadata(track)
+            except Exception as e:
+                logger.debug("[Service] Year fill failed for '%s': %s", track.title, e)
+
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(_fill, missing))
+        except Exception as e:
+            # A pool that cannot start must not lose the metadata entirely.
+            logger.debug("[Service] Year fill pool failed (%s); falling back to serial", e)
+            for track in missing:
+                _fill(track)
+
+        logger.debug(
+            "[Service] Year fill: %d track(s) in %.1fs (%d workers)",
+            len(missing), time.time() - started, workers,
+        )
         return tracks
 
     @staticmethod
@@ -1195,9 +1271,14 @@ class AntraService:
             enriched.amazon_asin = original.amazon_asin or enriched.amazon_asin
             enriched.apple_music_id = original.apple_music_id or enriched.apple_music_id
             enriched.deezer_track_id = original.deezer_track_id or enriched.deezer_track_id
+            enriched.qobuz_track_id = original.qobuz_track_id or enriched.qobuz_track_id
             enriched.source_service = original.source_service or enriched.source_service
             enriched.source_rule = original.source_rule or enriched.source_rule
             enriched.request_kind = original.request_kind or enriched.request_kind
+            # issue #74 - without this the row identity is lost the moment an
+            # enricher returns a rebuilt object, and the UI silently falls back
+            # to index keying, which is the bug being fixed.
+            enriched.row_id = original.row_id or enriched.row_id
             enriched.spotify_url = original.spotify_url or enriched.spotify_url
             enriched.duration_ms = original.duration_ms or enriched.duration_ms
             enriched.isrc = original.isrc or enriched.isrc
@@ -1346,11 +1427,25 @@ class AntraService:
     ) -> list[TrackMetadata]:
         cfg = self.build_runtime_config(options)
         self.validate_config(cfg)
-        # Skip enrichment for large playlists — batch_enrich_album_data calls
-        # _batch_fetch_isrcs_anonymous which makes O(N/50) requests to api.spotify.com
-        # (throttled from some regions). Resolver text-search handles matching without ISRCs.
+        # Album enrichment is capped for large playlists: without Spotify
+        # credentials it falls back to per-track page scraping (~1-2s each).
+        #
+        # ISRCs are NOT capped with it (BUG-MIX-1). "Resolver text-search handles
+        # matching without ISRCs" was the old comment here and it is exactly what
+        # goes wrong: text search cannot tell "Song - Vocal Club Mix" from "Song",
+        # so a 200+ track playlist resolved entirely by title. ISRCEnricher is a
+        # different, cheap route (measured: 20 lookups in 1.2 s over one session),
+        # so above the cap we still fetch ISRCs and only skip the album metadata.
         _MAX_ENRICH = 200
-        if not getattr(cfg, "enrich_album_data", False) or not tracks or len(tracks) > _MAX_ENRICH:
+        if not getattr(cfg, "enrich_album_data", False) or not tracks:
+            return self._stamp_disc_totals(tracks)
+        if len(tracks) > _MAX_ENRICH:
+            logger.info(
+                "[Service] %d tracks over the %d album-enrichment cap — "
+                "fetching ISRCs only",
+                len(tracks), _MAX_ENRICH,
+            )
+            self._enrich_isrcs(tracks)
             return self._stamp_disc_totals(tracks)
 
         try:
@@ -1653,6 +1748,94 @@ class AntraService:
             logger.debug(f"[Service] Apple fallback artist search failed: {e}")
         return []
 
+    # Song and album search (issue #58). Artist search was the only kind the app
+    # had, so finding one song meant opening an artist, reading the whole
+    # discography and guessing which release carried it.
+    SEARCH_KINDS = ("song", "album", "artist")
+
+    def search_catalog(self, query: str, kind: str = "song",
+                       source: str = "apple", limit: int = 25) -> list[dict]:
+        """Search the catalogue for songs, albums or artists.
+
+        kind:   "song" | "album" | "artist"
+        source: "apple" | "spotify"
+
+        Song and album rows carry a `url` that the existing URL pipeline already
+        resolves - an Apple song URL is `_RE_SONG` in apple_fetcher, a Spotify
+        one is an ordinary track link - so a result needs no new download path.
+
+        `source` is a preference, not a promise: each row states the `source` it
+        actually came from, and the caller tells the user when the two differ.
+        Artist search keeps its own long-standing fallback chain untouched.
+        """
+        kind = (kind or "song").strip().lower()
+        if kind == "artist":
+            return self.search_artists(query, source=source)
+        if kind not in ("song", "album"):
+            kind = "song"
+
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        rows: list[dict] = []
+        if source == "spotify":
+            rows = self._search_spotify_catalog(query, kind, limit)
+
+        if not rows:
+            # Apple is the fallback for Spotify and the primary for everything
+            # else: the iTunes Search API needs no token and no account, so it
+            # is the one path that cannot be switched off by a missing cookie.
+            try:
+                from antra.core.apple_fetcher import AppleFetcher
+                fetcher = AppleFetcher()
+                rows = (fetcher.search_songs(query, limit) if kind == "song"
+                        else fetcher.search_albums(query, limit))
+            except Exception as e:
+                logger.debug(f"[Service] Apple {kind} search failed: {e}")
+                rows = []
+
+        # Spotify rows are returned unscored - the clients that build them do
+        # not see the query. Score them here so every row the UI renders has a
+        # comparable match_score, whichever source produced it.
+        from antra.utils.matching import search_match_score
+        for r in rows:
+            if not r.get("match_score"):
+                r["match_score"] = search_match_score(
+                    query, r.get("artists") or "", r.get("title") or "")
+        return rows
+
+    def _search_spotify_catalog(self, query: str, kind: str, limit: int) -> list[dict]:
+        """Partner GraphQL first, then the public Web API. [] if both fail.
+
+        Same order and same reasoning as search_artists: `api.spotify.com`
+        answers 429 on throttled networks, so the partner route the web player
+        itself uses is tried first wherever an sp_dc cookie makes it possible.
+        """
+        sp_dc = (getattr(self._base_config, "spotify_sp_dc", "") or "").strip()
+        if sp_dc:
+            try:
+                from antra.core.spotify_partner import SpotifyPartnerClient
+                client = SpotifyPartnerClient(sp_dc)
+                rows = (client.search_songs(query, limit) if kind == "song"
+                        else client.search_albums(query, limit))
+                if rows:
+                    return rows
+            except Exception as e:
+                logger.debug(f"[Service] Spotify partner {kind} search failed ({e})")
+
+        try:
+            spotify = self._make_spotify_client(self._base_config)
+            rows = (spotify.search_songs(query, limit) if kind == "song"
+                    else spotify.search_albums(query, limit))
+            if rows:
+                return rows
+        except Exception as e:
+            logger.debug(f"[Service] Spotify {kind} search unavailable ({e})")
+
+        logger.debug(f"[Service] Spotify {kind} search returned nothing - falling back to Apple Music")
+        return []
+
     def _make_spotify_client(self, cfg: Config) -> SpotifyClient:
         client = self._spotify_client_factory(
             cfg.spotify_client_id,
@@ -1668,6 +1851,8 @@ class AntraService:
     # for all users without requiring individual API key configuration.
     # This key is accepted ONLY by /api/spotify-metadata (not audio mirror endpoints).
     _METADATA_PROXY_KEY = "mk_antra_metadata_v1_pub"
+    # Personal keys the proxy has refused this process (see _fetch_via_metadata_proxy).
+    _proxy_rejected_keys: set = set()
     _METADATA_PROXY_PAGE_SIZE = 200
 
     def _fetch_via_metadata_proxy(
@@ -1681,8 +1866,18 @@ class AntraService:
         back to the embedded shared metadata key. Returns None and falls through
         to direct Spotify only when the proxy is unreachable or returns an error.
         """
-        # User's own key takes priority; shared metadata key is the universal fallback
-        api_key = (getattr(cfg, "antra_api_key", "") or "").strip() or self._METADATA_PROXY_KEY
+        # The user's own key goes first (attribution), the embedded metadata key
+        # second. A personal key the VPS rejects — stale, mistyped, expired, never
+        # registered — used to end the attempt with a 403 and push every Spotify
+        # fetch onto direct Spotify, the throttled path this proxy exists to
+        # avoid, even though the embedded key would have been accepted. A rejected
+        # personal key is remembered for the process so later fetches do not pay
+        # for a doomed request first.
+        personal = (getattr(cfg, "antra_api_key", "") or "").strip()
+        candidates = []
+        if personal and personal != self._METADATA_PROXY_KEY and personal not in AntraService._proxy_rejected_keys:
+            candidates.append(personal)
+        candidates.append(self._METADATA_PROXY_KEY)
 
         proxy_base = "https://antra.hoshi.cfd"
         try:
@@ -1695,18 +1890,31 @@ class AntraService:
             except ImportError:
                 import requests as _req
                 _curl_kwargs = {}
-            logger.debug("[Proxy] Fetching Spotify metadata via VPS (key=%s)...", api_key[:12])
             # First-paint speed matters more than stubbornly waiting on the VPS.
             # When the proxy is overloaded, the UI currently sits idle before it
             # can fall back to direct Spotify fetches. Keep the proxy path, but
             # fail fast enough that pasted Spotify URLs still render quickly.
-            resp = _req.get(
-                f"{proxy_base}/api/spotify-metadata",
-                params={"url": url},
-                headers={"X-API-Key": api_key},
-                timeout=(4, 12),
-                **_curl_kwargs,
-            )
+            resp = None
+            for api_key in candidates:
+                logger.debug("[Proxy] Fetching Spotify metadata via VPS (key=%s)...", api_key[:6])
+                resp = _req.get(
+                    f"{proxy_base}/api/spotify-metadata",
+                    params={"url": url},
+                    headers={"X-API-Key": api_key},
+                    timeout=(4, 12),
+                    **_curl_kwargs,
+                )
+                # Only an auth refusal is worth a second key. A 5xx, a timeout or
+                # an empty result is about the proxy or the URL, not the key.
+                if resp.status_code in (401, 403) and api_key != self._METADATA_PROXY_KEY:
+                    AntraService._proxy_rejected_keys.add(api_key)
+                    logger.info(
+                        "[Proxy] Your API key was not accepted by the metadata proxy "
+                        "(HTTP %s); retrying with the built-in metadata key",
+                        resp.status_code,
+                    )
+                    continue
+                break
             if not resp.ok:
                 logger.warning(
                     "[Proxy] VPS returned HTTP %s: %s — falling back to direct Spotify",
@@ -2026,9 +2234,14 @@ class AntraService:
             organizer = LibraryOrganizer(
                 cfg.output_dir,
                 full_albums=full_albums,
+                library_index_enabled=getattr(cfg, "library_index_enabled", True),
+                library_index_db_path=getattr(cfg, "library_index_db_path", ""),
                 folder_structure=getattr(cfg, "folder_structure", "standard"),
                 album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
                 playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
+                playlist_storage_mode=getattr(cfg, "playlist_storage_mode", "playlist_folder"),
+                playlist_renumber=getattr(cfg, "playlist_renumber", True),
+                playlist_prune_orphans=getattr(cfg, "playlist_prune_orphans", "ask"),
                 single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
                 filename_format=getattr(cfg, "filename_format", "default"),
                 single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
@@ -2040,6 +2253,15 @@ class AntraService:
                 illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
                 whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
                 filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
+                # v2.0.0 DMX-2 — getattr with the real default so a Config
+                # built by an older caller (or a test) still behaves as before.
+                title_casing=getattr(cfg, "title_casing", "nothing"),
+                artist_casing=getattr(cfg, "artist_casing", "nothing"),
+                remove_album_version=getattr(cfg, "remove_album_version", False),
+                remove_duplicate_artists=getattr(cfg, "remove_duplicate_artists", True),
+                featured_artists_mode=getattr(cfg, "featured_artists_mode", "nothing"),
+                multi_artist_separator=getattr(cfg, "multi_artist_separator", "default"),
+                album_various_artists=getattr(cfg, "album_various_artists", True),
             )
 
         lyrics_fetcher = None
@@ -2052,6 +2274,7 @@ class AntraService:
                 # goes first in the waterfall when the mirror is configured.
                 apple_mirrors=_resolve_apple_mirrors(cfg),
                 mirror_api_key=_resolve_mirror_api_key(cfg),
+                deezer_mirrors=_resolve_deezer_mirrors(cfg),
             )
 
         # ANTRA_MAX_WORKERS is set to 4 by the Go desktop layer when a
@@ -2084,13 +2307,39 @@ class AntraService:
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
             save_cover_art_sidecar=getattr(cfg, "save_cover_art_sidecar", False),
+            sidecar_cue=getattr(cfg, "sidecar_cue", False),
+            sidecar_nfo=getattr(cfg, "sidecar_nfo", False),
+            sidecar_json=getattr(cfg, "sidecar_json", False),
+            artwork_prefs=ArtworkPreferences(
+                cover_image_template=getattr(cfg, "cover_image_template", "cover"),
+                local_artwork_size=getattr(cfg, "local_artwork_size", 0),
+                local_artwork_format=getattr(cfg, "local_artwork_format", "jpg"),
+                jpeg_image_quality=getattr(cfg, "jpeg_image_quality", 90),
+                embedded_artwork_size=getattr(cfg, "embedded_artwork_size", 1000),
+                embedded_artwork_png=getattr(cfg, "embedded_artwork_png", False),
+                save_artist_image=getattr(cfg, "save_artist_image", False),
+                artist_image_template=getattr(cfg, "artist_image_template", "folder"),
+            ),
             output_format=cfg.output_format,
             strict_matching=getattr(cfg, "strict_matching", False),
             strict_format=getattr(cfg, "strict_format", True),
             prevent_lossy_transcode=getattr(cfg, "prevent_lossy_transcode", True),
             write_antra_tags=getattr(cfg, "write_antra_tags", True),
+            disabled_tags=tuple(getattr(cfg, "disabled_tags", ()) or ()),
+            date_format=getattr(cfg, "date_format", "iso"),
+            write_id3v1=getattr(cfg, "write_id3v1", True),
             max_workers=_max_workers,
             prefetch_resolves=_prefetch,
+            post_command=PostCommandConfig(
+                enabled=getattr(cfg, "post_command_enabled", False),
+                confirmed=getattr(cfg, "post_command_confirmed", False),
+                command=getattr(cfg, "post_command", ""),
+                mode=getattr(cfg, "post_command_mode", "track"),
+                timeout=getattr(cfg, "post_command_timeout", 30),
+            ),
+            replaygain=getattr(cfg, "replaygain_enabled", False),
+            verify_audio=getattr(cfg, "verify_audio_enabled", False),
+            verify_audio_threshold=getattr(cfg, "verify_audio_threshold", 0.35),
         )
 
         return DownloadEngine(
@@ -2109,10 +2358,11 @@ class AntraService:
         event_callback: Optional[Callable[[EngineEvent], None]] = None,
         controller: Optional[DownloadController] = None,
         organizer: Optional[LibraryOrganizer] = None,
+        complete_playlist: bool = False,
     ) -> list[DownloadResult]:
         cfg = self.build_runtime_config(options)
         engine = self.build_engine(cfg, event_callback=event_callback, controller=controller, organizer=organizer)
-        return engine.download_playlist(tracks)
+        return engine.download_playlist(tracks, complete_playlist=complete_playlist)
 
     def download_playlist(
         self,
@@ -2127,4 +2377,7 @@ class AntraService:
             options=options,
             event_callback=event_callback,
             controller=controller,
+            # The whole playlist was just fetched, so issue #75's folder
+            # maintenance has the complete picture it requires.
+            complete_playlist=True,
         )

@@ -20,6 +20,7 @@ from typing import Optional
 import requests
 
 from antra.core.models import TrackMetadata
+from antra.core.spotify import _parse_explicit
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,9 @@ class SpotFetchFetcher:
             title=title,
             artists=artists,
             album=album,
+            # issue #61 - the mirror relays Spotify's own payload, so it carries
+            # whichever spelling of the explicit flag the upstream endpoint used.
+            is_explicit=_parse_explicit(data),
             album_artists=album_artists,
             album_id=album_id,
             duration_ms=duration_ms,

@@ -6,7 +6,7 @@
  * rather than shipping someone else's sample.
  *
  * Design note: the obvious implementation is three sine oscillators playing a
- * major triad (which is what SpotiFLAC does). It reads as a "beep" because a
+ * major triad. It reads as a "beep" because a
  * bare sine has no partials and no space. These voices instead use 2-operator
  * FM — a modulator driving the carrier's frequency, with the modulation index
  * decaying over the note — which is the classic way to get a struck-metal /

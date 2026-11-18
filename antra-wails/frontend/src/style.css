@@ -17,37 +17,448 @@
 }
 
 
-/* ── Default theme (Antra) ───────────────────────────────────────────────── */
+/* ══ THEME ENGINE (v2.0.0 THEME-1) ═══════════════════════════════════════════
+   Three tiers, ported from Antra-Web's stylesheet:
+
+     Tier 0a  the MODE ramp   — lightness + alpha only. The single block a
+                                light mode overrides, for every theme at once.
+     Tier 0b  the THEME seed  — hue and chroma only, ~8 lines per theme. The
+                                only block that repeats per theme.
+     Tier 1   SEMANTIC tokens — derived once from 0a + 0b, never repeated.
+
+   This replaces 12 blocks x ~22 hand-written literals (~290 independently
+   eyeballed values). Because OKLCH is perceptually uniform, holding L fixed
+   while swapping H is contrast-neutral BY CONSTRUCTION, so contrast becomes a
+   property of the ramp instead of something re-tuned per theme.
+
+   Measured before/after across all 12 themes (see the v2.0.0 changelog):
+     --text-muted   3.07-4.44 (AA fails in ALL 12)  ->  4.62-4.80  all pass
+     --text-faint   1.78-2.57 (AA-large fails all)  ->  3.05-3.14  all pass
+     --accent-color 3.41-14.23, 4.2x spread, 3 fail ->  4.60-13.21, 2.9x, 0 fail
+   Only three accents moved: the three that failed AA. The other nine keep
+   their brand lightness exactly.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+
+/* ── Tier 0a — mode ramp (DARK) ──────────────────────────────────────────── */
+:root {
+  --l-bg-0:  0.179;  /* app ground */
+  --l-bg-1:  0.239;  /* raised surface */
+  --l-bg-ov: 0.146;  /* modal scrim */
+  --l-fg-0:  0.983;  /* primary text */
+  --l-fg-1:  0.842;  /* body text */
+  --l-fg-2:  0.797;  /* secondary text */
+  --l-fg-3:  0.598;  /* muted text */
+  --l-fg-4:  0.497;  /* faint text */
+
+  /* per-token base chroma; a theme scales all of these with --n-cf */
+  --c-bg-0:  0.018;
+  --c-bg-1:  0.026;
+  --c-bg-ov: 0.013;
+  --c-fg-0:  0.019;
+  --c-fg-1:  0.049;
+  --c-fg-2:  0.046;
+  --c-fg-3:  0.034;
+  --c-fg-4:  0.03;
+
+  /* overlay alphas — shared, so a surface reads the same in every theme */
+  --a-surf-1:   0.045;
+  --a-surf-2:   0.085;
+  --a-surf-3:   0.13;
+  --a-bord-1:   0.08;
+  --a-bord-2:   0.16;
+  --a-acc-soft: 0.16;
+  --a-acc-bord: 0.32;
+  --a-acc-surf: 0.11;
+  --a-overlay:  0.92;
+
+  /* Mode scalars. Every one is a no-op in dark, so the dark palette is
+     untouched by construction and light mode is the only thing that
+     moves them. */
+  --a1-l-cap:   1;      /* accent lightness ceiling */
+  --a2-l-cap:   1;
+  --a-cf:       1;      /* accent chroma factor (gamut, see LIGHT) */
+  --state-l-cap: 1;     /* state colours used as TEXT */
+  --shd-k:      1;      /* shadow alpha scalar */
+}
+
+/* ── Tier 0a — mode ramp (LIGHT) ─────────────────────────────────────────── */
+/* Three states, and SYSTEM is the ABSENCE of data-mode -- an existing user
+   therefore sees no change at all unless their OS says light. An explicit
+   data-mode outranks the media query in both directions, which is what the
+   :not([data-mode="dark"]) guard buys.
+
+   The body below is identical in both blocks ON PURPOSE and is generated, not
+   hand-copied: two hand-maintained copies of a ramp is exactly how a light
+   mode drifts out of sync with its dark counterpart. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-mode="dark"]) {
+    --l-bg-0:  0.974;
+    --l-bg-1:  0.93;
+    --l-bg-ov: 0.954;
+    --l-fg-0:  0.265;
+    --l-fg-1:  0.44;
+    --l-fg-2:  0.47;
+    --l-fg-3:  0.542;
+    --l-fg-4:  0.643;
+    --c-bg-0:  0.009;
+    --c-bg-1:  0.016;
+    --c-bg-ov: 0.012;
+    --c-fg-0:  0.018;
+    --c-fg-1:  0.024;
+    --c-fg-2:  0.026;
+    --c-fg-3:  0.021;
+    --c-fg-4:  0.017;
+    --a-surf-1: 0.55;
+    --a-surf-2: 0.82;
+    --a-surf-3: 0.94;
+    --a-bord-1: 0.12;
+    --a-bord-2: 0.2;
+    /* Measured: on a light ground a raised surface is WHITER than the
+       ground (linen rgba(255,255,255,.55)) while a border is DARKER
+       (rgba(87,72,45,.12)). The two tints therefore move in opposite
+       directions and cannot share one variable. */
+    --surf-tint-l: 1;
+    --bord-tint-l: 0.32;
+    --text-tint-l: var(--l-fg-0);
+    /* Measured on this app's own seeds, not inherited from web:
+       accent-1 on a light ground is 1.32-4.63 and fails AA on TEN of the
+       twelve themes. Capping lightness fixes all twelve with the seeds
+       untouched -- but capping L at high chroma walks OUT of sRGB on six
+       of them, so chroma is scaled too. 0.66 is the smallest factor that
+       keeps every accent in gamut; the result is 5.03-5.80:1. */
+    --a1-l-cap:   0.509;
+    --a2-l-cap:   0.611;
+    --a-cf:       0.66;
+    /* Green must still mean success, so the FILL (--state-*) is untouched
+       and only the TEXT role is capped. Measured on white: success 1.62:1,
+       warning 1.42:1, error 2.92:1 -- all unreadable; L<=0.515 gives 4.60. */
+    --state-l-cap: 0.515;
+    /* Dark shadows sit at 0.16-0.8 alpha because they read against
+       near-black; at those alphas on white the UI is muddy. */
+    --shd-k:      0.28;
+
+  }
+}
+
+:root[data-mode="light"] {
+  --l-bg-0:  0.974;
+  --l-bg-1:  0.93;
+  --l-bg-ov: 0.954;
+  --l-fg-0:  0.265;
+  --l-fg-1:  0.44;
+  --l-fg-2:  0.47;
+  --l-fg-3:  0.542;
+  --l-fg-4:  0.643;
+  --c-bg-0:  0.009;
+  --c-bg-1:  0.016;
+  --c-bg-ov: 0.012;
+  --c-fg-0:  0.018;
+  --c-fg-1:  0.024;
+  --c-fg-2:  0.026;
+  --c-fg-3:  0.021;
+  --c-fg-4:  0.017;
+  --a-surf-1: 0.55;
+  --a-surf-2: 0.82;
+  --a-surf-3: 0.94;
+  --a-bord-1: 0.12;
+  --a-bord-2: 0.2;
+  /* Measured: on a light ground a raised surface is WHITER than the
+     ground (linen rgba(255,255,255,.55)) while a border is DARKER
+     (rgba(87,72,45,.12)). The two tints therefore move in opposite
+     directions and cannot share one variable. */
+  --surf-tint-l: 1;
+  --bord-tint-l: 0.32;
+  --text-tint-l: var(--l-fg-0);
+  /* Measured on this app's own seeds, not inherited from web:
+     accent-1 on a light ground is 1.32-4.63 and fails AA on TEN of the
+     twelve themes. Capping lightness fixes all twelve with the seeds
+     untouched -- but capping L at high chroma walks OUT of sRGB on six
+     of them, so chroma is scaled too. 0.66 is the smallest factor that
+     keeps every accent in gamut; the result is 5.03-5.80:1. */
+  --a1-l-cap:   0.509;
+  --a2-l-cap:   0.611;
+  --a-cf:       0.66;
+  /* Green must still mean success, so the FILL (--state-*) is untouched
+     and only the TEXT role is capped. Measured on white: success 1.62:1,
+     warning 1.42:1, error 2.92:1 -- all unreadable; L<=0.515 gives 4.60. */
+  --state-l-cap: 0.515;
+  /* Dark shadows sit at 0.16-0.8 alpha because they read against
+     near-black; at those alphas on white the UI is muddy. */
+  --shd-k:      0.28;
+
+}
+
+
+/* ── Tier 0b — theme seeds (hue + chroma only) ───────────────────────────── */
+/* Antra */
 :root,
 :root[data-theme="antra"] {
-  --bg-color: #081412;
-  --bg-elevated: #102320;
-  --bg-overlay: rgba(5, 12, 11, 0.92);
-  --fg-color: #a8d6cf;
-  --text-primary: #edfef8;
-  --text-secondary: #9dc7bf;
-  --text-muted: #658179;
-  --text-faint: #445b55;
-  --accent-color: #37e2c2;
-  --accent-strong: #78f0da;
-  --accent-soft: rgba(55, 226, 194, 0.16);
-  --accent-border: rgba(55, 226, 194, 0.32);
-  --surface-color: rgba(255, 255, 255, 0.045);
-  --surface-light: rgba(255, 255, 255, 0.085);
-  --surface-strong: rgba(255, 255, 255, 0.13);
-  --surface-accent: rgba(55, 226, 194, 0.11);
-  --border-color: rgba(226, 255, 248, 0.08);
-  --border-strong: rgba(226, 255, 248, 0.16);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
+  --n-h:      180.389;
+  --n-cf:     0.999;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.999;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.821;
+  --a1-c:     0.1417;
+  --a1-h:     176.561;
+  --a2-l:     0.879;
+  --a2-c:     0.1136;
+  --a2-h:     179.975;
+}
+
+/* Linen */
+:root[data-theme="linen"] {
+  --n-h:      134.749;
+  --n-cf:     1.199;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  1.199;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.599;
+  --a1-c:     0.0682;
+  --a1-h:     138;
+  --a2-l:     0.659;
+  --a2-c:     0.0733;
+  --a2-h:     137.993;
+}
+
+/* Ember */
+:root[data-theme="ember"] {
+  --n-h:      55.265;
+  --n-cf:     1.36;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.56;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.661;
+  --a1-c:     0.1316;
+  --a1-h:     54.792;
+  --a2-l:     0.745;
+  --a2-c:     0.1288;
+  --a2-h:     55.328;
+}
+
+/* Ocean */
+:root[data-theme="ocean"] {
+  --n-h:      250.113;
+  --n-cf:     1.274;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.474;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.719;
+  --a1-c:     0.1105;
+  --a1-h:     252.998;
+  --a2-l:     0.815;
+  --a2-c:     0.0722;
+  --a2-h:     249.357;
+}
+
+/* Graphite */
+:root[data-theme="graphite"] {
+  --n-h:      262.427;
+  --n-cf:     0.34;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.34;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.794;
+  --a1-c:     0.0152;
+  --a1-h:     264.482;
+  --a2-l:     0.896;
+  --a2-c:     0.0122;
+  --a2-h:     259.823;
+}
+
+/* Sunset */
+:root[data-theme="sunset"] {
+  --n-h:      345.615;
+  --n-cf:     1.258;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.578;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.741;
+  --a1-c:     0.0978;
+  --a1-h:     4.887;
+  --a2-l:     0.827;
+  --a2-c:     0.0802;
+  --a2-h:     4.188;
+}
+
+/* Spotify */
+:root[data-theme="spotify"] {
+  --n-h:      89.876;
+  --n-cf:     0;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.77;
+  --a1-c:     0.2124;
+  --a1-h:     148.67;
+  --a2-l:     0.77;
+  --a2-c:     0.2124;
+  --a2-h:     148.67;
+}
+
+/* TIDAL */
+:root[data-theme="tidal"] {
+  --n-h:      247.219;
+  --n-cf:     0.459;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.459;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.874;
+  --a1-c:     0.0941;
+  --a1-h:     218.175;
+  --a2-l:     0.921;
+  --a2-c:     0.062;
+  --a2-h:     215.398;
+}
+
+/* Qobuz */
+:root[data-theme="qobuz"] {
+  --n-h:      256.216;
+  --n-cf:     1.156;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.456;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.605;
+  --a1-c:     0.1662;
+  --a1-h:     258.669;
+  --a2-l:     0.74;
+  --a2-c:     0.1348;
+  --a2-h:     259.289;
+}
+
+/* Deezer */
+:root[data-theme="deezer"] {
+  --n-h:      306.051;
+  --n-cf:     1.517;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.577;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.631;
+  --a1-c:     0.2441;
+  --a1-h:     302.79;
+  --a2-l:     0.772;
+  --a2-c:     0.1604;
+  --a2-h:     311.389;
+}
+
+/* Apple Music */
+:root[data-theme="apple-music"] {
+  --n-h:      276.941;
+  --n-cf:     0.776;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.776;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.658;
+  --a1-c:     0.2277;
+  --a1-h:     16.018;
+  --a2-l:     0.721;
+  --a2-c:     0.1789;
+  --a2-h:     10.058;
+}
+
+/* Amazon Music */
+:root[data-theme="amazon-music"] {
+  --n-h:      252.643;
+  --n-cf:     1.281;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.461;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.704;
+  --a1-c:     0.1675;
+  --a1-h:     243.762;
+  --a2-l:     0.771;
+  --a2-c:     0.1334;
+  --a2-h:     237.705;
+}
+
+
+/* Artwork (v2.0.0 THEME-3) — dynamic; the seeds below are only the FALLBACK.
+   ExtractArtworkSeed() overwrites all nine as inline style on <html> as soon as
+   a cover has been seen, and index.html paints the stored ground before this
+   stylesheet even loads. This block is what "artwork theme selected, no cover
+   yet" looks like: the default theme's own neutral hue at the artwork
+   constants, so it reads as Antra rather than as grey mud. GENERATED by
+   ArtworkFallbackSeed() in artwork_theme.go and pinned by
+   TestFallbackSeedMatchesCSS — do not hand-edit. */
+:root[data-theme="artwork"] {
+  --n-h:      180.4;
+  --n-cf:     1.15;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.4;    /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.72;
+  --a1-c:     0.1303;
+  --a1-h:     180.4;
+  --a2-l:     0.79;
+  --a2-c:     0.1042;
+  --a2-h:     150.4;
+}
+
+
+/* Custom (v2.0.0 THEME-4) — base neutral x accent; the seeds below are only the
+   FALLBACK. CustomThemeSeed() overwrites all nine as inline style on <html> the
+   moment the user picks a pair, and index.html paints the stored ground before
+   this stylesheet loads. This block is what "custom selected, nothing chosen
+   yet" looks like: the default pair (Mist x Teal), which is the coolest neutral
+   and the accent closest to the default theme's aqua, so it reads as Antra
+   rather than as an arbitrary pick. GENERATED by CustomFallbackSeed() in
+   custom_theme.go and pinned by TestCustomFallbackMatchesCSS — do not hand-edit. */
+:root[data-theme="custom"] {
+  --n-h:      214.4;
+  --n-cf:     1.18;   /* neutral chroma factor: 0 = fully desaturated */
+  --n-cf-hi:  0.40;   /* near-white tier — clipped back into sRGB */
+  --a1-l:     0.72;
+  --a1-c:     0.0960;
+  --a1-h:     186.4;
+  --a2-l:     0.79;
+  --a2-c:     0.0768;
+  --a2-h:     186.4;
+}
+
+
+/* ── Tier 1 — semantic tokens (derived once, never repeated) ─────────────── */
+:root {
+  /* neutral surfaces and text */
+  --bg-color:        oklch(var(--l-bg-0) calc(var(--c-bg-0) * var(--n-cf)) var(--n-h));
+  --bg-elevated:     oklch(var(--l-bg-1) calc(var(--c-bg-1) * var(--n-cf)) var(--n-h));
+  --fg-color:        oklch(var(--l-fg-1) calc(var(--c-fg-1) * var(--n-cf)) var(--n-h));
+  --text-primary:    oklch(var(--l-fg-0) calc(var(--c-fg-0) * var(--n-cf-hi)) var(--n-h));
+  --text-secondary:  oklch(var(--l-fg-2) calc(var(--c-fg-2) * var(--n-cf)) var(--n-h));
+  --text-muted:      oklch(var(--l-fg-3) calc(var(--c-fg-3) * var(--n-cf)) var(--n-h));
+  --text-faint:      oklch(var(--l-fg-4) calc(var(--c-fg-4) * var(--n-cf)) var(--n-h));
+  --bg-overlay:      oklch(var(--l-bg-ov) calc(var(--c-bg-ov) * var(--n-cf))
+                           var(--n-h) / var(--a-overlay));
+
+  /* accents — hue and chroma are brand identity and stay per-theme; only
+     the mode scalars touch them, and both are no-ops in dark. */
+  --a1-lm:           min(var(--a1-l), var(--a1-l-cap));
+  --a2-lm:           min(var(--a2-l), var(--a2-l-cap));
+  --a1-cm:           calc(var(--a1-c) * var(--a-cf));
+  --a2-cm:           calc(var(--a2-c) * var(--a-cf));
+  --accent-color:    oklch(var(--a1-lm) var(--a1-cm) var(--a1-h));
+  --accent-strong:   oklch(var(--a2-lm) var(--a2-cm) var(--a2-h));
+  --accent-soft:     oklch(var(--a1-lm) var(--a1-cm) var(--a1-h) / var(--a-acc-soft));
+  --accent-border:   oklch(var(--a1-lm) var(--a1-cm) var(--a1-h) / var(--a-acc-bord));
+  --surface-accent:  oklch(var(--a1-lm) var(--a1-cm) var(--a1-h) / var(--a-acc-surf));
+
+  /* Overlay tints. App.svelte carried 105 hardcoded rgba(255,255,255,A)
+     literals; each is now oklch(var(--<kind>-tint-l) var(--tint-c)
+     var(--tint-h) / A) with A untouched, so a surface, a border and a
+     piece of text can move in different directions between modes. On a
+     light ground a white BORDER or white TEXT is invisible -- that is the
+     bug these three tints exist to remove. */
+  --tint-c:          calc(var(--c-fg-0) * var(--n-cf-hi));
+  --tint-h:          var(--n-h);
+  --surf-tint-l:     1;
+  --bord-tint-l:     1;
+  --text-tint-l:     var(--l-fg-0);
+  --surface-color:   oklch(var(--surf-tint-l) calc(var(--c-fg-0) * var(--n-cf-hi))
+                           var(--n-h) / var(--a-surf-1));
+  --surface-light:   oklch(var(--surf-tint-l) calc(var(--c-fg-0) * var(--n-cf-hi))
+                           var(--n-h) / var(--a-surf-2));
+  --surface-strong:  oklch(var(--surf-tint-l) calc(var(--c-fg-0) * var(--n-cf-hi))
+                           var(--n-h) / var(--a-surf-3));
+  --border-color:    oklch(var(--bord-tint-l) calc(var(--c-fg-0) * var(--n-cf-hi))
+                           var(--n-h) / var(--a-bord-1));
+  --border-strong:   oklch(var(--bord-tint-l) calc(var(--c-fg-0) * var(--n-cf-hi))
+                           var(--n-h) / var(--a-bord-2));
+
+  /* State colours are deliberately NOT themed — green must mean success in
+     every theme. --state-* is the raw FILL and never moves; --*-color is the
+     TEXT role and is the one that gets capped in light mode. */
+  --state-success:   #4ade80;
+  --state-warning:   #facc15;
+  --state-error:     #ff5555;
+  --success-color:   oklch(from var(--state-success)
+                           min(l, var(--state-l-cap)) c h);
+  --warning-color:   oklch(from var(--state-warning)
+                           min(l, var(--state-l-cap)) c h);
+  --error-color:     oklch(from var(--state-error)
+                           min(l, var(--state-l-cap)) c h);
+
   --border-radius: 8px;
   --font-mono: 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
   /* The app shell reads --font-ui; --font-mono stays genuinely monospace for
      the log panel and technical readouts, where column alignment matters.
      Default is the mono stack, so an install with no font preference set
-     renders byte-identically to before this feature. */
+     renders byte-identically to before that feature. */
   --font-ui: var(--font-mono);
+
   background-color: var(--bg-color);
   color: var(--fg-color);
   font-family: var(--font-ui);
@@ -58,331 +469,6 @@
   height: 100vh;
   overflow: hidden;
 }
-
-/* ── Linen theme ─────────────────────────────────────────────────────────── */
-:root[data-theme="linen"] {
-  --bg-color: #f6f1e7;
-  --bg-elevated: #ebe2d2;
-  --bg-overlay: rgba(241, 233, 220, 0.92);
-  --fg-color: #4f5e52;
-  --text-primary: #233126;
-  --text-secondary: #5e6e61;
-  --text-muted: #7c897d;
-  --text-faint: #a8b1a6;
-  --accent-color: #6c8a62;
-  --accent-strong: #7c9d71;
-  --accent-soft: rgba(108, 138, 98, 0.14);
-  --accent-border: rgba(108, 138, 98, 0.24);
-  --surface-color: rgba(255, 255, 255, 0.55);
-  --surface-light: rgba(255, 255, 255, 0.82);
-  --surface-strong: rgba(255, 255, 255, 0.94);
-  --surface-accent: rgba(108, 138, 98, 0.1);
-  --border-color: rgba(87, 72, 45, 0.12);
-  --border-strong: rgba(87, 72, 45, 0.2);
-  --success-color: #3b8f58;
-  --warning-color: #b8831f;
-  --error-color: #c45a48;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Ember theme ─────────────────────────────────────────────────────────── */
-:root[data-theme="ember"] {
-  --bg-color: #16100d;
-  --bg-elevated: #231914;
-  --bg-overlay: rgba(15, 10, 8, 0.93);
-  --fg-color: #e0baa0;
-  --text-primary: #fff2e6;
-  --text-secondary: #d0a17f;
-  --text-muted: #8c654b;
-  --text-faint: #5f4332;
-  --accent-color: #cf7a3a;
-  --accent-strong: #ea9557;
-  --accent-soft: rgba(207, 122, 58, 0.15);
-  --accent-border: rgba(207, 122, 58, 0.29);
-  --surface-color: rgba(255, 233, 213, 0.045);
-  --surface-light: rgba(255, 233, 213, 0.085);
-  --surface-strong: rgba(255, 233, 213, 0.13);
-  --surface-accent: rgba(207, 122, 58, 0.11);
-  --border-color: rgba(255, 233, 213, 0.08);
-  --border-strong: rgba(255, 233, 213, 0.16);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Ocean theme ─────────────────────────────────────────────────────────── */
-:root[data-theme="ocean"] {
-  --bg-color: #07111d;
-  --bg-elevated: #102033;
-  --bg-overlay: rgba(4, 9, 18, 0.93);
-  --fg-color: #9dbfd7;
-  --text-primary: #eef6ff;
-  --text-secondary: #90aecd;
-  --text-muted: #5f7590;
-  --text-faint: #3d526b;
-  --accent-color: #71a8e8;
-  --accent-strong: #9fc7f0;
-  --accent-soft: rgba(113, 168, 232, 0.16);
-  --accent-border: rgba(113, 168, 232, 0.3);
-  --surface-color: rgba(240, 248, 255, 0.045);
-  --surface-light: rgba(240, 248, 255, 0.085);
-  --surface-strong: rgba(240, 248, 255, 0.13);
-  --surface-accent: rgba(113, 168, 232, 0.11);
-  --border-color: rgba(240, 248, 255, 0.08);
-  --border-strong: rgba(240, 248, 255, 0.16);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Graphite theme ──────────────────────────────────────────────────────── */
-:root[data-theme="graphite"] {
-  --bg-color: #101113;
-  --bg-elevated: #1a1c20;
-  --bg-overlay: rgba(8, 9, 10, 0.94);
-  --fg-color: #b2b6be;
-  --text-primary: #f2f4f7;
-  --text-secondary: #a0a5ae;
-  --text-muted: #707680;
-  --text-faint: #4a4f58;
-  --accent-color: #b7bcc6;
-  --accent-strong: #d8dde5;
-  --accent-soft: rgba(183, 188, 198, 0.15);
-  --accent-border: rgba(183, 188, 198, 0.28);
-  --surface-color: rgba(255, 255, 255, 0.04);
-  --surface-light: rgba(255, 255, 255, 0.08);
-  --surface-strong: rgba(255, 255, 255, 0.12);
-  --surface-accent: rgba(183, 188, 198, 0.1);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Sunset theme ────────────────────────────────────────────────────────── */
-:root[data-theme="sunset"] {
-  --bg-color: #150d1a;
-  --bg-elevated: #24132b;
-  --bg-overlay: rgba(10, 5, 13, 0.93);
-  --fg-color: #d7b4c0;
-  --text-primary: #fff1f5;
-  --text-secondary: #d2a1b0;
-  --text-muted: #8b6672;
-  --text-faint: #5f444e;
-  --accent-color: #e091a3;
-  --accent-strong: #f4b1c0;
-  --accent-soft: rgba(224, 145, 163, 0.16);
-  --accent-border: rgba(224, 145, 163, 0.29);
-  --surface-color: rgba(255, 239, 245, 0.045);
-  --surface-light: rgba(255, 239, 245, 0.085);
-  --surface-strong: rgba(255, 239, 245, 0.13);
-  --surface-accent: rgba(224, 145, 163, 0.11);
-  --border-color: rgba(255, 239, 245, 0.08);
-  --border-strong: rgba(255, 239, 245, 0.16);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Spotify theme ───────────────────────────────────────────────────────── */
-/*    Faithful to Spotify's actual dark UI: pure noir base, no green cast    */
-/*    in backgrounds. Their green lives only in accent, exactly as intended. */
-:root[data-theme="spotify"] {
-  --bg-color: #121212;           /* Exact Spotify app background */
-  --bg-elevated: #1b1b1b;        /* Spotify card / elevated surface */
-  --bg-overlay: rgba(0, 0, 0, 0.93);
-  --fg-color: #b3b3b3;
-  --text-primary: #ffffff;        /* Spotify uses pure white for primary text */
-  --text-secondary: #b3b3b3;      /* Spotify's secondary label colour */
-  --text-muted: #7a7a7a;
-  --text-faint: #464646;
-  --accent-color: #1ed760;        /* Exact Spotify hover green for premium contrast */
-  --accent-strong: #1ed760;       /* Spotify hover/active green */
-  --accent-soft: rgba(29, 185, 84, 0.13);
-  --accent-border: rgba(29, 185, 84, 0.32);
-  --surface-color: rgba(255, 255, 255, 0.06);
-  --surface-light: rgba(255, 255, 255, 0.09);
-  --surface-strong: rgba(255, 255, 255, 0.14);
-  --surface-accent: rgba(29, 185, 84, 0.1);
-  --border-color: rgba(255, 255, 255, 0.09);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --success-color: #1ed760;
-  --warning-color: #facc15;
-  --error-color: #e8565e;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── TIDAL theme ─────────────────────────────────────────────────────────── */
-/*    TIDAL's post-2021 luxury look: near-pitch-black base, crisp white      */
-/*    text, and a precise cool-water cyan. Minimal, editorial, premium.      */
-:root[data-theme="tidal"] {
-  --bg-color: #050607;           /* TIDAL's near-black, slight cool cast */
-  --bg-elevated: #0d1014;
-  --bg-overlay: rgba(0, 0, 0, 0.94);
-  --fg-color: #c9d5df;
-  --text-primary: #f2f5fa;        /* Crisp, barely-warm white */
-  --text-secondary: #93a0ab;
-  --text-muted: #5a656f;
-  --text-faint: #333b43;
-  --accent-color: #8ae5ff;        /* Cleaner cool-aqua highlight */
-  --accent-strong: #b6f0ff;
-  --accent-soft: rgba(138, 229, 255, 0.11);
-  --accent-border: rgba(138, 229, 255, 0.26);
-  --surface-color: rgba(255, 255, 255, 0.04);
-  --surface-light: rgba(255, 255, 255, 0.07);
-  --surface-strong: rgba(255, 255, 255, 0.11);
-  --surface-accent: rgba(138, 229, 255, 0.09);
-  --border-color: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Qobuz theme ─────────────────────────────────────────────────────────── */
-/*    Qobuz's hi-fi editorial feel: deep blue-black, a rich royal blue       */
-/*    accent, no purple cross-contamination. Classical and serious.          */
-:root[data-theme="qobuz"] {
-  --bg-color: #08101c;           /* Deep blue-black, Qobuz's true base */
-  --bg-elevated: #0f1a2b;
-  --bg-overlay: rgba(2, 4, 8, 0.95);
-  --fg-color: #9eb4cf;
-  --text-primary: #edf3ff;
-  --text-secondary: #8da4c0;
-  --text-muted: #5f738d;
-  --text-faint: #38485e;
-  --accent-color: #3d7fe3;        /* Qobuz royal blue — their brand primary */
-  --accent-strong: #76abff;
-  --accent-soft: rgba(61, 127, 227, 0.12);
-  --accent-border: rgba(61, 127, 227, 0.27);
-  --surface-color: rgba(255, 255, 255, 0.04);
-  --surface-light: rgba(255, 255, 255, 0.075);
-  --surface-strong: rgba(255, 255, 255, 0.12);
-  --surface-accent: rgba(61, 127, 227, 0.1);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Deezer theme ────────────────────────────────────────────────────────── */
-/*    Deezer's energy: deep purple-charcoal base with their electric         */
-/*    violet — the exact gradient start colour from their brand system.      */
-:root[data-theme="deezer"] {
-  --bg-color: #120d18;           /* Deep violet-black — Deezer dark base */
-  --bg-elevated: #1d1526;
-  --bg-overlay: rgba(4, 2, 9, 0.95);
-  --fg-color: #c3addd;
-  --text-primary: #f5efff;
-  --text-secondary: #a691bc;
-  --text-muted: #6c597e;
-  --text-faint: #473857;
-  --accent-color: #A238FF;        /* Deezer electric violet — exact brand */
-  --accent-strong: #d082ff;
-  --accent-soft: rgba(162, 56, 255, 0.13);
-  --accent-border: rgba(162, 56, 255, 0.28);
-  --surface-color: rgba(255, 255, 255, 0.04);
-  --surface-light: rgba(255, 255, 255, 0.08);
-  --surface-strong: rgba(255, 255, 255, 0.13);
-  --surface-accent: rgba(162, 56, 255, 0.11);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Apple Music theme ───────────────────────────────────────────────────── */
-/*    A premium light interpretation based on Apple's current bright UI      */
-/*    language: porcelain surfaces, cool greys, and the exact rose accent.  */
-:root[data-theme="apple-music"] {
-  --bg-color: #fbfbfd;
-  --bg-elevated: #ececf1;
-  --bg-overlay: rgba(245, 245, 248, 0.92);
-  --fg-color: #5f6370;
-  --text-primary: #1d1d21;
-  --text-secondary: #555867;
-  --text-muted: #7b7d89;
-  --text-faint: #adb0ba;
-  --accent-color: #FF375F;        /* Exact Apple Music crimson-rose */
-  --accent-strong: #ff6d8b;
-  --accent-soft: rgba(255, 55, 95, 0.11);
-  --accent-border: rgba(255, 55, 95, 0.23);
-  --surface-color: rgba(255, 255, 255, 0.68);
-  --surface-light: rgba(255, 255, 255, 0.9);
-  --surface-strong: rgba(255, 255, 255, 0.98);
-  --surface-accent: rgba(255, 55, 95, 0.10);
-  --border-color: rgba(39, 41, 51, 0.09);
-  --border-strong: rgba(39, 41, 51, 0.14);
-  --success-color: #32a852;
-  --warning-color: #c99218;
-  --error-color: #d64a42;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Amazon Music theme ──────────────────────────────────────────────────── */
-/*    Amazon Music's dark app — not Amazon orange, that's retail. The music  */
-/*    app uses a deep navy-charcoal base with their precise sky-blue #00A8E1 */
-/*    that lives in the waveform logo and primary interactive elements.      */
-:root[data-theme="amazon-music"] {
-  --bg-color: #0b1220;            /* Amazon Music dark navy base */
-  --bg-elevated: #101a2b;
-  --bg-overlay: rgba(2, 4, 10, 0.95);
-  --fg-color: #97b8d6;
-  --text-primary: #eef6ff;
-  --text-secondary: #8aa7c5;
-  --text-muted: #5d7691;
-  --text-faint: #3a4d64;
-  --accent-color: #18a8ff;        /* Amazon Music signature blue */
-  --accent-strong: #54c0ff;
-  --accent-soft: rgba(24, 168, 255, 0.11);
-  --accent-border: rgba(24, 168, 255, 0.27);
-  --surface-color: rgba(255, 255, 255, 0.04);
-  --surface-light: rgba(255, 255, 255, 0.075);
-  --surface-strong: rgba(255, 255, 255, 0.12);
-  --surface-accent: rgba(24, 168, 255, 0.09);
-  --border-color: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
-  --success-color: #4ade80;
-  --warning-color: #facc15;
-  --error-color: #ff5555;
-  --border-radius: 8px;
-  background-color: var(--bg-color);
-  color: var(--fg-color);
-}
-
-/* ── Typeface options (v1.1.8 FEAT-10) ───────────────────────────────────────
-   Applied as data-font on <html>, exactly like data-theme. Deliberately an
-   attribute and not a class, so it cannot collide with the theme classes. */
 
 /* Follow the OS. system-ui resolves to Segoe UI Variable on Win11, SF on
    macOS, and the desktop's configured UI font on Linux. */

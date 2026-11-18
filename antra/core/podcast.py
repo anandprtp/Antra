@@ -457,7 +457,22 @@ class SpotifyPodcastClient:
                 }
             },
         }
-        r = self._post(_PATHFINDER_API, json=payload)
+        from antra.core.spotify_partner import is_stale_hash, persisted_hash, refresh_persisted_hash
+
+        payload["extensions"]["persistedQuery"]["sha256Hash"] = persisted_hash(operation_name, sha256_hash)
+        try:
+            r = self._post(_PATHFINDER_API, json=payload)
+        except requests.HTTPError as exc:
+            resp = exc.response
+            stale = payload["extensions"]["persistedQuery"]["sha256Hash"]
+            fresh = (
+                refresh_persisted_hash(operation_name, stale)
+                if resp is not None and is_stale_hash(resp.status_code, resp.text) else None
+            )
+            if not fresh:
+                raise
+            payload["extensions"]["persistedQuery"]["sha256Hash"] = fresh
+            r = self._post(_PATHFINDER_API, json=payload)
         data = r.json()
         if "errors" in data:
             raise RuntimeError(f"Pathfinder error: {data['errors']}")

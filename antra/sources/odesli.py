@@ -33,6 +33,64 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# --- amazon.com PRODUCT search: ASIN plausibility ---------------------------
+# `i=digital-music-track` is NOT honoured by amazon.com's HTML search, so the
+# result pages are full of general merchandise. Measured 2026-10-06 against the
+# real pages for Fastball's "Make Your Mama Proud" (no ISRCs, so every track
+# reached this scraper):
+#   "Boomerang"     -> B0DK529JWK "Professional Flyback Returning Boomerang ..."  (a toy)
+#   "Seattle"       -> B0GXVNC4T7 "Customized Handheld Seattle Fastball ... Stamp" (a stamp)
+#   "Eater"         -> 0857667734 "Smoke Eaters"                                  (a book)
+#   "Knock It Down" -> B094HBB6WJ "... Crazy Balls Sport and Outdoor Games ..."   (toy balls)
+# The old acceptance test was a bare substring compare of the track title against
+# the product title with the artist IGNORED, followed by an unconditional
+# "first result wins" fallback -- so a query that matched nothing at all still
+# returned pairs[0]. Two different songs on this album were handed the SAME ASIN
+# that way. The ASIN then became `amazon_asin`, which the resolver treats as an
+# exact platform id, and the wrong audio downloaded at 0.90 confidence with the
+# right tags on it.
+#
+# An ISBN-shaped ASIN (9 digits + check char, e.g. "0857667734") is a print
+# product and can never be a music track, so it is rejected with no request.
+_ISBN_ASIN_RE = re.compile(r"^\d{9}[\dXx]$")
+
+# Minimum score_similarity() between the requested track and a PRODUCT card
+# title. Measured on the pages above: junk peaked at 0.437 ("Smoke Eaters")
+# while genuine music cards floored at 0.628 ("Knock It Down"); an exact title
+# match with zero artist signal scores 0.60, so the gate must sit below that.
+_AMAZON_PRODUCT_MIN_SCORE = 0.58
+
+
+def _pick_amazon_product_asin(pairs, title, title_clean, artists):
+    """Best ASIN from amazon.com product-search (asin, product_title) pairs.
+
+    Returns (asin, product_title, score) or None. Scoring is the shared
+    score_similarity(), so a version/mix mismatch is capped and an unrelated
+    product falls far below the gate. There is deliberately NO "first result"
+    fallback: Amazon ranks by commerce relevance, which for a song title is
+    routinely a physical object, and returning it unchecked is what shipped
+    wrong audio. This is a cheap pre-filter only -- AmazonAdapter still verifies
+    the surviving ASIN against the mirror before trusting it.
+    """
+    from antra.utils.matching import score_similarity
+
+    best = None
+    for asin, product_title in pairs or []:
+        if not asin or _ISBN_ASIN_RE.match(asin):
+            continue
+        product_title = html.unescape((product_title or "").strip())
+        if not product_title:
+            continue
+        score = max(
+            score_similarity(title, artists, product_title, ""),
+            score_similarity(title_clean, artists, product_title, ""),
+        )
+        if score < _AMAZON_PRODUCT_MIN_SCORE:
+            continue
+        if best is None or score > best[2]:
+            best = (asin, product_title, score)
+    return best
+
 _ODESLI_API = "https://api.song.link/v1-alpha.1/links"
 _SONGWHIP_API = "https://api.songwhip.com/v3/resolve"
 _AMAZON_SEARCH = "https://www.amazon.com/s"
@@ -162,8 +220,8 @@ class OdesliEnricher:
         for k, v in sw.items():
             result.setdefault(k, v)
 
-        # 2.5 Deezer ISRC -> song.link. SpotiFLAC succeeds on a subset of Amazon
-        # matches by first resolving the ISRC to a Deezer track, then asking
+        # 2.5 Deezer ISRC -> song.link. A subset of Amazon matches only resolve
+        # by first turning the ISRC into a Deezer track, then asking
         # song.link for cross-platform URLs from that Deezer URL. This path is
         # especially helpful when direct Spotify->song.link resolution is sparse.
         if getattr(track, "isrc", None) and "amazonMusic" not in result:
@@ -174,6 +232,13 @@ class OdesliEnricher:
         if getattr(track, "isrc", None) and "amazonMusic" not in result:
             dz = self._try_deezer_songlink(track)
             for k, v in dz.items():
+                result.setdefault(k, v)
+
+        # 2.9 Squigly / MusicBrainz url-rels / Unitune (AUDIT-API-1): real track
+        #     URLs only, so a search-page link can never become an id.
+        if "amazonMusic" not in result:
+            from antra.sources.link_aggregators import resolve_extra
+            for k, v in resolve_extra(track, self._session).items():
                 result.setdefault(k, v)
 
         # 3. iTunes Search → Odesli(Apple Music URL) — catches tracks that Odesli
@@ -249,23 +314,19 @@ class OdesliEnricher:
                 if not pairs:
                     continue
 
-                title_lower = title.lower()
-                title_clean_lower = title_clean.lower()
-
-                for asin, product_title in pairs:
-                    pt_lower = product_title.strip().lower()
-                    # Accept if product title contains our track title (case-insensitive).
-                    # Also match against the collaboration-stripped title so "YouUgly" matches
-                    # a product titled "YouUgly (with Westside Gunn)" and vice-versa.
-                    if (title_lower in pt_lower or pt_lower in title_lower
-                            or title_clean_lower in pt_lower or pt_lower in title_clean_lower):
-                        logger.debug(f"[Amazon Search] Matched '{product_title.strip()}' → {asin}")
-                        return asin
-
-                # Looser fallback: first result (Amazon ranks by relevance)
-                asin, product_title = pairs[0]
-                logger.debug(f"[Amazon Search] Using first result '{product_title.strip()}' → {asin}")
-                return asin
+                picked = _pick_amazon_product_asin(
+                    pairs, title, title_clean, [artist] if artist else []
+                )
+                if picked:
+                    logger.debug(
+                        "[Amazon Search] Matched '%s' → %s (score=%.2f)",
+                        picked[1], picked[0], picked[2],
+                    )
+                    return picked[0]
+                logger.debug(
+                    "[Amazon Search] %d result(s) for %r, none plausible — refusing to guess",
+                    len(pairs), query,
+                )
         except Exception as e:
             logger.debug(f"[Amazon Search] Request failed: {e}")
             return None
@@ -319,7 +380,7 @@ class OdesliEnricher:
             if not m:
                 continue
             # Verify title similarity before accepting
-            itunes_title = item.get("trackName", "").lower()
+            itunes_title = (item.get("trackName") or "").lower()
             title_clean_lower = title_clean.lower()
             if title_clean_lower in itunes_title or itunes_title in title_clean_lower:
                 apple_track_id = m.group(1)

@@ -138,7 +138,9 @@ func mergeSupportStatus(base SupportStatus, override supportStatusPatch) Support
 	if override.Currency != "" {
 		merged.Currency = override.Currency
 	}
-	if override.Link != "" && !isRetiredFundingLink(override.Link) {
+	// The link comes from the remote gist and ends up in BrowserOpenURL, so it
+	// must also be a plain https URL (file:, smb:, custom protocol handlers).
+	if override.Link != "" && !isRetiredFundingLink(override.Link) && isSafeExternalLink(override.Link) {
 		merged.Link = override.Link
 	}
 	return merged

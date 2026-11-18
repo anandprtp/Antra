@@ -1,0 +1,120 @@
+# Antra — Flatpak manifest
+#
+# WHAT THIS BUILDS
+# ----------------
+# An installable Flatpak bundle from the *already-built* Linux binary produced by
+# the `build-linux` job in .github/workflows/release.yml:
+#
+#     flatpak install --user ./Antra.flatpak
+#     flatpak run io.github.anandprtp.Antra
+#
+# The point of shipping this at all is that `org.gnome.Platform` contains
+# WebKitGTK, so the user never has to install `webkit2gtk-4.1` by hand. That
+# hand-install step is the actual friction the Flatpak request was about — the
+# AppImage has always worked, it just needed a distro-specific package first.
+#
+# WHY IT CONSUMES A PREBUILT BINARY INSTEAD OF BUILDING FROM SOURCE
+# -----------------------------------------------------------------
+# Flathub proper requires a source build, and a source build here means running
+# the Wails toolchain (Go + npm) *and* PyInstaller inside the sandbox with no
+# network — i.e. vendoring both Go modules and the npm tree, then rebuilding the
+# ~70 MB backend inside flatpak-builder. That is a separate project.
+#
+# This manifest deliberately reuses the binary the Linux job already builds AND
+# ALREADY SMOKE-TESTS (it runs the real download entry point and the endpoint
+# manifest cache path before publishing). Consuming that exact artifact means the
+# Flatpak ships something that has been exercised, not merely compiled.
+#
+# The trade-off is stated plainly: this is enough for
+# `flatpak install ./Antra.flatpak`, and is NOT enough for a Flathub listing.
+# See packaging/flatpak/README.md for what a Flathub submission would additionally
+# need — including the licensing constraint, which is the bigger obstacle.
+#
+# RUNTIME VERSION
+# ---------------
+# 50 is the current GNOME runtime on Flathub (verified against the Flathub API,
+# 2026-09-09). GNOME 48 went EOL in March 2026. If flatpak-builder fails with
+# "runtime not found", bump this one number — CI will tell you loudly rather than
+# producing a bundle that fails at install time.
+app-id: io.github.anandprtp.Antra
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: antra
+
+finish-args:
+  # Display. fallback-x11 rather than x11 so a Wayland session never takes the
+  # X11 socket it does not need.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # WebKitGTK needs SHM under X11, and GPU access for accelerated compositing.
+  - --share=ipc
+  - --device=dri
+
+  # Every download, every metadata lookup and the API mirrors all go over the
+  # network. Without this the app has no function at all.
+  - --share=network
+
+  # The Downloaded Music tab plays audio through the WebView, and the app plays a
+  # synthesised notification sound when a track is saved.
+  - --socket=pulseaudio
+
+  # THE ONE PERMISSION THAT NEEDS ARGUING, so here is the argument.
+  #
+  # Antra is a library manager: the user points it at a music folder, and it then
+  # *scans that whole tree on every launch* to deduplicate against what is already
+  # on disk and to populate the Downloaded Music browser. That is a persistent,
+  # arbitrary, user-chosen path — not a one-shot file the user hands over through a
+  # portal, so a portal grant is the wrong shape for it.
+  #
+  # Two further reasons, both measured rather than assumed:
+  #
+  #  1. Wails opens its folder picker with GTK's own GtkFileChooserDialog
+  #     (antra-wails/app_backend.go:392 -> wailsRuntime.OpenDirectoryDialog), not
+  #     the XDG portal. Narrowing to --filesystem=xdg-music would leave the picker
+  #     showing only the sandbox, which is worse than useless for choosing a
+  #     library location.
+  #
+  #  2. The app's default library path is $HOME/Music (app_backend.go:177).
+  #     Flatpak only leaves $HOME pointing at the real home when home access is
+  #     granted; with xdg-music alone $HOME is remapped to ~/.var/app/<id>, so the
+  #     default would silently resolve to a sandboxed directory the user's other
+  #     music players cannot see. The default would look like it worked and
+  #     quietly put the library somewhere wrong.
+  #
+  # A useful side effect: because $HOME stays real, ~/.local/share/Antra/config.json
+  # is the same file the AppImage build uses, so switching from the AppImage to the
+  # Flatpak keeps the user's settings, history and library path.
+  - --filesystem=home
+
+# The Linux release binary is built on ubuntu-24.04 against GTK3 +
+# webkit2gtk-4.1 and glibc 2.39, and runs here against the newer glibc in the
+# GNOME runtime. glibc is forward compatible in that direction, and the
+# webkit2gtk-4.1 soname is the same one org.gnome.Platform provides (it is the
+# same pairing Tauri targets for its own GTK3 + WebKit stack).
+modules:
+  - name: antra
+    buildsystem: simple
+    build-commands:
+      # The Go binary embeds the PyInstaller backend and extracts it to the app
+      # data directory at first run, so there is nothing else to install here.
+      - install -Dm755 Antra /app/bin/antra
+      - install -Dm644 io.github.anandprtp.Antra.desktop
+          /app/share/applications/io.github.anandprtp.Antra.desktop
+      - install -Dm644 io.github.anandprtp.Antra.metainfo.xml
+          /app/share/metainfo/io.github.anandprtp.Antra.metainfo.xml
+      - install -Dm644 icon-512.png
+          /app/share/icons/hicolor/512x512/apps/io.github.anandprtp.Antra.png
+      - install -Dm644 icon-128.png
+          /app/share/icons/hicolor/128x128/apps/io.github.anandprtp.Antra.png
+    sources:
+      - type: file
+        path: Antra
+      - type: file
+        path: io.github.anandprtp.Antra.desktop
+      - type: file
+        path: io.github.anandprtp.Antra.metainfo.xml
+      - type: file
+        path: icon-512.png
+      - type: file
+        path: icon-128.png

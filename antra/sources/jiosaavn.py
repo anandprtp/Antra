@@ -32,6 +32,7 @@ except ImportError:
 
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
 from antra.sources.base import BaseSourceAdapter
+from antra.utils.mirror_http import ensure_complete_transfer
 from antra.utils.matching import score_similarity, duration_close
 
 logger = logging.getLogger(__name__)
@@ -39,9 +40,35 @@ logger = logging.getLogger(__name__)
 # JioSaavn metadata is often noisier than Spotify metadata. We keep a lower
 # adapter-local threshold so the resolver can still compare it against lower
 # priority sources before deciding to fall through.
-MIN_SIMILARITY = 0.45
+# 0.45 was only survivable because the old autocomplete.get endpoint returned
+# artists=['Unknown'], which made every score - right or wrong - collapse to the
+# 0.50 artist cap. On search.getResults the artists are real and the separation is
+# clean, measured 2026-08-26 over 8 live searches:
+#   correct : Kesariya 0.78, Tum Hi Ho 1.00, Chaiyya Chaiyya 0.88,
+#             Apna Bana Le 0.86, Raataan Lambiyan 0.81, Naatu Naatu 0.87
+#   wrong   : a "Blinding Lights" cover by Glas Quartet 0.50, a "Shape of You"
+#             phonk remix 0.50  - both within the duration gate, so the score is
+#             what has to reject them.
+# 0.60 is also the text-search floor this repo already uses elsewhere (apple.py's
+# _public_itunes_search and the iTunes artwork fallback), so this is consistent
+# with existing calibration rather than a new number.
+MIN_SIMILARITY = 0.60
 
 _DES_KEY = b"38346591"
+
+
+def _to_seconds(value) -> Optional[float]:
+    """Duration from an API field that may be a number, a numeric string, "" or null.
+
+    float(item.get("duration", 0)) raised on "" / None, and the caller's blanket
+    except then discarded the whole item - contradicting _best_match, which
+    deliberately only discounts a result with no duration.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _decrypt_url(enc_url: str) -> Optional[str]:
@@ -134,21 +161,33 @@ class JioSaavnAdapter(BaseSourceAdapter):
     def _search_via_official_api(self, query: str, track: TrackMetadata) -> Optional[SearchResult]:
         """Use JioSaavn's internal API."""
         try:
+            # search.getResults, NOT autocomplete.get. Measured 2026-08-26 on the
+            # same query: autocomplete.get returns NO duration and no artistMap,
+            # so every result reached the resolver with duration_ms=None - which
+            # silently disables _passes_identity_gate()'s duration check - and
+            # artists=['Unknown'], which makes the artist score meaningless and
+            # caps the composite at 0.50. JioSaavn was effectively matching on
+            # TITLE ALONE, which is why it handed out wrong songs.
+            # search.getResults returns duration=268 and
+            # artistMap.primary_artists=['Pritam','Arijit Singh','Amitabh
+            # Bhattacharya'] for the same track. _parse_item already understands
+            # this richer shape.
             resp = self._session.get(
                 self._API_BASE,
                 params={
-                    "__call": "autocomplete.get",
+                    "__call": "search.getResults",
                     "_format": "json",
                     "_marker": "0",
-                    "cc": "in",
-                    "includeMetaTags": "1",
-                    "query": query,
+                    "api_version": "4",
+                    "ctx": "web6dot0",
+                    "n": "10",
+                    "q": query,
                 },
                 timeout=10,
             )
             resp.raise_for_status()
             data = resp.json()
-            songs = data.get("songs", {}).get("data", [])
+            songs = data.get("results") or []
             return self._best_match(songs, track, source="official")
         except Exception as e:
             logger.debug(f"[JioSaavn] Official API search failed: {e}")
@@ -165,9 +204,32 @@ class JioSaavnAdapter(BaseSourceAdapter):
 
             score = self._score_match(track, title, artists)
 
+            # Duration is a GATE, not a discount. It was `score *= 0.8`, so a
+            # wrong-length recording with a strong title match still won - the
+            # BUG-1 shape (right metadata, wrong audio). Measured 2026-08-26 over
+            # 8 real searches, duration separates right from wrong cleanly where
+            # the score does not: correct hits landed at -4s..+0s while the wrong
+            # ones were -46s, -111s and -134s.
+            #
+            # Two bands on purpose. duration_close() is adaptive
+            # (max(tolerance, min(30, longer*0.045))), so t=15 is a generous
+            # "definitely a different recording" line while t=6 keeps the old
+            # soft penalty for the normal few-second catalogue disagreement
+            # (leading silence, fade-outs, regional edits, rounding).
             if duration_s and track.duration_seconds:
+                if not duration_close(track.duration_seconds, duration_s, tolerance=15):
+                    logger.debug(
+                        "[JioSaavn] Rejected '%s' - duration %.0fs vs expected %.0fs",
+                        title, duration_s, track.duration_seconds,
+                    )
+                    continue
                 if not duration_close(track.duration_seconds, duration_s, tolerance=6):
                     score *= 0.8
+            elif track.duration_seconds:
+                # Unverifiable: the item carried no duration. Discount rather than
+                # reject, so an API shape change degrades quality instead of
+                # silently emptying the adapter.
+                score *= 0.8
 
             if score > best_score:
                 best_score = score
@@ -183,6 +245,18 @@ class JioSaavnAdapter(BaseSourceAdapter):
                     download_url=None,
                     stream_id=song_id,
                     similarity_score=score,
+                    # JioSaavn's API exposes NO recording identifier. Verified
+                    # 2026-08-26 against search.getResults: the item carries
+                    # label, copyright_text, release_date, album_id and duration,
+                    # but no isrc field at any level. So this is honest, not an
+                    # oversight - there is nothing to verify against.
+                    # Recording-class markers (instrumental/karaoke/live/remix)
+                    # need no check here either: because isrc_match is False,
+                    # SourceResolver._passes_identity_gate() applies
+                    # version_mismatch() to every result from this adapter.
+                    # Verified: it rejects (Instrumental), - Karaoke Version,
+                    # (Live), - Lofi Flip and (Sped Up) while passing a clean
+                    # title and (From "Brahmastra").
                     isrc_match=False,
                     artwork_url=self._extract_artwork_url(item),
                 )
@@ -198,11 +272,11 @@ class JioSaavnAdapter(BaseSourceAdapter):
         try:
             if source == "community":
                 title = self._clean_text(item.get("name", ""))
-                artists = [a["name"] for a in item.get("artists", {}).get("primary", [])] or [
+                artists = [a["name"] for a in (item.get("artists") or {}).get("primary") or []] or [
                     item.get("primaryArtists", "Unknown")
                 ]
                 artists = [self._clean_text(artist) for artist in artists if artist]
-                duration_s = float(item.get("duration", 0)) or None
+                duration_s = _to_seconds(item.get("duration"))
                 song_id = item.get("id")
             else:
                 # Official API shape
@@ -212,7 +286,8 @@ class JioSaavnAdapter(BaseSourceAdapter):
                     or item.get("name")
                     or ""
                 )
-                primary = item.get("more_info", {}).get("artistMap", {}).get("primary_artists", [])
+                more_info = item.get("more_info") or {}
+                primary = (more_info.get("artistMap") or {}).get("primary_artists") or []
                 if primary:
                     artists = [self._clean_text(a["name"]) for a in primary]
                 else:
@@ -222,7 +297,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
                         for artist in re.split(r",|&| feat\. ", subtitle, flags=re.IGNORECASE)
                         if artist.strip()
                     ]
-                duration_s = float(item.get("more_info", {}).get("duration", 0)) or None
+                duration_s = _to_seconds(more_info.get("duration"))
                 song_id = item.get("id")
 
             return title, artists, duration_s, song_id
@@ -230,16 +305,39 @@ class JioSaavnAdapter(BaseSourceAdapter):
             return "", [], None, None
 
     def _score_match(self, track: TrackMetadata, result_title: str, result_artists: list[str]) -> float:
-        artist_blob = ", ".join(a for a in result_artists if a)
+        # Score against each artist SEPARATELY as well as against the joined
+        # blob, and take the best. JioSaavn returns a LIST, and
+        # score_similarity() matches each of OUR artists against the result's
+        # artist FIELD as a single string, so a long, complete credit list can
+        # score worse than a short wrong one.
+        #
+        # Measured on this tree 2026-09-08, query artist "Arijit Singh":
+        #   "Vishal & Shekhar, Arijit Singh"                        0.615
+        #   "Pritam, Arijit Singh & Amitabh Bhattacharya"           0.462
+        #   "Pritam, Shashwat Singh, Antara Mitra, Arijit Singh &
+        #    Amitabh Bhattacharya"                                  0.300  <- trips
+        #                        the scorer's `best_artist_score < 0.45` cap
+        # against an exact 1.000 for the artist on its own.
+        #
+        # The blob is KEPT as a candidate rather than replaced: our own query
+        # artist is often itself a combined string, so per-artist-only scoring
+        # can come out LOWER (measured: Kesariya 1.000 -> 0.867, Jhoome Jo
+        # Pathaan 0.982 -> 0.744). max() over both can only raise the score,
+        # which matters because MIN_SIMILARITY was raised to 0.60 in the same
+        # change and headroom is the thing protecting good matches.
+        singles = [a for a in (result_artists or []) if a]
+        blob = ", ".join(singles)
+        candidates = ([blob] + singles) if singles else [""]
         return max(
             (
                 score_similarity(
                     query_title=title_variant,
                     query_artists=track.artists,
                     result_title=result_title,
-                    result_artist=artist_blob,
+                    result_artist=result_artist,
                 )
                 for title_variant in self._title_variants(track.title)
+                for result_artist in candidates
             ),
             default=0.0,
         )
@@ -290,7 +388,7 @@ class JioSaavnAdapter(BaseSourceAdapter):
 
         if isinstance(image, list):
             links = [
-                entry.get("link", "").strip()
+                (entry.get("link") or "").strip()
                 for entry in image
                 if isinstance(entry, dict) and entry.get("link")
             ]
@@ -528,10 +626,23 @@ class JioSaavnAdapter(BaseSourceAdapter):
         with self._session.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
+            # .part + rename: a cut transfer must never sit under the real filename.
+            part = os.path.splitext(path)[0] + ".part"   # stem-based: see qobuz.py (Windows MAX_PATH)
+            try:
+                written = 0
+                with open(part, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            written += len(chunk)
+                            f.write(chunk)
+                ensure_complete_transfer(r, written, "JioSaavn")
+                os.replace(part, path)
+            except BaseException:
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+                raise
 
     @staticmethod
     def _infer_extension(url: str) -> str:

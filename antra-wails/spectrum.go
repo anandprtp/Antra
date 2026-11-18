@@ -31,7 +31,7 @@ const (
 	analyseSec = 45.0 // window of audio to analyse
 	// Spectrogram transport resolution. 256 frequency rows is plenty for a
 	// display a few hundred pixels tall, and keeps the payload small enough to
-	// hand to the frontend without the 170MB full-PCM problem SpotiFLAC has.
+	// hand to the frontend without shipping the ~170MB of raw PCM it came from.
 	specRowCount = 256
 	specFloorDb  = -100.0 // dB floor for the byte quantisation
 )

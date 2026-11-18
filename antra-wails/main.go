@@ -6,11 +6,16 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/wailsapp/wails/v2/pkg/options/linux"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
+
+// Linux has no .icns/.ico: the window and taskbar icon is whatever we hand to GTK.
+//go:embed build/linux/appicon.png
+var linuxIcon []byte
 
 func main() {
 	// Create an instance of the app structure
@@ -39,6 +44,7 @@ func main() {
 			WindowIsTranslucent:  false,
 			DisableWindowIcon:    false,
 		},
+		Linux: &linux.Options{Icon: linuxIcon},
 		Bind: []interface{}{
 			app,
 		},

@@ -143,6 +143,30 @@ class Config:
     output_format: str = "flac"
     save_cover_art_sidecar: bool = False
 
+    # v2.0.0 PORT-2 - sidecar files. All three default OFF: a new file silently
+    # appearing in every existing user's library is a behaviour change nobody
+    # asked for. No .m3u toggle - the organizer already writes one for
+    # playlists; see antra/utils/sidecars.py for why that is deliberate.
+    sidecar_cue: bool = False
+    sidecar_nfo: bool = False
+    sidecar_json: bool = False
+
+    # v2.0.0 FR-2 - cover art settings block.
+    # local_artwork_size defaults to 0 (original) rather than a fixed 1400 so
+    # the byte-for-byte sidecar fast path is reachable out of the box; before
+    # FR-2 every sidecar was a JPEG q95 re-encode measured 0.8-16.9% LARGER
+    # than the original it replaced.
+    cover_image_template: str = "cover"
+    local_artwork_size: int = 0
+    local_artwork_format: str = "jpg"
+    jpeg_image_quality: int = 90
+    # 1000 matches the hardcoded cap the v1.1.6 BUG-F fix introduced, so the
+    # embedded path is byte-unchanged for anyone who never opens the setting.
+    embedded_artwork_size: int = 1000
+    embedded_artwork_png: bool = False
+    save_artist_image: bool = False
+    artist_image_template: str = "folder"
+
     # Soulseek / slskd (optional)
     soulseek_base_url: str = ""
     soulseek_api_key: str = ""
@@ -175,6 +199,18 @@ class Config:
     # v1.1.8 FEAT-4 — stamp which Antra version/source produced a file so a
     # library owner can re-fetch folders written by a version with a known bug.
     write_antra_tags: bool = True
+    # v2.0.0 DMX-1 — per-tag write toggles. Stored as the DISABLED ids, so an
+    # empty tuple (the default, and what any pre-DMX-1 config.json produces)
+    # means every tag is written exactly as before.
+    disabled_tags: tuple[str, ...] = ()
+    # How the `date` tag is rendered: iso | year | dmy | mdy. ISO is the
+    # default and must stay it — v1.1.3 established Windows Media Player needs
+    # a full ISO date string.
+    date_format: str = "iso"
+    # Write the legacy ID3v1 tag alongside ID3v2 on MP3. On by default because
+    # that is what the tagger has always done; some old hardware needs it and
+    # some library scanners prefer it absent.
+    write_id3v1: bool = True
 
     # Library deduplication mode:
     #   "smart_dedup"  — skip a track if the same ISRC/ID exists anywhere in the library (default)
@@ -195,6 +231,19 @@ class Config:
     #   "standard" — Playlists / Playlist Name / files
     #   "flat"     — <root> / Playlist Name / files
     playlist_folder_structure: str = "standard"
+    # Playlist storage mode (issue #78):
+    #   "playlist_folder" - tracks live under the playlist name (default, unchanged)
+    #   "library"         - tracks are filed by the configured library folder /
+    #                       filename templates, exactly like an album download;
+    #                       the playlist survives only as the .m3u manifest.
+    playlist_storage_mode: str = "playlist_folder"
+    # issue #75 — rename a playlist's files when their position in the playlist
+    # moved. Spotify's Liked Songs prepends, so without this every number in the
+    # folder goes stale the moment one song is added.
+    playlist_renumber: bool = True
+    # issue #75 — files left in a playlist folder that the playlist no longer
+    # contains: "ask" (report only, default) | "auto" (delete) | "off".
+    playlist_prune_orphans: str = "ask"
 
     # Single-track layout:
     #   "album_numbered" — store under the album folder as 101 - Title (default)
@@ -223,6 +272,44 @@ class Config:
     illegal_character_replacement: str = ""
     whitespace_handling: str = "preserve"
     filename_conflict_behavior: str = "skip"
+
+    # -- v2.0.0 DMX-6 -- post-download command hook -----------------------
+    # OFF by default. post_command_confirmed is a second, independent gate:
+    # the hook runs a program with values taken from remote catalogue
+    # metadata, so it must be acknowledged once in the UI before anything
+    # executes. Enforced in PostCommandRunner, not only in the UI, so a
+    # config.json hand-edited to enabled=true stays inert without it.
+    post_command_enabled: bool = False
+    post_command_confirmed: bool = False
+    post_command: str = ""
+    post_command_mode: str = "track"
+    post_command_timeout: int = 30
+    # v2.0.0 SF-2 - ReplayGain 2.0 tags. OFF by default: one full decode per track.
+    replaygain_enabled: bool = False
+    # Audio fingerprint verification: check the downloaded audio against the
+    # track's free 30s store preview and fail the track when it is a different
+    # recording. ON by default: it costs ~1.4s and one small preview fetch per
+    # track, and it is the only check that looks at the audio itself.
+    verify_audio_enabled: bool = True
+    verify_audio_threshold: float = 0.35
+
+    # ── v2.0.0 DMX-2 — output-only text transforms ──────────────────────────
+    # These are applied by antra_shared.filename_prefs.transform_text at the
+    # TAG and FILENAME sites only. Nothing here mutates TrackMetadata, so the
+    # resolver, strip_collab() and the identity gate keep seeing the
+    # catalogue's original strings — applying them upstream would bring back
+    # BUG-1's wrong-audio-correct-metadata failures.
+    #
+    # Every default is a no-op EXCEPT remove_duplicate_artists (default on),
+    # which only changes output for a track whose artist list actually repeats
+    # a name.
+    title_casing: str = "nothing"
+    artist_casing: str = "nothing"
+    remove_album_version: bool = False
+    remove_duplicate_artists: bool = True
+    featured_artists_mode: str = "nothing"
+    multi_artist_separator: str = "default"
+    album_various_artists: bool = True
 
     # Direct Amazon Music credentials (JSON blob from amazon_creds.json).
     # When set, Antra calls the Amazon DMLS API directly with the user's own
@@ -282,6 +369,38 @@ class Config:
     # quality tier across sessions. Empty db_path → default user-data location.
     provider_stats_enabled: bool = True
     provider_stats_db_path: str = ""
+
+    # Persistent library identity index (v2.0.0 SF-4). Caches per-file dedup
+    # keys so the library scan does not re-parse every file on every run. Pure
+    # cache — disabling it only makes startup slower, never different.
+    library_index_enabled: bool = True
+    library_index_db_path: str = ""
+
+
+def _int_env(name: str, default: int) -> int:
+    """int() an env var, falling back to the default on blank/garbage.
+
+    A raw int(os.getenv(...)) here would raise at config load and take every
+    download with it if the GUI ever wrote an empty string.
+    """
+    try:
+        return int(str(os.getenv(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _verify_threshold() -> float:
+    """Fingerprint mismatch limit, clamped to a sane band.
+
+    Measured separation is genuine <= 0.20 and different-recording >= 0.40, so a
+    value outside 0.20-0.45 would either fail good downloads or never fire. An
+    unparseable value falls back to the default rather than raising.
+    """
+    try:
+        value = float(os.getenv("VERIFY_AUDIO_THRESHOLD", "0.35") or 0.35)
+    except ValueError:
+        return 0.35
+    return min(max(value, 0.20), 0.45)
 
 
 def load_config() -> Config:
@@ -344,6 +463,17 @@ def load_config() -> Config:
         source_preference=os.getenv("SOURCE_PREFERENCES", os.getenv("SOURCE_PREFERENCE", "auto")),
         output_format=os.getenv("OUTPUT_FORMAT", "flac"),
         save_cover_art_sidecar=os.getenv("SAVE_COVER_ART_SIDECAR", "false").lower() == "true",
+        sidecar_cue=os.getenv("SIDECAR_CUE", "false").lower() == "true",
+        sidecar_nfo=os.getenv("SIDECAR_NFO", "false").lower() == "true",
+        sidecar_json=os.getenv("SIDECAR_JSON", "false").lower() == "true",
+        cover_image_template=os.getenv("COVER_IMAGE_TEMPLATE", "cover"),
+        local_artwork_size=_int_env("LOCAL_ARTWORK_SIZE", 0),
+        local_artwork_format=os.getenv("LOCAL_ARTWORK_FORMAT", "jpg"),
+        jpeg_image_quality=_int_env("JPEG_IMAGE_QUALITY", 90),
+        embedded_artwork_size=_int_env("EMBEDDED_ARTWORK_SIZE", 1000),
+        embedded_artwork_png=os.getenv("EMBEDDED_ARTWORK_PNG", "false").lower() == "true",
+        save_artist_image=os.getenv("SAVE_ARTIST_IMAGE", "false").lower() == "true",
+        artist_image_template=os.getenv("ARTIST_IMAGE_TEMPLATE", "folder"),
         soulseek_base_url=os.getenv("SLSKD_BASE_URL", ""),
         soulseek_api_key=os.getenv("SLSKD_API_KEY", ""),
         soulseek_username=os.getenv("SOULSEEK_USERNAME", ""),
@@ -356,10 +486,20 @@ def load_config() -> Config:
         strict_format=os.getenv("STRICT_FORMAT", "true").lower() == "true",
         prevent_lossy_transcode=os.getenv("PREVENT_LOSSY_TRANSCODE", "true").lower() == "true",
         write_antra_tags=os.getenv("WRITE_ANTRA_TAGS", "true").lower() == "true",
+        disabled_tags=tuple(
+            part.strip().lower()
+            for part in os.getenv("DISABLED_TAGS", "").split(",")
+            if part.strip()
+        ),
+        date_format=os.getenv("DATE_FORMAT", "iso").strip().lower() or "iso",
+        write_id3v1=os.getenv("WRITE_ID3V1", "true").lower() == "true",
         library_mode=os.getenv("LIBRARY_MODE", "smart_dedup"),
         folder_structure=os.getenv("FOLDER_STRUCTURE", "standard"),
         album_folder_structure=os.getenv("ALBUM_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
         playlist_folder_structure=os.getenv("PLAYLIST_FOLDER_STRUCTURE", os.getenv("FOLDER_STRUCTURE", "standard")),
+        playlist_storage_mode=os.getenv("PLAYLIST_STORAGE_MODE", "playlist_folder"),
+        playlist_renumber=os.getenv("PLAYLIST_RENUMBER", "true").lower() == "true",
+        playlist_prune_orphans=os.getenv("PLAYLIST_PRUNE_ORPHANS", "ask"),
         single_track_structure=os.getenv("SINGLE_TRACK_STRUCTURE", "album_numbered"),
         filename_format=os.getenv("FILENAME_FORMAT", "default"),
         single_track_filename_template=os.getenv("SINGLE_TRACK_FILENAME_TEMPLATE", ""),
@@ -372,6 +512,24 @@ def load_config() -> Config:
         illegal_character_replacement=os.getenv("ILLEGAL_CHARACTER_REPLACEMENT", ""),
         whitespace_handling=os.getenv("WHITESPACE_HANDLING", "preserve"),
         filename_conflict_behavior=os.getenv("FILENAME_CONFLICT_BEHAVIOR", "skip"),
+        post_command_enabled=os.getenv("POST_COMMAND_ENABLED", "false").lower() == "true",
+        post_command_confirmed=os.getenv("POST_COMMAND_CONFIRMED", "false").lower() == "true",
+        post_command=os.getenv("POST_COMMAND", ""),
+        post_command_mode=os.getenv("POST_COMMAND_MODE", "track"),
+        post_command_timeout=int(os.getenv("POST_COMMAND_TIMEOUT", "30") or 30),
+        replaygain_enabled=os.getenv("REPLAYGAIN_ENABLED", "false").lower() == "true",
+        verify_audio_enabled=os.getenv("VERIFY_AUDIO_ENABLED", "true").lower() == "true",
+        verify_audio_threshold=_verify_threshold(),
+        # v2.0.0 DMX-2 — clamping lives in migrate_legacy_templates, so an
+        # unrecognised value read from here degrades to the no-op rather than
+        # reaching a regex or a casing branch.
+        title_casing=os.getenv("TITLE_CASING", "nothing").strip().lower() or "nothing",
+        artist_casing=os.getenv("ARTIST_CASING", "nothing").strip().lower() or "nothing",
+        remove_album_version=os.getenv("REMOVE_ALBUM_VERSION", "false").lower() == "true",
+        remove_duplicate_artists=os.getenv("REMOVE_DUPLICATE_ARTISTS", "true").lower() == "true",
+        featured_artists_mode=os.getenv("FEATURED_ARTISTS_MODE", "nothing").strip().lower() or "nothing",
+        multi_artist_separator=os.getenv("MULTI_ARTIST_SEPARATOR", "default").strip().lower() or "default",
+        album_various_artists=os.getenv("ALBUM_VARIOUS_ARTISTS", "true").lower() == "true",
         amazon_direct_creds_json=os.getenv("AMAZON_DIRECT_CREDS_JSON", ""),
         amazon_wvd_path=os.getenv("AMAZON_WVD_PATH", ""),
         apple_authorization_token=os.getenv("APPLE_AUTHORIZATION_TOKEN", ""),
@@ -392,5 +550,7 @@ def load_config() -> Config:
         tracked_playlists=[],
         provider_stats_enabled=os.getenv("PROVIDER_STATS_ENABLED", "true").lower() == "true",
         provider_stats_db_path=os.getenv("PROVIDER_STATS_DB_PATH", ""),
+        library_index_enabled=os.getenv("LIBRARY_INDEX_ENABLED", "true").lower() == "true",
+        library_index_db_path=os.getenv("LIBRARY_INDEX_DB_PATH", ""),
     )
     return cfg

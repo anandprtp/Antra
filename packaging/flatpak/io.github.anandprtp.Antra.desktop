@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Antra
+GenericName=Music Downloader
+Comment=Lossless music library downloader
+Exec=antra
+Icon=io.github.anandprtp.Antra
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=music;audio;flac;lossless;download;library;spotify;tidal;qobuz;deezer;
+StartupNotify=true
+StartupWMClass=antra

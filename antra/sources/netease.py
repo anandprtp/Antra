@@ -124,6 +124,10 @@ class NetEaseAdapter(BaseSourceAdapter):
             score = self._score(track, title, artists)
 
             if duration_ms and track.duration_ms:
+                # Gate, not a discount (same measurement as JioSaavn): a x0.8 penalty let
+                # a clearly different-length recording or a ~30 s VIP trial clip still win.
+                if not duration_close(track.duration_ms / 1000, duration_ms / 1000, tolerance=15):
+                    continue
                 if not duration_close(track.duration_ms / 1000, duration_ms / 1000, tolerance=6):
                     score *= 0.8
 
@@ -196,6 +200,9 @@ class NetEaseAdapter(BaseSourceAdapter):
 
         # Use a unique temp stem to avoid collisions
         tmp_stem = os.path.join(tmp_dir, f"_ne_tmp_{result.stream_id}")
+        # glob.escape: the folder comes from the user's template ("Album [Deluxe]"), and
+        # unescaped [ ] * ? made the cleanup/fallback globs below match nothing.
+        tmp_glob = glob.escape(tmp_stem) + ".*"
 
         ydl_opts = {
             "format": "bestaudio",
@@ -212,7 +219,7 @@ class NetEaseAdapter(BaseSourceAdapter):
                 ext = info.get("ext") or "mp3"
         except Exception as e:
             # Clean up any partial files left by yt-dlp
-            for f in glob.glob(tmp_stem + ".*"):
+            for f in glob.glob(tmp_glob):
                 try:
                     os.remove(f)
                 except OSError:
@@ -223,7 +230,7 @@ class NetEaseAdapter(BaseSourceAdapter):
         # back to glob in case yt-dlp used a slightly different extension.
         tmp_path = f"{tmp_stem}.{ext}"
         if not os.path.exists(tmp_path):
-            candidates = glob.glob(tmp_stem + ".*")
+            candidates = glob.glob(tmp_glob)
             if not candidates:
                 raise ValueError(f"[NetEase] Expected output file not found: {tmp_path}")
             tmp_path = candidates[0]

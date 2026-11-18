@@ -4,6 +4,97 @@
     <meta charset="UTF-8"/>
     <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
     <title>antra-wails</title>
+<script>
+  /* ── Pre-paint (v2.0.0 THEME-2) ───────────────────────────────────────────
+     Without this the window paints the default dark ground and then repaints
+     into the user's theme once the bundle has loaded and GetConfig() has come
+     back over the Wails bridge -- a double flash on every launch.
+
+     BG is GENERATED from style.css's own ramps and seeds (scratchpad
+     gen_prepaint.py), never hand-typed, so the pre-paint colour cannot drift
+     away from the painted one. [dark, light] per theme.
+
+     The stored values are read from localStorage, which anything running in
+     this webview can write, so both are validated against a whitelist before
+     they reach setAttribute. */
+  (function () {
+    var BG = {
+    "amazon-music":["#0a121b","#f1f7fe"],
+    "antra":["#081412","#f0f9f7"],
+    "artwork":["#071412","#eff9f7"],
+    "custom":["#061417","#eff8fb"],
+    "apple-music":["#101118","#f5f6fb"],
+    "deezer":["#140e1b","#f9f4fe"],
+    "ember":["#1a0e07","#fdf5ef"],
+    "graphite":["#101114","#f5f6f8"],
+    "linen":["#0d140a","#f3f8f1"],
+    "ocean":["#09121b","#f1f7fe"],
+    "qobuz":["#0b121b","#f2f7fe"],
+    "spotify":["#111111","#f6f6f6"],
+    "sunset":["#190d14","#fdf4f8"],
+    "tidal":["#0f1215","#f4f7f9"]
+    };
+    var t = "antra", m = "system";
+    try {
+      var st = localStorage.getItem("antra:theme");
+      var sm = localStorage.getItem("antra:mode");
+      if (st && Object.prototype.hasOwnProperty.call(BG, st)) t = st;
+      if (sm === "light" || sm === "dark" || sm === "system") m = sm;
+    } catch (e) { /* storage disabled: fall back to the default theme */ }
+
+    var light = m === "light";
+    if (m === "system") {
+      try { light = window.matchMedia("(prefers-color-scheme: light)").matches; }
+      catch (e) { light = false; }
+    }
+
+    var root = document.documentElement;
+    root.setAttribute("data-theme", t);
+    if (m === "light" || m === "dark") root.setAttribute("data-mode", m);
+    /* The artwork theme (THEME-3) is the one theme whose colour is not known
+       until runtime, so its seed is stored beside the theme id and replayed
+       here. Without this, choosing it and relaunching would paint the fallback
+       teal for a frame before the Go extractor had even been called -- the
+       exact flash this whole block exists to prevent. The stored record is
+       range-checked field by field, because anything in this webview can write
+       localStorage and these values go straight into style properties. */
+    var seed = null;
+    if (t === "artwork" || t === "custom") {
+      try {
+        var key = t === "custom" ? "antra:customSeed" : "antra:artworkSeed";
+        var raw = JSON.parse(localStorage.getItem(key) || "null");
+        var num = function (v, lo, hi) {
+          return typeof v === "number" && isFinite(v) && v >= lo && v <= hi;
+        };
+        var hex = function (v) { return typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v); };
+        if (raw && num(raw.h, 0, 360) && num(raw.h2, 0, 360) &&
+            (raw.ah === undefined || num(raw.ah, 0, 360)) &&
+            num(raw.c1, 0, 0.5) && num(raw.c2, 0, 0.5) &&
+            num(raw.l1, 0, 1) && num(raw.l2, 0, 1) &&
+            num(raw.n_cf, 0, 3) && num(raw.n_cf_hi, 0, 3) &&
+            hex(raw.bg_dark) && hex(raw.bg_light)) {
+          seed = raw;
+        }
+      } catch (e) { /* malformed record: fall back to the CSS block */ }
+    }
+
+    if (seed) {
+      root.style.setProperty("--n-h", String(seed.h));
+      root.style.setProperty("--n-cf", String(seed.n_cf));
+      root.style.setProperty("--n-cf-hi", String(seed.n_cf_hi));
+      root.style.setProperty("--a1-l", String(seed.l1));
+      root.style.setProperty("--a1-c", String(seed.c1));
+      root.style.setProperty("--a1-h", String(typeof seed.ah === "number" ? seed.ah : seed.h));
+      root.style.setProperty("--a2-l", String(seed.l2));
+      root.style.setProperty("--a2-c", String(seed.c2));
+      root.style.setProperty("--a2-h", String(seed.h2));
+      root.style.background = light ? seed.bg_light : seed.bg_dark;
+    } else {
+      root.style.background = BG[t][light ? 1 : 0];
+    }
+    root.style.colorScheme = light ? "light" : "dark";
+  })();
+</script>
 </head>
 <body>
 <div id="app"></div>

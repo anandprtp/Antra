@@ -21,8 +21,9 @@ from antra.core.resolver import SourceResolver
 from antra.sources.base import RateLimitedError
 from antra.utils.matching import duration_close
 from antra.utils.lyrics import LyricsFetcher
-from antra.utils.organizer import LibraryOrganizer
-from antra.utils.tagger import FileTagger
+from antra.utils.post_command import PostCommandConfig, PostCommandRunner
+from antra.utils.organizer import LibraryOrganizer, SUPPORTED_AUDIO_EXTENSIONS
+from antra.utils.tagger import FileTagger, ArtworkPreferences, tag_problem_for
 from antra.utils.transcoder import AudioTranscoder
 
 logger = logging.getLogger(__name__)
@@ -51,9 +52,17 @@ def _is_server_error(exc: BaseException) -> bool:
     down / returning 500" (which should rate-limit the adapter globally after
     3 consecutive failures so subsequent tracks skip it immediately).
     """
-    msg = str(exc).lower()
-    # Catch explicit HTTP status codes (500, 502, 503, 504, 507…)
     import re as _re
+    # Strip URLs BEFORE matching. requests embeds the full request URL in its
+    # error text, so a bare \b5\d{2}\b match reads the URL as a status code:
+    # measured, a 404 for track id 512 gives
+    #   "404 Client Error: Not Found for url: .../api/stream/512"
+    # which matched and counted a DEFINITIVE licensing refusal toward the 5xx
+    # circuit breaker. Same class as the mirror servers' _URL_IN_ERROR_RE,
+    # where matching the raw string once classified every Qobuz 403 as a
+    # signature fault and drained that pool 72 -> 0.
+    msg = _re.sub(r"https?://\S+", " ", str(exc)).lower()
+    # Catch explicit HTTP status codes (500, 502, 503, 504, 507…)
     if _re.search(r"\b5\d{2}\b", msg):
         return True
     # Catch phrased server errors from mirror adapters
@@ -93,6 +102,13 @@ class EngineConfig:
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
     save_cover_art_sidecar: bool = False
+    # v2.0.0 PORT-2 - sidecar files, all default off.
+    sidecar_cue: bool = False
+    sidecar_nfo: bool = False
+    sidecar_json: bool = False
+    # v2.0.0 FR-2 - cover art naming / size / format / quality.
+    artwork_prefs: Optional[ArtworkPreferences] = None
+    filename_preferences: Optional[dict] = None
     output_format: str = "source"
     strict_matching: bool = False
     max_workers: int = 1
@@ -103,6 +119,10 @@ class EngineConfig:
     prevent_lossy_transcode: bool = True
     # v1.1.8 FEAT-4 — stamp ANTRA_VERSION / ANTRA_SOURCE / ANTRA_DOWNLOADED.
     write_antra_tags: bool = True
+    # v2.0.0 DMX-1 — per-tag write toggles, date rendering, legacy ID3v1.
+    disabled_tags: tuple[str, ...] = ()
+    date_format: str = "iso"
+    write_id3v1: bool = True
     # Threads that resolve upcoming tracks while other tracks download, so a
     # download worker never spends its slot on a network search. 0 disables it
     # and restores the pre-v1.1.8 behaviour exactly.
@@ -111,6 +131,13 @@ class EngineConfig:
     # prefetch thread would double the concurrent request load the mirrors see
     # from free users, and FEAT-7's rule is that the free tier must not change.
     prefetch_resolves: int = 0
+    # v2.0.0 DMX-6 - post-download command hook. None = never runs.
+    post_command: Optional[PostCommandConfig] = None
+    # v2.0.0 SF-2 - ReplayGain 2.0 tags. Off by default: a full decode per track.
+    replaygain: bool = False
+    # Audio fingerprint verification against the track's store preview.
+    verify_audio: bool = False
+    verify_audio_threshold: float = 0.35
 
 
 class DownloadEngine:
@@ -130,9 +157,19 @@ class DownloadEngine:
         self.cfg = config or EngineConfig()
         self.tagger = FileTagger(
             write_antra_tags=getattr(self.cfg, "write_antra_tags", True),
+            artwork_prefs=getattr(self.cfg, "artwork_prefs", None),
+            filename_preferences=getattr(self.cfg, "filename_preferences", None)
+            or getattr(organizer, "filename_preferences", None),
+            disabled_tags=getattr(self.cfg, "disabled_tags", ()),
+            date_format=getattr(self.cfg, "date_format", "iso"),
+            write_id3v1=getattr(self.cfg, "write_id3v1", True),
         )
         self.transcoder = AudioTranscoder(
             prevent_lossy_transcode=getattr(self.cfg, "prevent_lossy_transcode", True),
+        )
+        self.post_command = PostCommandRunner(
+            getattr(self.cfg, "post_command", None),
+            library_root=str(getattr(organizer, "root", "") or ""),
         )
         self.event_callback = event_callback
         self.controller = controller
@@ -158,6 +195,9 @@ class DownloadEngine:
         self._prefetch_slack = 1
         # Resolves claimed but not yet stored, counted against the queue budget.
         self._prefetch_inflight = 0
+        # v2.0.0 SF-2 - per-file loudness kept until the album pass consumes it.
+        self._rg_measurements: dict[str, object] = {}
+        self._rg_lock = threading.Lock()
 
     def _signal_output_lost(self, exc: OSError) -> None:
         """Record the first mount-loss error so workers can abort fast."""
@@ -413,7 +453,11 @@ class DownloadEngine:
         file_path: str,
         fallback_format: AudioFormat | None,
         fallback_label: str,
+        source_kbps: int | None = None,
     ) -> str:
+        """`source_kbps` is the bitrate of the LOSSY file we were handed before any re-encode.
+        A 128 kbps stream transcoded to a 320 kbps MP3 is still 128 kbps of audio, so the label
+        never shows more than the source had."""
         try:
             audio = MutagenFile(file_path)
         except Exception:
@@ -431,13 +475,52 @@ class DownloadEngine:
                 if bit_depth:
                     return f"{fmt} {int(bit_depth)}-bit"
                 return fmt
-            if bitrate:
-                return f"{fmt} {int(bitrate) // 1000}kbps"
+            file_kbps = int(bitrate) // 1000 if bitrate else None
+            if source_kbps and (not file_kbps or source_kbps < file_kbps):
+                return f"{fmt} {int(source_kbps)}kbps"
+            if file_kbps:
+                return f"{fmt} {file_kbps}kbps"
             return fmt
         return fallback_label
 
-    def _should_convert_output(self, file_path: str, output_format: str) -> bool:
-        return self.transcoder.needs_conversion(file_path, output_format)
+    @staticmethod
+    def _lossy_source_bitrate_kbps(file_path: str, result) -> int | None:
+        """Real bitrate of a lossy download, measured from the file; the adapter's own claim
+        (`quality_kbps`) is only the fallback, because adapters report what they asked for
+        (JioSaavn "320", YouTube's flat search `abr`) and not what arrived."""
+        bitrate = None
+        try:
+            info = getattr(MutagenFile(file_path), "info", None)
+            bitrate = getattr(info, "bitrate", None)
+        except Exception:
+            pass
+        if not bitrate:
+            from antra.utils.runtime import get_ffprobe_exe
+            ffprobe = get_ffprobe_exe() or shutil.which("ffprobe")
+            if ffprobe:
+                try:
+                    out = subprocess.run(
+                        [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries",
+                         "stream=bit_rate:format=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                        capture_output=True, text=True, timeout=15,
+                    ).stdout.split()
+                    bitrate = next((int(v) for v in out if v.isdigit() and int(v) > 0), None)
+                except Exception:
+                    bitrate = None
+        if bitrate:
+            return int(round(int(bitrate) / 1000))
+        claimed = getattr(result, "quality_kbps", None)
+        return int(claimed) if claimed else None
+
+    @staticmethod
+    def _source_is_lossy_only(adapter) -> bool:
+        """A source that only has lossy audio (YouTube, JioSaavn, Apple without its wrapper) is
+        reached only when no lossless service had the track. FEAT-2 must not then leave the
+        user with a container they did not ask for, so these may be re-encoded to the target."""
+        return bool(getattr(adapter, "is_last_resort", False) or getattr(adapter, "always_lossy", False))
+
+    def _should_convert_output(self, file_path: str, output_format: str, allow_lossy_reencode: bool = False) -> bool:
+        return self.transcoder.needs_conversion(file_path, output_format, allow_lossy_reencode)
 
     @staticmethod
     def _format_conversion_log(file_path: str, output_format: str) -> str:
@@ -565,6 +648,40 @@ class DownloadEngine:
         "flac", "lossless", "lossless-16", "lossless-24",
         "alac", "alac-16", "alac-24",
     }
+
+    def _audio_verification_problem(self, file_path: str, track) -> str | None:
+        """Reason to reject `file_path` as the wrong recording, else None.
+
+        Returns None for every inconclusive outcome (no preview for the track,
+        no fingerprinting tool, network failure) so a track is only ever failed
+        on positive evidence that the audio is a different recording.
+        """
+        try:
+            from antra.utils.audio_verify import verify_file
+
+            result = verify_file(
+                file_path,
+                isrc=getattr(track, "isrc", "") or "",
+                title=getattr(track, "title", "") or "",
+                artist=(getattr(track, "artists", None) or [""])[0],
+                duration_ms=getattr(track, "duration_ms", None),
+                threshold=self.cfg.verify_audio_threshold,
+            )
+        except Exception as exc:  # noqa: BLE001 - verification must never fail a good download
+            logger.debug("  [VERIFY] check failed for %s: %s", getattr(track, "title", ""), exc)
+            return None
+        if result.is_mismatch:
+            logger.info("  [VERIFY] %s: rejected, %s", track.title, result.reason)
+            return (
+                f"Audio does not match '{track.title}' — the file contains a different "
+                f"recording (fingerprint difference {result.score:.2f}, limit "
+                f"{self.cfg.verify_audio_threshold:.2f}) — retrying with next source"
+            )
+        if result.verdict == "match":
+            logger.info("  [VERIFY] %s: audio matches the requested recording", track.title)
+        else:
+            logger.debug("  [VERIFY] %s: not checked — %s", track.title, result.reason)
+        return None
 
     def _strict_format_problem(self, file_path: str) -> str | None:
         """Reject a lossy file delivered under a lossless output format
@@ -919,6 +1036,112 @@ class DownloadEngine:
             except OSError:
                 pass
 
+    # ── v2.0.0 DMX-5 — filename_conflict_behavior ────────────────────────────
+
+    # Suffix for a file set aside while an overwrite re-download is in flight.
+    # Not an audio extension, so neither the identity index nor the library
+    # scanner can mistake it for a track, and it does not match
+    # _CLEANUP_SUFFIX_RE, so a failed attempt's cleanup can never delete it.
+    _OVERWRITE_STASH_SUFFIX = ".antra-overwrite-old"
+
+    def _stash_for_overwrite(
+        self, track: TrackMetadata, output_base: str, stash: dict[str, str]
+    ) -> None:
+        """Move the existing file aside before an overwrite re-download.
+
+        Adapters write straight into their final path, and the BUG-4 cleanup
+        only removes files an attempt CREATED. Overwriting in place therefore
+        meant a failed re-download truncated a perfectly good file and then left
+        the stub behind. With the original moved aside it is restored on
+        failure and deleted only once the replacement has fully succeeded.
+        """
+        from pathlib import Path
+        from antra.utils.longpath import extended_path
+
+        # Recover a track hidden by a run that was killed mid-overwrite. The desktop Stop
+        # button kills the whole process tree, so no `except` ever ran: the good file stayed
+        # renamed to .antra-overwrite-old and silently vanished from the library. Restoring
+        # only when the original is MISSING cannot clobber a newer file. Runs in every
+        # conflict mode, since a stale stash is unwanted whatever is configured now.
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
+            original = output_base + ext
+            stale = original + self._OVERWRITE_STASH_SUFFIX
+            try:
+                if os.path.isfile(extended_path(stale)) and not os.path.exists(extended_path(original)):
+                    os.replace(extended_path(stale), extended_path(original))
+                    logger.info(f"  [OVERWRITE]  Restored a file left aside by an interrupted run: "
+                                f"{os.path.basename(original)}")
+            except OSError as e:
+                logger.warning(f"  [OVERWRITE]  Could not restore {os.path.basename(original)}: {e}")
+
+        if self.organizer.conflict_behavior != "overwrite":
+            return
+
+        for ext in SUPPORTED_AUDIO_EXTENSIONS:
+            original = output_base + ext
+            if original in stash or not os.path.isfile(extended_path(original)):
+                continue
+            try:
+                # A different recording that merely shares the stem is never
+                # ours to replace (get_output_path would normally have given
+                # this request a "(2)" stem already — belt and braces).
+                if self.organizer._existing_file_is_positively_different(track, Path(original)):
+                    continue
+            except Exception:
+                pass
+            backup = original + self._OVERWRITE_STASH_SUFFIX
+            try:
+                os.replace(extended_path(original), extended_path(backup))
+                stash[original] = backup
+                logger.info(f"  [OVERWRITE]  Replacing existing file: {os.path.basename(original)}")
+            except OSError as e:
+                logger.warning(
+                    f"  [OVERWRITE]  Could not set aside {os.path.basename(original)} ({e}); "
+                    "it will be overwritten in place"
+                )
+
+    @staticmethod
+    def _finish_overwrite_stash(stash: dict[str, str], *, success: bool) -> None:
+        from antra.utils.longpath import extended_path
+
+        for original, backup in stash.items():
+            try:
+                if success:
+                    if os.path.exists(extended_path(backup)):
+                        os.remove(extended_path(backup))
+                elif os.path.exists(extended_path(backup)):
+                    # os.replace also clears any stub a failed attempt left at
+                    # the original name.
+                    os.replace(extended_path(backup), extended_path(original))
+                    logger.info(
+                        f"  [OVERWRITE]  Re-download failed — restored the original: "
+                        f"{os.path.basename(original)}"
+                    )
+            except OSError as e:
+                logger.warning(f"  [OVERWRITE]  Could not finalise {os.path.basename(original)}: {e}")
+        stash.clear()
+
+    def _retag_existing(self, track: TrackMetadata, path: str) -> bool:
+        """tag_only: refresh an existing file's tags without re-downloading it.
+
+        No resolver search runs — avoiding the mirrors is the point — so the
+        metadata is the fetcher's plus the free enrichment chain (Deezer /
+        iTunes / MusicBrainz / lyrics / artwork upgrade), not a source adapter's.
+        """
+        self._fetch_lyrics_if_needed(track)
+        try:
+            from antra.core.metadata_enricher import MetadataEnricher
+            MetadataEnricher.enrich(track, None)
+        except Exception:
+            self._enrich_track_metadata_if_needed(track)
+            self._enrich_genres_if_needed(track)
+        ok = self.tagger.tag(path, track, provenance=False)
+        if ok:
+            logger.info(f"  [RETAG]  Re-tagged existing file: {track.title}")
+        else:
+            logger.warning(f"  [RETAG]  Could not re-tag {path} — the file was left as it was")
+        return ok
+
     def download_track(
         self,
         track: TrackMetadata,
@@ -926,7 +1149,40 @@ class DownloadEngine:
         track_total: Optional[int] = None,
     ) -> DownloadResult:
         """Full pipeline for a single track."""
+        stash: dict[str, str] = {}
+        try:
+            result = self._download_track_impl(track, track_index, track_total, stash)
+        except BaseException:
+            self._finish_overwrite_stash(stash, success=False)
+            raise
+        self._finish_overwrite_stash(
+            stash, success=result.status == DownloadStatus.COMPLETED
+        )
+        # v2.0.0 DMX-6. Fired here rather than inside the impl for one
+        # reason: in overwrite mode the displaced original is still sitting
+        # beside the new file as .antra-overwrite-old until the line above
+        # runs, and a hook that scans the folder (a rescan, a beets import)
+        # would see it. This is also the more explicit place for the
+        # COMPLETED gate: a SKIPPED track is already in the library and
+        # changed nothing on disk, so re-triggering a rescan for it would be
+        # pure noise. Contained - PostCommandRunner swallows every failure,
+        # so a hook can never fail a track.
+        if result.status == DownloadStatus.COMPLETED and result.file_path:
+            self.post_command.run_for_track(
+                file_path=result.file_path,
+                track=track,
+                source=result.source_used or "",
+                release_folder=self.organizer.release_folder_for(result.file_path) or "",
+            )
+        return result
 
+    def _download_track_impl(
+        self,
+        track: TrackMetadata,
+        track_index: Optional[int],
+        track_total: Optional[int],
+        overwrite_stash: dict[str, str],
+    ) -> DownloadResult:
         # 1. Resume check — only skip if the existing file meets the current output format.
         existing = self.organizer.is_already_downloaded(track)
         if existing:
@@ -956,16 +1212,29 @@ class DownloadEngine:
 
             if existing:
                 existing = self.organizer.ensure_playlist_copy(track, existing)
+                retagged = False
+                retag_path = self.organizer.retag_target(track, existing)
+                if retag_path:
+                    retagged = self._retag_existing(track, retag_path)
                 if self.cfg.save_cover_art_sidecar:
-                    self.tagger.save_cover_art_sidecar(existing, track)
-                logger.info(f"  [SKIP]  Skipping (already downloaded): {track.title}")
+                    self.tagger.save_cover_art_sidecar(
+                        existing, track, folder=self.organizer.release_folder_for(existing)
+                    )
+                if getattr(self.cfg, "artwork_prefs", None) and self.cfg.artwork_prefs.save_artist_image:
+                    self.tagger.save_artist_image_sidecar(
+                        self.organizer.artist_folder_for(existing), track
+                    )
+                if not retagged:
+                    logger.info(f"  [SKIP]  Skipping (already downloaded): {track.title}")
                 self._emit(
                     EngineEventType.TRACK_SKIPPED,
                     track=track,
                     track_index=track_index,
                     track_total=track_total,
                     file_path=existing,
-                    message="Track already exists on disk.",
+                    message=(
+                        "Re-tagged existing file." if retagged else "Track already exists on disk."
+                    ),
                 )
                 return DownloadResult(
                     track=track,
@@ -986,6 +1255,7 @@ class DownloadEngine:
         last_source: Optional[str] = None
         attempted_sources: list[str] = []  # ordered list of sources that were tried
         used_lossy_fallback: bool = False  # flag for post-download warning
+        source_lossy_kbps: int | None = None  # bitrate of the lossy file as downloaded
         # Per-adapter outcome across the whole track (search + download), so the
         # full source chain can be surfaced if the track ultimately fails.
         source_chain: dict[str, str] = {}
@@ -1099,6 +1369,9 @@ class DownloadEngine:
 
             file_path: Optional[str] = None
             final_error: Optional[Exception] = None
+            # Before the first attempt, so each attempt's cleanup snapshot sees
+            # the backup as pre-existing and can never remove it (DMX-5).
+            self._stash_for_overwrite(track, output_base, overwrite_stash)
 
             for attempt in range(1, self.cfg.max_retries + 1):
                 self._last_attempt_start = time.time()
@@ -1149,19 +1422,32 @@ class DownloadEngine:
                     # Amazon OPUS streams may be a different edit than the
                     # Spotify metadata suggests; probing before conversion
                     # gives us the true source duration.
+                    # Measured BEFORE any re-encode and reset every attempt, so a later lossless
+                    # source never inherits an earlier lossy source's cap.
+                    source_lossy_kbps = (
+                        None if result.is_lossless
+                        else self._lossy_source_bitrate_kbps(candidate_path, result)
+                    )
                     _pre_transcode_duration_s = self._probe_duration_seconds(candidate_path)
                     source_duration_ms: int | None = (
                         int(_pre_transcode_duration_s * 1000)
                         if _pre_transcode_duration_s is not None else None
                     )
-                    if self._should_convert_output(candidate_path, self.cfg.output_format):
+                    if self._should_convert_output(
+                        candidate_path, self.cfg.output_format,
+                        allow_lossy_reencode=self._source_is_lossy_only(adapter),
+                    ):
                         logger.info(
                             "  [FMT]  %s: %s",
                             self._format_conversion_log(candidate_path, self.cfg.output_format),
                             track.title,
                         )
                         try:
-                            candidate_path = self.transcoder.convert(candidate_path, self.cfg.output_format)
+                            candidate_path = self.transcoder.convert(
+                                candidate_path, self.cfg.output_format,
+                                allow_lossy_reencode=self._source_is_lossy_only(adapter),
+                                max_source_kbps=source_lossy_kbps,
+                            )
                         except RuntimeError as conv_err:
                             # ffmpeg failed — discard the corrupt source so it does not
                             # linger on disk and re-raise so the engine falls through to
@@ -1226,6 +1512,17 @@ class DownloadEngine:
                             raise
                         except Exception:
                             pass  # Probe failed — accept the file as-is
+                    # Audio fingerprint check: everything above this point
+                    # reads metadata, so a source that returns a completely
+                    # different recording under the right tags passes them all.
+                    # Compares the audio against the track's free 30s store
+                    # preview; only a positive mismatch rejects the file, a
+                    # missing preview or tool leaves the download untouched.
+                    if self.cfg.verify_audio:
+                        verify_reason = self._audio_verification_problem(candidate_path, track)
+                        if verify_reason is not None:
+                            self._discard_file(candidate_path)
+                            raise RuntimeError(f"[{adapter.name}] {verify_reason}")
                     file_path = candidate_path
                     break
                 except Exception as e:
@@ -1297,6 +1594,11 @@ class DownloadEngine:
                     self._cleanup_failed_attempt(output_base, _attempt_snapshot)
                     self.resolver.record_outcome(adapter.name, False)
                     final_error = RuntimeError(f"[{adapter.name}] {delivery_problem}")
+                    # Same bookkeeping as the exception path: an adapter that is
+                    # never excluded after a failure (Soulseek) would otherwise be
+                    # handed this exact candidate again, forever.
+                    self.resolver.record_album_source_failure(track, adapter.name)
+                    adapter.mark_failed_result(result, final_error)
                     last_error = str(final_error)
                     last_source = adapter.name
                     if adapter.name not in attempted_sources:
@@ -1329,14 +1631,42 @@ class DownloadEngine:
                     bool(track.synced_lyrics),
                     track.genres or [],
                 )
-                tag_ok = self.tagger.tag(file_path, track)
-                if not tag_ok:
+                # v2.0.0 ADV-1 (issue #43) — the advisory atom describes the
+                # FILE, so the winning result's flag is handed over alongside
+                # the track. MetadataEnricher only fills track.is_explicit when
+                # it is None (the catalogue wins), so without this a fallback
+                # to a clean master would still be tagged explicit.
+                tag_ok = self.tagger.tag(
+                    file_path,
+                    track,
+                    delivered_explicit=getattr(result, "is_explicit", None),
+                )
+                # DECISION (AUDIT-DESKTOP-16): the audio is valid and the cause is
+                # deterministic, so the track stays COMPLETED and the file is kept;
+                # what must not happen is staying SILENT about it.
+                tags_problem = tag_problem_for(file_path, tag_ok)
+                if tags_problem == "unsupported":
                     logger.warning(
-                        f"  [WARN]  Metadata tagging did not complete for {file_path}. "
-                        "This usually means the output container is unsupported for embedded tags."
+                        f"  [WARN]  {os.path.basename(file_path)} was saved WITHOUT tags: "
+                        "this file type cannot hold embedded tags."
+                    )
+                elif tags_problem == "failed":
+                    logger.warning(
+                        f"  [WARN]  {os.path.basename(file_path)} was saved WITHOUT tags: "
+                        "the tag writer failed (see the error above). Re-tag it from the library once the cause is fixed."
                     )
                 if self.cfg.save_cover_art_sidecar:
-                    self.tagger.save_cover_art_sidecar(file_path, track)
+                    self.tagger.save_cover_art_sidecar(
+                        file_path, track, folder=self.organizer.release_folder_for(file_path)
+                    )
+                if getattr(self.cfg, "artwork_prefs", None) and self.cfg.artwork_prefs.save_artist_image:
+                    self.tagger.save_artist_image_sidecar(
+                        self.organizer.artist_folder_for(file_path), track
+                    )
+                # v2.0.0 SF-2. After tagging, so the tagger's save cannot
+                # clobber the gain, and before TRACK_COMPLETED / the DMX-6
+                # track hook, so anything reacting to "done" sees the tags.
+                self._apply_track_replaygain(file_path, track)
 
                 # 5. Mark done
                 self.organizer.mark_downloaded(track, file_path)
@@ -1374,6 +1704,7 @@ class DownloadEngine:
                     file_path,
                     completed_audio_format,
                     result.quality_label,
+                    source_kbps=source_lossy_kbps,
                 )
                 self._emit(
                     EngineEventType.TRACK_COMPLETED,
@@ -1383,6 +1714,7 @@ class DownloadEngine:
                     source=adapter.name,
                     file_path=file_path,
                     quality_label=completed_quality_label,
+                    tags_problem=tags_problem,
                 )
                 return DownloadResult(
                     track=track,
@@ -1390,6 +1722,7 @@ class DownloadEngine:
                     file_path=file_path,
                     source_used=adapter.name,
                     audio_format=completed_audio_format,
+                    tags_problem=tags_problem,
                 )
 
             # Rate-limited adapters already placed in rate_limited_adapters above — skip
@@ -1608,8 +1941,299 @@ class DownloadEngine:
         with self._prefetch_lock:
             self._prefetched.clear()
 
-    def download_playlist(self, tracks: list[TrackMetadata]) -> list[DownloadResult]:
-        """Download all tracks in a playlist in parallel, returning results in original order."""
+    def _warn_if_platform_pin_unavailable(self, tracks: list[TrackMetadata]) -> None:
+        """Emit ONE notice when the pasted platform cannot serve this download.
+
+        `source_preference` narrows the adapter chain before the resolver is even
+        constructed (ALAC -> Apple only), so a platform pin can be structurally
+        impossible for the whole job. The resolver fails open rather than failing
+        every track, which is the right outcome — but silently substituting a
+        different service looks exactly like the platform setting being ignored.
+        """
+        if not tracks:
+            return
+        service = getattr(tracks[0], "source_service", None)
+        resolver = getattr(self, "resolver", None)
+        checker = getattr(resolver, "platform_pin_is_available", None)
+        if not service or checker is None:
+            return
+        try:
+            if checker(service):
+                return
+            available = ", ".join(
+                dict.fromkeys(resolver._service_label(a.name) for a in resolver.adapters)
+            ) or "no other source"
+            pinned = resolver._service_label(service)
+        except Exception:  # advisory only — never let it fail a download
+            return
+        self._emit(
+            EngineEventType.NOTICE,
+            message=(
+                f"{pinned} cannot be used for this format or plan — the available "
+                f"source is {available}. These tracks will be matched on "
+                f"{available} instead."
+            ),
+        )
+
+    def _write_sidecars(self, results: list[DownloadResult]) -> None:
+        """Write .cue / .nfo / .json beside the audio, from the files on disk.
+
+        SKIPPED counts, and that is deliberate: on the desktop a skipped track's
+        `file_path` points at a real, already-owned file that is part of the
+        same release, so excluding it would make a re-run of a mostly-complete
+        album emit a cue describing only the track that happened to be missing.
+
+        Nothing here may fail a download that already succeeded, hence the bare
+        except — same rule as the cover-art sidecar and the provenance tags.
+        """
+        if not (self.cfg.sidecar_cue or self.cfg.sidecar_nfo or self.cfg.sidecar_json):
+            return
+        try:
+            from antra.utils import sidecars as _sidecars
+
+            entries = [
+                (r.track, r.file_path)
+                for r in results
+                if r.file_path
+                and r.status in (DownloadStatus.COMPLETED, DownloadStatus.SKIPPED)
+            ]
+            if not entries:
+                return
+            _sidecars.write_release_sidecars(
+                entries,
+                want_cue=self.cfg.sidecar_cue,
+                want_nfo=self.cfg.sidecar_nfo,
+                want_json=self.cfg.sidecar_json,
+                download_format=self.cfg.output_format or "",
+            )
+        except Exception as e:
+            logger.warning(f"  [WARN]  Could not write sidecar files: {e}")
+
+    def _replaygain_active(self) -> bool:
+        if not getattr(self.cfg, "replaygain", False):
+            return False
+        # Spatial mixes are skipped: players do not apply ReplayGain to them,
+        # and a stereo-referenced gain on a 5.1 EC-3 bed is not meaningful.
+        return not (self.cfg.output_format or "").lower().startswith("atmos")
+
+    def _apply_track_replaygain(self, file_path: str, track: TrackMetadata) -> None:
+        """Measure one delivered file and write its track gain/peak.
+
+        Contained: any failure is logged and the download stands.
+        """
+        if not self._replaygain_active():
+            return
+        try:
+            from antra.utils import replaygain as rg
+
+            if os.path.splitext(file_path)[1].lower() not in rg.SUPPORTED_EXTENSIONS:
+                logger.debug(f"  [RG]  Skipped (container not tagged): {file_path}")
+                return
+            loud = rg.measure(file_path)
+            if loud is None:
+                logger.info(f"  [RG]  No loudness measured for {track.title} - ReplayGain not written")
+                return
+            if not rg.write_tags(
+                file_path,
+                track=(loud.gain_db, loud.peak),
+                clear_album=True,
+                id3_v1=self.tagger._id3_v1,
+            ):
+                logger.info(f"  [RG]  Could not write ReplayGain tags for {track.title}")
+                return
+            # Only release tracks are kept for the album pass. Playlist rows are
+            # never grouped, and holding ~10 blocks/second for a 2,000-track
+            # playlist would be memory spent on nothing.
+            if not track.playlist_name:
+                with self._rg_lock:
+                    self._rg_measurements[file_path] = loud
+            logger.debug(
+                f"  [RG]  {track.title}: {loud.integrated_lufs:.2f} LUFS -> "
+                f"{rg.format_gain(loud.gain_db)}, peak {rg.format_peak(loud.peak)}"
+            )
+        except Exception as e:
+            logger.warning(f"  [WARN]  ReplayGain analysis failed for {track.title}: {e}")
+
+    @staticmethod
+    def _rg_album_key(track: TrackMetadata) -> tuple:
+        if track.album_id:
+            return ("id", str(track.album_id))
+        album_artist = (track.album_artists[0] if track.album_artists
+                        else (track.artists[0] if track.artists else ""))
+        return ("name", (track.album or "").strip().lower(), album_artist.strip().lower())
+
+    def _apply_album_replaygain(self, results: list[DownloadResult]) -> None:
+        """Write album gain/peak for every release this batch delivered in full.
+
+        A release gets album tags only when EVERY track of it in this batch
+        was downloaded and measured, and the batch covers the whole release
+        (track count >= total_tracks when the catalogue states it, or an album
+        request when it does not). Anything less - a skipped track already in
+        the library, a failure, one track pulled from a 12-track album - is
+        left with track gain only: an album gain computed from part of an
+        album is a wrong number, and players fall back to track gain when the
+        album tags are absent. Playlist rows are never grouped: a playlist is
+        not a release.
+        """
+        if not self._replaygain_active():
+            return
+        with self._rg_lock:
+            measured = dict(self._rg_measurements)
+            self._rg_measurements.clear()
+        if not measured:
+            return
+        try:
+            from antra.utils import replaygain as rg
+
+            groups: dict[tuple, list[DownloadResult]] = {}
+            for r in results:
+                if r.track is None or r.track.playlist_name:
+                    continue
+                groups.setdefault(self._rg_album_key(r.track), []).append(r)
+
+            for rows in groups.values():
+                title = rows[0].track.album or "(untitled release)"
+                loud = [measured.get(r.file_path) if r.file_path else None for r in rows]
+                incomplete = [
+                    r for r, m in zip(rows, loud)
+                    if r.status != DownloadStatus.COMPLETED or m is None
+                ]
+                if incomplete:
+                    if any(r.status == DownloadStatus.COMPLETED for r in rows):
+                        logger.info(
+                            f"  [RG]  Album gain not written for {title}: "
+                            f"{len(rows) - len(incomplete)} of {len(rows)} tracks were "
+                            "downloaded and measured in this run"
+                        )
+                    continue
+                total = max((r.track.total_tracks or 0) for r in rows)
+                whole = (len(rows) >= total) if total > 0 else any(
+                    (r.track.request_kind or "") == "album" for r in rows
+                )
+                if not whole:
+                    logger.info(
+                        f"  [RG]  Album gain not written for {title}: this run covered "
+                        f"{len(rows)} of {total or 'an unknown number of'} tracks"
+                    )
+                    continue
+                album = rg.album_loudness(loud)
+                if album is None:
+                    continue
+                gain = rg.gain_for(album[0])
+                wrote = sum(
+                    1 for r in rows
+                    if rg.write_tags(r.file_path, album=(gain, album[1]), id3_v1=self.tagger._id3_v1)
+                )
+                logger.info(
+                    f"  [RG]  {title}: album {album[0]:.2f} LUFS -> {rg.format_gain(gain)}, "
+                    f"peak {rg.format_peak(album[1])} ({wrote}/{len(rows)} files)"
+                )
+        except Exception as e:
+            logger.warning(f"  [WARN]  Album ReplayGain failed: {e}")
+
+    # ── issue #75 — playlist folder maintenance ───────────────────────────
+
+    def _handle_playlist_orphans(self, playlist_name, results, complete_playlist: bool) -> None:
+        """Report (or, in auto mode, delete) files the playlist no longer holds.
+
+        Runs only on a complete playlist. See download_playlist's docstring for
+        why the partial case must never reach this.
+        """
+        if not complete_playlist:
+            return
+        mode = getattr(self.organizer, "playlist_prune_orphans", "ask")
+        if mode == "off":
+            return
+        try:
+            orphans = self.organizer.find_playlist_orphans(
+                playlist_name, [r.file_path for r in results if r.file_path]
+            )
+        except Exception as e:
+            logger.warning(f"  [PRUNE]  Could not check for leftover files: {e}")
+            return
+        if not orphans:
+            return
+
+        pruned = False
+        if mode == "auto":
+            removed = self.organizer.prune_playlist_orphans(orphans)
+            logger.info(
+                f"  [PRUNE]  Removed {len(removed)} file(s) no longer in '{playlist_name}'"
+            )
+            orphans, pruned = removed, True
+        else:
+            logger.info(
+                f"  [PRUNE]  {len(orphans)} file(s) in '{playlist_name}' are no longer "
+                "in the playlist"
+            )
+        if not orphans:
+            return
+        self._emit(
+            EngineEventType.PLAYLIST_ORPHANS,
+            message=playlist_name,
+            paths=orphans,
+            pruned=pruned,
+        )
+
+    def _renumber_playlist(self, playlist_name, results, complete_playlist: bool) -> None:
+        """Rename playlist files to their current positions, in place in `results`.
+
+        Rewriting `results` matters as much as the rename: the manifest, the
+        summary and the post-download hooks all read `file_path` afterwards, and
+        a path that was renamed a moment ago no longer exists.
+        """
+        if not complete_playlist:
+            return
+        entries = [(r.track, r.file_path) for r in results if r.file_path and r.track]
+        if not entries:
+            return
+        try:
+            renamed = self.organizer.renumber_playlist_folder(playlist_name, entries)
+        except Exception as e:
+            logger.warning(f"  [RENUM]  Could not renumber '{playlist_name}': {e}")
+            return
+        if not renamed:
+            return
+        lookup = {os.path.normcase(old): new for old, new in renamed.items()}
+        for r in results:
+            if not r.file_path:
+                continue
+            new = lookup.get(os.path.normcase(str(r.file_path)))
+            if new:
+                r.file_path = new
+
+    def _common_release_folder(self, results) -> str:
+        """The one release folder this batch wrote into, or "" if it spans several.
+
+        {release_folder} is only meaningful for a batch when every delivered
+        file landed in the same folder - an album. A playlist spanning 40
+        albums has no single release folder, and naming one of the 40 would
+        be worse than naming none, so it renders empty and the argv element
+        holding it is dropped.
+        """
+        folders = set()
+        for r in results:
+            if not getattr(r, "file_path", None):
+                continue
+            try:
+                folders.add(self.organizer.release_folder_for(r.file_path) or "")
+            except Exception:
+                return ""
+            if len(folders) > 1:
+                return ""
+        return next(iter(folders), "") if len(folders) == 1 else ""
+
+    def download_playlist(
+        self, tracks: list[TrackMetadata], *, complete_playlist: bool = False
+    ) -> list[DownloadResult]:
+        """Download all tracks in a playlist in parallel, returning results in original order.
+
+        `complete_playlist` says whether `tracks` is the WHOLE playlist. It gates
+        the issue #75 folder maintenance, and it defaults to False because
+        getting it wrong the other way is destructive: on a partial run (a PV-1
+        selection, an auto-sync that fetched only new tracks, a single-track
+        retry) every track the run did not cover looks like an orphan.
+        """
         total = len(tracks)
         playlist_name = tracks[0].playlist_name if tracks and tracks[0].playlist_name else None
         self._emit(
@@ -1617,6 +2241,11 @@ class DownloadEngine:
             track_total=total,
             message=f"Starting playlist download for {total} track(s).",
         )
+
+        # Tell the user UP FRONT when the platform their link came from cannot
+        # be used for this format. The chain is fixed for the life of the job,
+        # so this is knowable before the first track.
+        self._warn_if_platform_pin_unavailable(tracks)
 
         # results[i] will hold the DownloadResult for tracks[i]
         results: list[Optional[DownloadResult]] = [None] * total
@@ -1711,10 +2340,43 @@ class DownloadEngine:
             return final
 
         if playlist_name:
+            # issue #75 — prune first, then renumber, then write the manifest.
+            # The order is load-bearing: an orphan still holding "06 - X.mp3"
+            # would block the rename that wants that name, and the manifest has
+            # to be written from the FINAL paths or it points at files that no
+            # longer exist under those names.
+            self._handle_playlist_orphans(playlist_name, final, complete_playlist)
+            self._renumber_playlist(playlist_name, final, complete_playlist)
             self.organizer.write_playlist_manifest(
                 playlist_name,
                 [r.file_path for r in final if r.file_path],
             )
+
+        # v2.0.0 SF-2. Before the sidecars and the batch hook, so a beets
+        # import or rescan fired by DMX-6 sees the album tags. Not on the
+        # cancelled path: a half-finished album has no album loudness.
+        self._apply_album_replaygain(final)
+
+        # v2.0.0 PORT-2. Deliberately NOT on the cancelled path above: an .m3u
+        # of a half-finished run is still a usable list of files, but a .cue or
+        # .nfo describing 3 of 20 tracks claims to describe the release and does
+        # not. The user re-runs and gets the real thing.
+        self._write_sidecars(final)
+
+        # v2.0.0 DMX-6, batch mode. Deliberately on the SAME path as the
+        # sidecars and NOT on the cancelled return above: a rescan or a
+        # beets import fired over a half-finished run describes a release
+        # that does not exist yet. {count} counts only tracks that produced
+        # a new file, so a run where everything was already in the library
+        # still reports 0 rather than claiming work was done.
+        _ok = sum(1 for r in final if r.status == DownloadStatus.COMPLETED)
+        self.post_command.run_for_batch(
+            downloaded=_ok,
+            failed=sum(1 for r in final if r.status == DownloadStatus.FAILED),
+            total=total,
+            playlist_name=playlist_name or "",
+            release_folder=self._common_release_folder(final),
+        )
 
         self._emit(
             EngineEventType.PLAYLIST_COMPLETED,

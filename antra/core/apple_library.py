@@ -83,7 +83,7 @@ class AppleLibraryClient:
 
     def get_saved_songs_tracks(self, page_callback=None) -> list[TrackMetadata]:
         tracks: list[TrackMetadata] = []
-        for item in self._iter_collection("/songs", params={"limit": 100}):
+        for item in self._iter_collection("/songs", params={"limit": 100, "include": "catalog"}):
             meta = self._library_song_to_metadata(item)
             if not meta:
                 continue
@@ -107,7 +107,7 @@ class AppleLibraryClient:
         playlist_name, playlist_artwork = self._get_library_playlist_meta(playlist_id)
         tracks: list[TrackMetadata] = []
         path = f"/playlists/{playlist_id}/tracks"
-        for item in self._iter_collection(path, params={"limit": 100}):
+        for item in self._iter_collection(path, params={"limit": 100, "include": "catalog"}):
             meta = self._library_song_to_metadata(item)
             if not meta:
                 continue
@@ -214,14 +214,66 @@ class AppleLibraryClient:
             pages += 1
 
     def _get_json(self, path_or_url: str, params: Optional[dict] = None) -> dict:
-        url = path_or_url if path_or_url.startswith("http") else f"{_LIBRARY_API_BASE}{path_or_url}"
-        resp = self._session.get(url, params=params, timeout=20)
+        if path_or_url.startswith("http"):
+            url = path_or_url
+        elif path_or_url.startswith("/v1/"):
+            # Apple's `next` links are absolute paths ("/v1/me/library/...?offset=100");
+            # prefixing the library base again produced a doubled, invalid path.
+            url = f"https://api.music.apple.com{path_or_url}"
+        else:
+            url = f"{_LIBRARY_API_BASE}{path_or_url}"
+
+        attempt_params = dict(params) if params else None
+        resp = self._session.get(url, params=attempt_params, timeout=20)
+
+        # A 400 on the library endpoints is usually a parameter Apple rejects for
+        # this account (oversized `limit`, unsupported `include`). Retry with
+        # progressively plainer requests before giving up.
+        if resp.status_code == 400 and attempt_params:
+            for relax in self._relaxations(attempt_params):
+                logger.warning("[AppleLibrary] 400 for %s params=%s - retrying with %s", url, attempt_params, relax)
+                resp = self._session.get(url, params=relax or None, timeout=20)
+                if resp.status_code != 400:
+                    break
+
         if resp.status_code == 401:
             raise RuntimeError("Apple Music session expired. Reconnect your account in Settings.")
         if resp.status_code == 403:
-            raise RuntimeError("Apple Music library access was denied for this account.")
-        resp.raise_for_status()
+            raise RuntimeError(
+                "Apple Music library access was denied for this account. "
+                "Make sure iCloud Music Library is enabled, then reconnect in Settings."
+            )
+        if resp.status_code >= 400:
+            detail = ""
+            try:
+                errs = (resp.json() or {}).get("errors") or []
+                detail = "; ".join(
+                    f"{e.get('title', '')}: {e.get('detail', '')}".strip(": ") for e in errs[:2]
+                )
+            except Exception:
+                detail = (resp.text or "")[:200]
+            logger.warning("[AppleLibrary] HTTP %s for %s: %s", resp.status_code, resp.url, detail)
+            hint = " Reconnect Apple Music in Settings." if resp.status_code == 400 else ""
+            raise RuntimeError(
+                f"Apple Music library request failed (HTTP {resp.status_code})"
+                f"{': ' + detail if detail else ''}.{hint}"
+            )
         return resp.json()
+
+    @staticmethod
+    def _relaxations(params: dict):
+        """Yield plainer variants of a rejected parameter set."""
+        variants = []
+        if "include" in params:
+            variants.append({k: v for k, v in params.items() if k != "include"})
+        if "limit" in params:
+            variants.append({k: v for k, v in params.items() if k not in ("include", "limit")} | {"limit": 25})
+            variants.append({k: v for k, v in params.items() if k not in ("include", "limit")})
+        seen = []
+        for v in variants:
+            if v not in seen:
+                seen.append(v)
+                yield v
 
     def _library_song_to_metadata(self, item: dict) -> Optional[TrackMetadata]:
         attrs = item.get("attributes") or {}
@@ -241,12 +293,19 @@ class AppleLibraryClient:
         play_params = attrs.get("playParams") or {}
         relationships = item.get("relationships") or {}
         catalog_data = ((relationships.get("catalog") or {}).get("data") or [])
-        catalog_id = (
-            play_params.get("catalogId")
-            or play_params.get("id")
-            or (catalog_data[0].get("id") if catalog_data else None)
-            or item.get("id")
-        )
+        catalog_attrs = (catalog_data[0].get("attributes") or {}) if catalog_data else {}
+        # Library ids ("i.xxxx", "l.xxxx") mean nothing to the catalog/mirrors and
+        # made every such track 404. Accept numeric catalog ids only; otherwise
+        # leave it unset so the resolver matches by ISRC / title instead.
+        catalog_id = None
+        for candidate in (
+            play_params.get("catalogId"),
+            catalog_data[0].get("id") if catalog_data else None,
+            play_params.get("id"),
+        ):
+            if candidate and str(candidate).isdigit():
+                catalog_id = str(candidate)
+                break
 
         content_rating = attrs.get("contentRating")
         is_explicit = (
@@ -260,7 +319,7 @@ class AppleLibraryClient:
             artists=self._split_artists(artist),
             album=(attrs.get("albumName") or "").strip() or "Saved Songs",
             duration_ms=attrs.get("durationInMillis"),
-            isrc=attrs.get("isrc") or None,
+            isrc=attrs.get("isrc") or catalog_attrs.get("isrc") or None,
             track_number=attrs.get("trackNumber"),
             disc_number=attrs.get("discNumber"),
             release_date=release_date,
@@ -269,7 +328,7 @@ class AppleLibraryClient:
             genres=attrs.get("genreNames") or [],
             audio_traits=attrs.get("audioTraits") or [],
             is_explicit=is_explicit,
-            apple_music_id=str(catalog_id) if catalog_id else None,
+            apple_music_id=catalog_id,
         )
 
     @staticmethod

@@ -154,7 +154,9 @@ class SoundCloudFetcher:
                 page = resp.json()
             except Exception:
                 break
-            all_tracks.extend(page.get("collection", []))
+            if not isinstance(page, dict):
+                break
+            all_tracks.extend(page.get("collection") or [])
             next_url = page.get("next_href")
             if next_url and "client_id" not in next_url:
                 next_url += f"&client_id={client_id}"
@@ -283,7 +285,7 @@ class SoundCloudFetcher:
                     raw_tracks = merged_tracks or raw_tracks
 
         result: list[TrackMetadata] = []
-        for index, t in enumerate(raw_tracks, start=1):
+        for t in raw_tracks:
             if not isinstance(t, dict):
                 continue
             # SoundCloud may return stub objects (only id present) for
@@ -295,7 +297,9 @@ class SoundCloudFetcher:
                 track.playlist_name = playlist_name or None
                 track.playlist_owner = playlist_owner or None
                 track.playlist_artwork_url = playlist_artwork or None
-                track.playlist_position = index
+                # count the tracks KEPT (like every other fetcher), so a removed
+                # track does not leave a hole in the numbering
+                track.playlist_position = len(result) + 1
                 result.append(track)
             except Exception as e:
                 logger.debug(f"[SoundCloud] Skipping track due to parse error: {e}")

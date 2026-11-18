@@ -17,9 +17,11 @@ from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.utils.matching import score_similarity, duration_close, strip_collab
 
-from antra.utils.mirror_http import TlsFallbackSession, humanize_network_error
+from antra.utils.mirror_http import TlsFallbackSession, ensure_complete_transfer, humanize_network_error
 
 logger = logging.getLogger(__name__)
+
+_SEARCH_TIMEOUT = 45
 
 MIN_SIMILARITY = 0.55
 
@@ -42,6 +44,7 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
         if api_key:
             self._session.headers["X-API-Key"] = api_key
         self._available: Optional[bool] = None
+        self._timeout_until = 0.0  # monotonic; set when the mirror hangs on a search
         self._preferred_output_format = (preferred_output_format or "source").lower()
 
     def _requires_strict_24bit(self) -> bool:
@@ -140,12 +143,56 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
         )
         return shorter or longer
 
+    def _direct_result(self, track: TrackMetadata, track_id: str) -> SearchResult:
+        """The exact Qobuz track a Qobuz link named - no searching at all.
+
+        bit depth / sample rate are not in the album payload and
+        /api/meta/track/{id} returns them null, so they fall back to the
+        same 24/44100 the ISRC path already assumes when the server omits
+        them. They are advisory: strict_24 is enforced at download time.
+        """
+        logger.info(
+            "[QobuzMirror] Using known Qobuz track ID %s for '%s'",
+            track_id, track.title,
+        )
+        return SearchResult(
+            source=self.name,
+            title=track.title,
+            artists=track.artists,
+            album=track.album,
+            duration_ms=track.duration_ms,
+            audio_format=AudioFormat.FLAC,
+            quality_kbps=None,
+            is_lossless=True,
+            bit_depth=24,
+            sample_rate_hz=44100,
+            download_url=None,
+            stream_id=str(track_id),
+            similarity_score=1.0,
+            isrc_match=bool(track.isrc),
+            is_explicit=track.is_explicit,
+        )
+
     def search(self, track: TrackMetadata) -> Optional[SearchResult]:
+        # A Qobuz link already told us which track this is. Searching for
+        # it by ISRC or title is guesswork over a fact we were handed, and
+        # it loses: the mirror's ISRC endpoint walks Qobuz's text index,
+        # which does not carry brand-new small-label releases.
+        qobuz_track_id = getattr(track, "qobuz_track_id", None)
+        if qobuz_track_id:
+            return self._direct_result(track, str(qobuz_track_id))
+
+        # A hung mirror answers every search with a 10s read timeout; ISRC + 3 text
+        # queries then cost 40s per track. Back off for 30s instead of repeating it.
+        import time as _t
+        if _t.monotonic() < self._timeout_until:
+            return None
+
         if track.isrc:
             try:
                 r = self._session.get(
                     f"{self._base}/api/search/isrc/{track.isrc}",
-                    timeout=10,
+                    timeout=_SEARCH_TIMEOUT,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Qobuz mirror rate limited (429)")
@@ -206,6 +253,9 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
                 raise
             except Exception as e:
                 logger.debug("[QobuzMirror] ISRC search failed: %s", e)
+                if "timed out" in str(e).lower():
+                    self._timeout_until = _t.monotonic() + 30
+                    return None
 
         # Text search fallback — used when ISRC is unavailable
         return self._text_search(track)
@@ -218,7 +268,7 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
                 r = self._session.get(
                     f"{self._base}/api/search",
                     params={"title": query["title"], "artist": query["artist"], "limit": 5},
-                    timeout=10,
+                    timeout=_SEARCH_TIMEOUT,
                 )
                 if r.status_code == 429:
                     raise RateLimitedError("Qobuz mirror rate limited (429)")
@@ -232,6 +282,10 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
                 raise
             except Exception as e:
                 logger.debug("[QobuzMirror] Text search failed: %s", e)
+                if "timed out" in str(e).lower():
+                    import time as _t
+                    self._timeout_until = _t.monotonic() + 30
+                    break
                 continue
 
             for item in items:
@@ -292,6 +346,19 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
             if r.status_code == 503:
                 self._reset_availability()
                 raise RuntimeError("[QobuzMirror] Server unavailable (503)")
+            if r.status_code == 404:
+                # The mirror answers 404 only after walking its ENTIRE account
+                # pool, and puts the reason in the JSON body. raise_for_status()
+                # throws that body away, leaving the user a bare
+                # "404 Client Error: Not Found for url: ..." -- and leaving
+                # should_retry_download's rights-phrase tests matching nothing.
+                # Keep the literal "404 Client Error" so the classifier still
+                # fires even when the body is unparseable.
+                detail = _mirror_detail(r)
+                raise RuntimeError(
+                    "[QobuzMirror] Stream request failed: 404 Client Error"
+                    + (" - " + detail if detail else "")
+                )
             r.raise_for_status()
         except RateLimitedError:
             raise
@@ -325,10 +392,13 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
         # stem keeps the temp name exactly as long as the final one.
         part_path = output_path + ".part"
         try:
+            written = 0
             with open(part_path, "wb") as f:
                 for chunk in r.iter_content(131072):
                     if chunk:
+                        written += len(chunk)
                         f.write(chunk)
+            ensure_complete_transfer(r, written, "QobuzMirror")
             os.replace(part_path, final_path)
         except BaseException:
             try:
@@ -336,6 +406,8 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
             except OSError:
                 pass
             raise
+        finally:
+            r.close()   # the response was opened without `with`; error paths leaked the connection
 
         logger.info("[QobuzMirror] Downloaded %s quality=%s bit_depth=%s",
                     os.path.basename(final_path), quality_hdr, bit_depth_hdr)
@@ -345,12 +417,42 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
         msg = str(error).lower()
         if "duration mismatch" in msg or "preview clip" in msg:
             return False
+        # DEFINITIVE answer from the mirror: it walked its entire account pool
+        # and nobody is licensed for this release. Retrying re-walks all 16
+        # accounts for the same answer -- measured 12-22s each, three times --
+        # and as a 500 it also tripped the engine's 5xx circuit breaker, which
+        # then blocked Qobuz for 5 minutes for tracks it COULD have served.
+        # A 404 from the mirror is likewise definitive, never worth a retry.
+        if ("no account in the pool holds streaming rights" in msg
+                or "not streamable by any of" in msg
+                or "404 client error" in msg):
+            return False
         # Cloudflare/VPS 5xx during the relay stream is usually not fixed by
         # hammering the same signed URL 2 more times. Fall through immediately
         # so the engine can try Tidal/Amazon/Apple instead.
         if any(code in msg for code in (" 524 ", "524 server error", "502", "503", "504")):
             return False
         return True
+
+
+def _mirror_detail(resp) -> str:
+    """Best-effort read of the mirror's JSON `detail` from an error response.
+
+    Never raises and never blocks: the body of a non-2xx from this mirror is a
+    small JSON object, but the response was opened with stream=True, so this is
+    deliberately defensive. Returns "" when there is nothing usable.
+    """
+    try:
+        resp.encoding = resp.encoding or "utf-8"
+        data = resp.json()
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    detail = data.get("detail")
+    if not isinstance(detail, str):
+        return ""
+    return " ".join(detail.split())[:300]
 
 
 def _extract_qobuz_mirror_source_meta(data: dict) -> dict:

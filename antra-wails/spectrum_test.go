@@ -264,7 +264,11 @@ func TestResolutionBeatsOldProbe(t *testing.T) {
 	t.Logf("14 kHz fixture -> %d Hz (old probe could only say 12000 or 16000)", res.CutoffHz)
 }
 
-func TestMain(m *testing.M) { os.Exit(m.Run()) }
+func TestMain(m *testing.M) {
+	// proc_tree_kill_test.go re-enters this binary as a fake process tree.
+	helperProcessDispatch()
+	os.Exit(m.Run())
+}
 
 // TestRealEncoders is the test that actually matters: encode with real lossy
 // encoders and confirm the analyser both finds a plausible cutoff AND calls it

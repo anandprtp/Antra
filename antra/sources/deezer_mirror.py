@@ -23,12 +23,13 @@ from antra.core.models import AudioFormat, SearchResult, TrackMetadata
 from antra.sources.base import BaseSourceAdapter, RateLimitedError
 from antra.utils.matching import score_similarity, duration_close
 
-from antra.utils.mirror_http import TlsFallbackSession, humanize_network_error
+from antra.utils.mirror_http import TlsFallbackSession, ensure_complete_transfer, humanize_network_error
 
 logger = logging.getLogger(__name__)
 
 MIN_SIMILARITY = 0.75
 _CHUNK_SIZE = 2048
+_TRACK_TIMEOUT = 60
 _DOWNLOAD_CHUNK = 65536
 
 # Strip featured/with suffixes from titles before text search.
@@ -67,8 +68,10 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
     name = "deezer_mirror"
     priority = 3  # After 24-bit sources (priority 1), before community pools
 
-    def __init__(self, mirror_url: str, api_key: str = ""):
+    def __init__(self, mirror_url: str, api_key: str = "",
+                 preferred_output_format: str = "source"):
         self._base = mirror_url.rstrip("/")
+        self._preferred_output_format = (preferred_output_format or "source").lower()
         # v1.1.8 BUG-2: TLS-resilient session (curl_cffi fallback + proxy
         # diagnostics). Lifted from the Amazon adapter so all mirrors
         # behave the same on hostile networks.
@@ -284,18 +287,53 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
             return best
         return None
 
+    # Deezer's media API is asked for FLAC/MP3_320/MP3_128 in one call and the
+    # mirror used to return whatever came back -- so a free-tier account (no FLAC
+    # entitlement) returned MP3 and the mirror reported SUCCESS. The engine's
+    # strict-format gate then discarded the file and burned a whole retry. Telling
+    # the mirror that lossless is REQUIRED lets it rotate to a lossless-capable
+    # account instead. Same shape as qobuz_mirror's strict_24.
+    _LOSSLESS_FORMATS = {"lossless", "lossless-16", "lossless-24", "flac",
+                         "alac", "alac-16", "alac-24"}
+
+    def _requires_lossless(self) -> bool:
+        return self._preferred_output_format in self._LOSSLESS_FORMATS
+
     def download(self, result: SearchResult, output_path: str) -> str:
         track_id = result.stream_id
         try:
-            r = self._session.get(f"{self._base}/api/track/{track_id}", timeout=30)
+            _strict = {"strict_lossless": "1"} if self._requires_lossless() else None
+            # Must stay ABOVE the mirror's worst-case rotation budget, or a
+            # legitimate rotation is aborted client-side before the server can
+            # answer and the user sees a bare timeout instead of the real reason.
+            # Measured on a cold pool: up to ~50s while capability is still being
+            # learned; ~1-7s warm. Same constraint as _QOBUZ_MIRROR_TIMEOUT.
+            r = self._session.get(f"{self._base}/api/track/{track_id}",
+                                  params=_strict, timeout=_TRACK_TIMEOUT)
             if r.status_code == 429:
                 raise RateLimitedError("Deezer mirror rate limited (429)")
             if r.status_code == 503:
                 self._reset_availability()
                 raise RuntimeError("[DeezerMirror] Server unavailable (503)")
+            if r.status_code == 409:
+                # No Deezer account in the pool holds FLAC entitlement for this
+                # track. A catalog/entitlement fact, not a transport fault -- fall
+                # through to another source rather than retrying Deezer.
+                raise RuntimeError(
+                    "[DeezerMirror] No lossless copy available on Deezer for "
+                    f"track {track_id}"
+                )
             r.raise_for_status()
             data = r.json()
         except RateLimitedError:
+            raise
+        except RuntimeError:
+            # Our own explicit 409/503 raises above. Letting the generic handler
+            # re-wrap them produced "Track request failed: [DeezerMirror] No
+            # lossless copy available..." -- the reason the user is meant to read,
+            # buried behind a generic prefix. requests raises HTTPError /
+            # RequestException / JSONDecodeError, never RuntimeError, so this
+            # catches only the two raises in this block.
             raise
         except Exception as e:
             raise RuntimeError(f"[DeezerMirror] Track request failed: {e}") from e
@@ -308,17 +346,32 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
 
         # Download encrypted stream through the VPS relay so the local machine
         # never has to resolve Deezer's CDN hostnames directly.
-        with self._session.get(relay_url, stream=True, timeout=120) as r:
+        with self._session.get(relay_url, params=_strict, stream=True, timeout=120) as r:
             if r.status_code == 429:
                 raise RateLimitedError("Deezer mirror rate limited (429)")
             if r.status_code == 503:
                 self._reset_availability()
                 raise RuntimeError("[DeezerMirror] Stream relay unavailable (503)")
+            if r.status_code == 409:
+                # The relay runs its OWN rotation, so it can exhaust the
+                # lossless-capable pool even when /api/track/ just succeeded --
+                # measured on the live mirror at 46 stream-path 409s across 25
+                # distinct tracks in 13.7h. Without this branch that 409 fell to
+                # raise_for_status() as a bare requests.HTTPError, which
+                # should_retry_download() does not recognise -> the engine retried
+                # Deezer 3x for an answer that cannot change.
+                raise RuntimeError(
+                    "[DeezerMirror] No lossless copy available on Deezer for "
+                    f"track {track_id}"
+                )
             r.raise_for_status()
             chunks = []
+            received = 0
             for chunk in r.iter_content(_DOWNLOAD_CHUNK):
                 if chunk:
                     chunks.append(chunk)
+                    received += len(chunk)
+            ensure_complete_transfer(r, received, "DeezerMirror")
         encrypted = b"".join(chunks)
 
         # Decrypt
@@ -328,8 +381,19 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
         ext = ".flac" if decrypted[:4] == b"fLaC" else ".mp3"
         final_path = output_path + ext
         os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-        with open(final_path, "wb") as f:
-            f.write(decrypted)
+        # Write beside the target and rename, so an interrupted write never leaves a
+        # half-file under the real name (same rule as the Qobuz mirror, BUG-4).
+        part_path = output_path + ".part"
+        try:
+            with open(part_path, "wb") as f:
+                f.write(decrypted)
+            os.replace(part_path, final_path)
+        except BaseException:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            raise
 
         logger.info("[DeezerMirror] Downloaded %s (%d bytes)", os.path.basename(final_path), len(decrypted))
         return final_path
@@ -337,6 +401,12 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
     def should_retry_download(self, result: SearchResult, error: Exception) -> bool:
         msg = str(error).lower()
         if "duration mismatch" in msg or "preview clip" in msg:
+            return False
+        if "no lossless copy available" in msg:
+            # The mirror exhausted its lossless-capable accounts for this track.
+            # That is an entitlement/catalog fact about Deezer, not a transient
+            # fault, so retrying Deezer cannot help -- fall through to another
+            # source instead of burning the engine's retry budget.
             return False
         return True
 
